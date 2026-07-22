@@ -1,0 +1,8 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.env
+archive/
+geometries/
+tests/
+runs/
