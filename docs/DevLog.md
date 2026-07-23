@@ -1,5 +1,17 @@
 # 开发日志
 
+## 2026-07-23：编写源码指南
+
+- 将已废止的 `autogrid_backend_py_dev_plan.md` 重写为 `SOURCE_CODE_GUIDE.md`。
+- 新文档面向无 CFD 背景的 Python 开发者，从零开始解释 CFD 概念、网格生成原理和叶轮机械术语，然后逐模块深入源码——`geomturbo.py`、`controls.py`、`autogrid.py`、`quality.py` 和 `mesh.py`。
+- 对每个数据类的每个字段、每个关键函数的调用链、选择器语法、setter 审计机制、阶段执行顺序、质量判定逻辑均做了详细的中文说明。
+- 删除旧文件 `docs/autogrid_backend_py_dev_plan.md`。
+
+## 2026-07-23：移除 conda 环境依赖
+
+- 确认项目所有 `.py` 文件仅使用 Python 标准库（`re`、`json`、`dataclasses`、`pathlib`、`typing`、`subprocess` 等），无任何第三方包依赖。
+- 将 `CLAUDE.md`（即 `AGENTS.md`）、`README.md` 和 `docs/MESH_CONTROL_ITEMS.md` 中的 `conda activate LLM` 指令替换为"依赖 Python 标准库，Python ≥3.7 即可运行"的说明。
+
 ## 2026-07-23：AutoGrid 17.1 全量网格控制与质量解析 Schema v2
 
 ### 控制注册表
@@ -62,3 +74,9 @@
 - ori1 P1/P2 实机控制验证成功：Rotor 主叶片 wake control、shroud gap clustering 和 hub fillet clustering 均成功应用并回读。
 - ori1 不适用拓扑实机验证成功：Default 拓扑请求 HOH wake clustering 时严格返回 1，以中文记录失败控制且不生成网格。
 - 三个默认质量基线保持 Rotor37 `PASS`、WP100 `FAIL`、ori1 `FAIL`。
+
+## 2026-07-23：补充中文 docstring
+
+- 为 `mesh.py`、`geomturbo.py`、`autogrid.py`、`quality.py` 和 `controls.py` 补充中文模块级 docstring。
+- 为上述脚本中的类、属性、公开函数和内部辅助函数补充简洁的中文用途说明。
+- 本次变更仅完善源码文档，不修改网格生成、控制解析或质量判定逻辑。

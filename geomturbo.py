@@ -1,3 +1,5 @@
+"""解析 ``.geomTurbo`` 文件并提取叶轮机械几何拓扑摘要。"""
+
 from __future__ import annotations
 
 import re
@@ -8,6 +10,8 @@ from typing import Any
 
 @dataclass(frozen=True)
 class BladeInfo:
+    """描述单个叶片实体及其间隙、圆角等拓扑信息。"""
+
     name: str
     number_of_blades: int | None = None
     has_tip_gap: bool = False
@@ -18,6 +22,8 @@ class BladeInfo:
 
 @dataclass(frozen=True)
 class RowInfo:
+    """描述一个叶排包含的叶片实体及周期性信息。"""
+
     name: str
     periodicity: int | None = None
     blades: list[BladeInfo] = field(default_factory=list)
@@ -25,17 +31,23 @@ class RowInfo:
 
     @property
     def main_blades(self) -> int | None:
+        """返回主叶片数量，缺失时回退到叶排周期数。"""
+
         if self.blades and self.blades[0].number_of_blades is not None:
             return self.blades[0].number_of_blades
         return self.periodicity
 
     @property
     def has_splitter(self) -> bool:
+        """判断叶排中是否包含分流叶片。"""
+
         return len(self.blades) > 1 or any("spl" in blade.name.lower() for blade in self.blades)
 
 
 @dataclass(frozen=True)
 class GeomTurboSummary:
+    """汇总一个 ``.geomTurbo`` 文件的几何与叶排信息。"""
+
     path: str
     version: str | None
     units: str | None
@@ -45,17 +57,25 @@ class GeomTurboSummary:
 
     @property
     def multi_row(self) -> bool:
+        """判断几何是否包含多个叶排。"""
+
         return self.row_count > 1
 
     @property
     def has_splitter(self) -> bool:
+        """判断任一叶排是否包含分流叶片。"""
+
         return any(row.has_splitter for row in self.rows)
 
     @property
     def has_tip_gap(self) -> bool:
+        """判断任一叶排是否包含叶尖间隙。"""
+
         return any(row.has_tip_gap for row in self.rows)
 
     def to_dict(self) -> dict[str, Any]:
+        """将几何摘要转换为可序列化字典。"""
+
         data = asdict(self)
         data["multi_row"] = self.multi_row
         data["has_splitter"] = self.has_splitter
@@ -67,6 +87,8 @@ class GeomTurboSummary:
 
 
 def parse_geomturbo(path: str | Path) -> GeomTurboSummary:
+    """读取 ``.geomTurbo`` 文件并返回结构化几何摘要。"""
+
     geom_path = Path(path)
     text = geom_path.read_text(encoding="utf-8", errors="replace")
     rows = _parse_rows(text)
@@ -81,6 +103,8 @@ def parse_geomturbo(path: str | Path) -> GeomTurboSummary:
 
 
 def _parse_rows(text: str) -> list[RowInfo]:
+    """从几何文本中解析所有叶排及叶片拓扑。"""
+
     rows: list[RowInfo] = []
     stack: list[str] = []
     current_row: dict[str, Any] | None = None
@@ -182,6 +206,8 @@ def _parse_rows(text: str) -> list[RowInfo]:
 
 
 def _split_key_value(line: str) -> tuple[str, str]:
+    """将一行几何定义拆分为键和值。"""
+
     parts = line.split(None, 1)
     if len(parts) == 1:
         return parts[0], ""
@@ -189,11 +215,15 @@ def _split_key_value(line: str) -> tuple[str, str]:
 
 
 def _first_value(text: str, key: str) -> str | None:
+    """返回指定键首次出现时的原始值。"""
+
     match = re.search(rf"^\s*{re.escape(key)}\s+(.+?)\s*$", text, flags=re.IGNORECASE | re.MULTILINE)
     return match.group(1).strip() if match else None
 
 
 def _first_float_value(text: str, key: str) -> float | None:
+    """返回指定键首次出现时的浮点数值。"""
+
     value = _first_value(text, key)
     if value is None:
         return None
@@ -204,6 +234,8 @@ def _first_float_value(text: str, key: str) -> float | None:
 
 
 def _to_int(value: str) -> int | None:
+    """尽可能将文本转换为整数，失败时返回空值。"""
+
     try:
         return int(float(value.split()[0]))
     except (IndexError, ValueError):
@@ -211,4 +243,6 @@ def _to_int(value: str) -> int | None:
 
 
 def _unique_tuple(values: list[str]) -> tuple[str, ...]:
+    """按原顺序去重并返回不可变元组。"""
+
     return tuple(dict.fromkeys(values))

@@ -1,3 +1,5 @@
+"""解析 AutoGrid 质量数据并依据叶轮机械网格准则进行评估。"""
+
 from __future__ import annotations
 
 import re
@@ -50,11 +52,15 @@ LEGACY_CRITERION_PREFIX = {
 
 @dataclass(frozen=True)
 class QualityEvaluation:
+    """表示网格质量判定状态、是否通过及具体原因。"""
+
     status: str
     accepted: bool
     reasons: list[str]
 
     def to_dict(self) -> dict[str, Any]:
+        """将质量判定转换为可序列化字典。"""
+
         return asdict(self)
 
 
@@ -64,6 +70,8 @@ def summarize_quality(
     units_factor: float | None = None,
     units: str | None = None,
 ) -> dict[str, Any]:
+    """选择可用质量数据源并生成统一的网格质量摘要。"""
+
     quality_report = outputs.get("quality_report")
     cgns = outputs.get("cgns")
     source_path = Path(quality_report or cgns) if quality_report or cgns else None
@@ -291,6 +299,8 @@ def parse_quality_report(
 
 
 def parse_embedded_cgns_quality(path: str | Path) -> dict[str, Any]:
+    """从 CGNS 文本片段中提取内嵌的 AutoGrid 质量指标。"""
+
     text = Path(path).read_bytes().decode("latin1", errors="ignore")
     if "NIGridQuality" not in text:
         raise ValueError(f"No embedded NIGridQuality data found: {path}")
@@ -343,6 +353,8 @@ def parse_embedded_cgns_quality(path: str | Path) -> dict[str, Any]:
 
 
 def evaluate_quality(metrics: dict[str, Any]) -> QualityEvaluation:
+    """依据预设硬性阈值评估网格质量指标。"""
+
     if "metrics" in metrics and "negative_cells" not in metrics and isinstance(metrics["metrics"], dict):
         metrics = metrics["metrics"]
     required = {
@@ -378,6 +390,8 @@ def evaluate_quality(metrics: dict[str, Any]) -> QualityEvaluation:
 
 
 def _new_entity(*, scope: str, name: str) -> dict[str, Any]:
+    """创建一个空的质量统计实体。"""
+
     return {
         "scope": scope,
         "name": name,
@@ -389,10 +403,14 @@ def _new_entity(*, scope: str, name: str) -> dict[str, Any]:
 
 
 def _empty_criterion() -> dict[str, Any]:
+    """创建一个空的质量准则统计结构。"""
+
     return {"minimum": None, "maximum": None, "average": None, "critical_location": None}
 
 
 def _empty_metadata() -> dict[str, Any]:
+    """创建一个空的质量报告元数据结构。"""
+
     return {
         "autogrid_version": None,
         "generation_date": None,
@@ -405,6 +423,8 @@ def _empty_metadata() -> dict[str, Any]:
 
 
 def _empty_project(*, units: str | None, units_factor: float | None) -> dict[str, Any]:
+    """创建包含单位信息的空项目摘要。"""
+
     return {
         "name": None,
         "template_path": None,
@@ -417,6 +437,8 @@ def _empty_project(*, units: str | None, units_factor: float | None) -> dict[str
 
 
 def _parse_statistic_line(line: str) -> tuple[str, str, float] | None:
+    """解析质量报告中的单行统计值。"""
+
     match = re.match(
         rf"(Minimal|Maximum|Maximal|Average|Minimum)\s+(.+?)\s*:\s*({NUMBER_TEXT})\s*$",
         line,
@@ -433,6 +455,8 @@ def _parse_statistic_line(line: str) -> tuple[str, str, float] | None:
 
 
 def _parse_location_line(line: str) -> tuple[str, dict[str, Any]] | None:
+    """解析质量极值所在块及 I/J/K 索引。"""
+
     match = re.match(
         r"(Max|Min)\s+Location\s+(.+?)\s*:\s*(.+?)\s+I\s*,\s*J\s*,\s*K\s*:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*$",
         line,
@@ -454,6 +478,8 @@ def _parse_location_line(line: str) -> tuple[str, dict[str, Any]] | None:
 
 
 def _criterion_name(label: str) -> str | None:
+    """将报告标签映射为规范化质量准则名称。"""
+
     normalized = re.sub(r"\s+", " ", label.strip()).lower()
     aliases = {
         "skewness angle": "skewness_angle",
@@ -472,6 +498,8 @@ def _finalize_entity_criteria(
     units_factor: float | None,
     units: str | None,
 ) -> None:
+    """补齐实体质量准则并按单位换算壁面距离。"""
+
     ordered: dict[str, Any] = {}
     for name in CRITERIA:
         criterion = entity["criteria"].get(name, _empty_criterion())
@@ -492,6 +520,8 @@ def _finalize_entity_criteria(
 
 
 def _derive_entire_mesh_locations(entities: list[dict[str, Any]]) -> None:
+    """从各叶排统计中推导全网格极值位置。"""
+
     entire = next((entity for entity in entities if entity["scope"] == "entire_mesh"), None)
     rows = [entity for entity in entities if entity["scope"] == "row"]
     if entire is None:
@@ -519,6 +549,8 @@ def _derive_entire_mesh_locations(entities: list[dict[str, Any]]) -> None:
 
 
 def _flatten_entity_metrics(entity: dict[str, Any] | None) -> dict[str, Any]:
+    """将实体的分层质量准则压平为兼容指标字典。"""
+
     if entity is None:
         return {}
     metrics: dict[str, Any] = {}
@@ -548,6 +580,8 @@ def _model_from_flat_metrics(
     units_factor: float | None,
     units: str | None,
 ) -> dict[str, Any]:
+    """将旧式扁平指标转换为统一质量数据模型。"""
+
     entity = _new_entity(scope="entire_mesh", name="Entire Mesh")
     for field in ("negative_cells", "number_of_points", "grid_levels"):
         entity[field] = metrics.get(field)
@@ -572,6 +606,8 @@ def _model_from_flat_metrics(
 
 
 def _duration_seconds(value: str) -> int | None:
+    """将时分秒形式的耗时文本转换为秒数。"""
+
     match = re.fullmatch(r"(\d+):(\d{2}):(\d{2})", value)
     if not match:
         return None
@@ -580,6 +616,8 @@ def _duration_seconds(value: str) -> int | None:
 
 
 def _discover_project_units(source_path: Path) -> tuple[str | None, float | None]:
+    """从质量数据源附近的项目文件中发现长度单位。"""
+
     candidates = (source_path.parent / "input.geomTurbo", source_path.with_suffix(".geomTurbo"))
     for candidate in candidates:
         if not candidate.exists():
@@ -594,11 +632,15 @@ def _discover_project_units(source_path: Path) -> tuple[str | None, float | None
 
 
 def _quality_blocks(text: str, name: str) -> list[str]:
+    """提取指定名称的所有质量数据块。"""
+
     pattern = rf"NI_BEGIN\s+{re.escape(name)}(?P<body>.*?)NI_END\s+NIGridQuality"
     return [match.group("body") for match in re.finditer(pattern, text, flags=re.IGNORECASE | re.DOTALL)]
 
 
 def _embedded_location(blocks: list[str], *, extreme: str) -> dict[str, Any] | None:
+    """从内嵌质量块中提取最小值或最大值位置。"""
+
     preferred_prefix = "min" if extreme == "minimum" else "max"
     for block in reversed(blocks):
         block_name = _first_text(block, rf"\b{preferred_prefix}Block\s+(\S+)")
@@ -625,21 +667,29 @@ def _embedded_location(blocks: list[str], *, extreme: str) -> dict[str, Any] | N
 
 
 def _first_float(text: str, pattern: str) -> float | None:
+    """返回正则表达式首次匹配到的浮点数。"""
+
     match = re.search(pattern, text, flags=re.IGNORECASE)
     return float(match.group(1)) if match else None
 
 
 def _last_int(text: str, pattern: str) -> int | None:
+    """返回正则表达式最后一次匹配到的整数。"""
+
     matches = list(re.finditer(pattern, text, flags=re.IGNORECASE))
     return int(matches[-1].group(1)) if matches else None
 
 
 def _first_text(text: str, pattern: str) -> str | None:
+    """返回正则表达式首次匹配到的非空文本。"""
+
     match = re.search(pattern, text, flags=re.IGNORECASE)
     return match.group(1) if match else None
 
 
 def _add_wall_uniformity(metrics: dict[str, Any]) -> None:
+    """根据壁面距离极值计算并写入均匀性指标。"""
+
     min_wall = metrics.get("min_wall_distance")
     max_wall = metrics.get("max_wall_distance")
     if min_wall is not None and max_wall is not None and min_wall != 0:

@@ -1,3 +1,5 @@
+"""生成并执行 NUMECA AutoGrid 初始化脚本，收集网格运行产物。"""
+
 from __future__ import annotations
 
 import os
@@ -18,6 +20,8 @@ CONTROL_RESULT_MARKER = "AGMESH_CONTROL_RESULT:"
 
 @dataclass(frozen=True)
 class AutoGridRun:
+    """记录一次 AutoGrid 执行的命令、产物与控制应用结果。"""
+
     command: list[str]
     returncode: int | None
     run_dir: str
@@ -27,6 +31,8 @@ class AutoGridRun:
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        """将运行记录转换为可序列化字典。"""
+
         return asdict(self)
 
 
@@ -41,6 +47,8 @@ def run_autogrid_init(
     timeout_seconds: int | None = None,
     controls: Sequence[ResolvedControl] = (),
 ) -> AutoGridRun:
+    """生成 AutoGrid 脚本并按配置执行或仅进行 dry-run。"""
+
     run_path = Path(run_dir)
     run_path.mkdir(parents=True, exist_ok=True)
 
@@ -135,6 +143,8 @@ def render_autogrid_script(
     use_row_wizard: bool = True,
     controls: Sequence[ResolvedControl | dict[str, Any]] = (),
 ) -> str:
+    """渲染可由 IGG 执行的 AutoGrid Python 脚本文本。"""
+
     control_plan = _serialize_control_plan(controls)
     control_plan_json = json.dumps(control_plan, ensure_ascii=True, sort_keys=True)
     return f'''# -*- coding: utf-8 -*-
@@ -462,6 +472,8 @@ print("AutoGrid geomTurbo init script completed for", OUTPUT_PREFIX)
 def _serialize_control_plan(
     controls: Sequence[ResolvedControl | dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    """将解析后的控制项转换为脚本可消费的数据结构。"""
+
     serialized: list[dict[str, Any]] = []
     for control in controls:
         data = control.to_dict() if isinstance(control, ResolvedControl) else dict(control)
@@ -481,6 +493,8 @@ def _serialize_control_plan(
 
 
 def parse_control_results(stdout: str) -> list[dict[str, Any]]:
+    """从 IGG 标准输出中解析网格控制应用结果。"""
+
     results: list[dict[str, Any]] = []
     for line in stdout.splitlines():
         marker_index = line.find(CONTROL_RESULT_MARKER)
@@ -500,6 +514,8 @@ def merge_control_results(
     controls: Sequence[ResolvedControl],
     events: Sequence[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    """将控制计划与实际执行结果合并为完整状态列表。"""
+
     event_by_id = {str(event.get("id")): dict(event) for event in events}
     merged: list[dict[str, Any]] = []
     for control in controls:
@@ -520,6 +536,8 @@ def merge_control_results(
 
 
 def _completed_text(value: str | bytes | None) -> str:
+    """将子进程输出统一转换为文本。"""
+
     if value is None:
         return ""
     if isinstance(value, bytes):
@@ -533,6 +551,8 @@ def _completed_text(value: str | bytes | None) -> str:
 
 
 def _script_error(stderr: str) -> str | None:
+    """从 IGG 标准错误中提取有效的脚本错误信息。"""
+
     if not re.search(r"(?:Traceback \(most recent call last\)|SyntaxError:|RuntimeError:|ValueError:)", stderr):
         return None
     lines = [line.strip() for line in stderr.splitlines() if line.strip()]
@@ -540,6 +560,8 @@ def _script_error(stderr: str) -> str | None:
 
 
 def collect_outputs(run_dir: str | Path, output_prefix: str = "mesh") -> dict[str, Path]:
+    """收集运行目录中已生成的 AutoGrid 网格及报告文件。"""
+
     run_path = Path(run_dir)
     suffixes = {
         "igg": ".igg",
@@ -560,6 +582,8 @@ def collect_outputs(run_dir: str | Path, output_prefix: str = "mesh") -> dict[st
 
 
 def resolve_igg(executable: str = "igg") -> str | None:
+    """解析 IGG 可执行文件路径，必要时搜索常见安装目录。"""
+
     if os.path.sep in executable or (os.path.altsep and os.path.altsep in executable):
         path = Path(executable)
         return str(path) if path.exists() else None
@@ -582,6 +606,8 @@ def resolve_igg(executable: str = "igg") -> str | None:
 
 
 def _candidate_roots() -> list[Path]:
+    """返回用于搜索 NUMECA 安装的候选根目录。"""
+
     env = os.environ
     roots: list[Path] = []
     for name in ("NUMECA_ROOT", "NUMECA_HOME", "FINE_ROOT", "FINE_HOME", "FINE171_ROOT"):

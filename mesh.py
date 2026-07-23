@@ -1,3 +1,5 @@
+"""提供从 ``.geomTurbo`` 几何生成 AutoGrid 网格的命令行入口。"""
+
 from __future__ import annotations
 
 import argparse
@@ -22,6 +24,8 @@ from quality import summarize_quality
 
 
 def main() -> int:
+    """解析命令行参数，执行网格生成并输出运行摘要。"""
+
     parser = argparse.ArgumentParser(
         description="从 .geomTurbo 直接生成 NUMECA AutoGrid 17.1 CFD 网格。"
     )
@@ -178,6 +182,8 @@ def main() -> int:
 
 
 def _build_control_requests(args: argparse.Namespace) -> list[ControlRequest]:
+    """将快捷参数和通用设置合并为网格控制请求。"""
+
     assignments = list(args.set_values)
     explicit = (
         (args.mesh_level, f"row:*/mesh_level={args.mesh_level}" if args.mesh_level else None),
@@ -214,15 +220,21 @@ def _build_control_requests(args: argparse.Namespace) -> list[ControlRequest]:
 
 
 def _default_run_dir(geomturbo_path: Path) -> Path:
+    """根据几何文件名和当前时间生成默认运行目录。"""
+
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return Path("runs") / f"{geomturbo_path.stem}_{stamp}"
 
 
 def _write_json(path: Path, data: Any) -> None:
+    """以便于审阅的格式写入 JSON 文件。"""
+
     path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
+    """读取简单的 ``KEY=VALUE`` 环境配置文件。"""
+
     if not path.exists():
         return {}
     values: dict[str, str] = {}
@@ -246,6 +258,8 @@ def _render_report(
     *,
     dry_run: bool,
 ) -> str:
+    """根据几何、控制、执行和质量信息生成 Markdown 报告。"""
+
     lines = [
         "# AutoGrid 17.1 网格生成报告",
         "",
@@ -369,10 +383,14 @@ def _render_report(
 
 
 def _command_line(command: list[str]) -> str:
+    """将命令参数列表格式化为单行文本。"""
+
     return " ".join(str(part) for part in command)
 
 
 def _display_value(value: Any) -> str:
+    """将报告字段转换为适合 Markdown 展示的文本。"""
+
     if value is None:
         return "—"
     if isinstance(value, (dict, list, tuple)):
@@ -381,6 +399,8 @@ def _display_value(value: Any) -> str:
 
 
 def _format_location(location: dict[str, Any] | None) -> str:
+    """格式化质量极值所在的块与网格索引。"""
+
     if not location:
         return "—"
     block = location.get("block") or "?"
@@ -390,6 +410,8 @@ def _format_location(location: dict[str, Any] | None) -> str:
 
 
 def _translate_quality_reason(reason: str) -> str:
+    """将已知的英文质量判定原因翻译为中文。"""
+
     translations = {
         "Negative cells detected": "检测到负体积单元",
         "Insufficient grid levels": "网格层级不足",
@@ -407,6 +429,8 @@ def _translate_quality_reason(reason: str) -> str:
 
 
 def _print_control_catalog(priority: str | None) -> None:
+    """按优先级输出可用网格控制项目录。"""
+
     specs = list_control_specs(priority)
     title = f"AutoGrid 17.1 {priority or '全部'}纯网格控制（{len(specs)} 项）"
     print(title)
@@ -419,6 +443,8 @@ def _print_control_catalog(priority: str | None) -> None:
 
 
 def _print_control_description(key: str) -> None:
+    """输出指定网格控制项的详细说明。"""
+
     spec = describe_control(key)
     print(f"控制键：{spec.key}")
     print(f"说明：{spec.description}")

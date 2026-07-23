@@ -1,3 +1,5 @@
+"""定义、解析、校验并解析 AutoGrid 17.1 网格控制项。"""
+
 from __future__ import annotations
 
 import math
@@ -52,21 +54,29 @@ class ControlSpec:
 
     @property
     def supports_readback(self) -> bool:
+        """判断该控制项是否支持通过 getter 回读。"""
+
         return self.getter is not None
 
     def map_api_value(self, value: Any) -> Any:
+        """将公开控制值映射为 AutoGrid API 所需值。"""
+
         for public_value, api_value in self.value_map:
             if value == public_value:
                 return api_value
         return value
 
     def setter_for_value(self, value: Any) -> str | None:
+        """根据控制值选择对应的 AutoGrid setter。"""
+
         for public_value, method in self.setter_by_value:
             if value == public_value:
                 return method
         return self.setter
 
     def to_dict(self) -> dict[str, Any]:
+        """将控制规格转换为可序列化字典。"""
+
         data = asdict(self)
         data["supports_readback"] = self.supports_readback
         data["unit"] = "m" if self.si_length else None
@@ -75,15 +85,21 @@ class ControlSpec:
 
 @dataclass(frozen=True)
 class EntitySelector:
+    """描述控制表达式中的实体类型、匹配方式和值。"""
+
     kind: str
     mode: str
     value: str | int
 
     @property
     def specificity(self) -> int:
+        """返回选择器的匹配精确度。"""
+
         return 0 if self.mode == "wildcard" else 1
 
     def canonical(self) -> str:
+        """返回选择器的规范化文本表示。"""
+
         if self.mode == "wildcard":
             return f"{self.kind}:*"
         if self.mode == "index":
@@ -91,11 +107,15 @@ class EntitySelector:
         return f"{self.kind}:{self.value}"
 
     def to_dict(self) -> dict[str, Any]:
+        """将实体选择器转换为可序列化字典。"""
+
         return asdict(self)
 
 
 @dataclass(frozen=True)
 class ControlRequest:
+    """表示用户提交且已经通过基础解析的控制请求。"""
+
     raw: str
     key: str
     selectors: tuple[EntitySelector, ...]
@@ -105,6 +125,8 @@ class ControlRequest:
 
     @property
     def selector_path(self) -> str:
+        """返回控制请求的规范化实体路径。"""
+
         if self.spec.scope == "configuration":
             return "configuration"
         path = "/".join(selector.canonical() for selector in self.selectors)
@@ -114,9 +136,13 @@ class ControlRequest:
 
     @property
     def specificity(self) -> int:
+        """返回请求中所有实体选择器的总精确度。"""
+
         return sum(selector.specificity for selector in self.selectors)
 
     def to_dict(self) -> dict[str, Any]:
+        """将控制请求转换为可序列化字典。"""
+
         return {
             "raw": self.raw,
             "key": self.key,
@@ -129,16 +155,22 @@ class ControlRequest:
 
 @dataclass(frozen=True)
 class TargetEntity:
+    """表示几何中可应用控制的具体目标实体。"""
+
     kind: str
     index: int | None
     name: str
 
     def to_dict(self) -> dict[str, Any]:
+        """将目标实体转换为可序列化字典。"""
+
         return {"kind": self.kind, "index": self.index, "name": self.name}
 
 
 @dataclass(frozen=True)
 class ResolvedControl:
+    """表示已展开通配符并绑定具体实体的控制项。"""
+
     control_id: str
     key: str
     target: tuple[TargetEntity, ...]
@@ -157,12 +189,16 @@ class ResolvedControl:
 
     @property
     def target_path(self) -> str:
+        """返回已解析目标实体的规范化路径。"""
+
         return "/".join(
             f"{part.kind}:#{part.index}" if part.index is not None else f"{part.kind}:{part.name}"
             for part in self.target
         ) or "configuration"
 
     def to_dict(self) -> dict[str, Any]:
+        """将已解析控制项转换为可序列化字典。"""
+
         return {
             "id": self.control_id,
             "key": self.key,
@@ -212,6 +248,8 @@ def _add(
     not_applicable_when: str | None = None,
     setter_mode: str = "value",
 ) -> None:
+    """向内部注册表添加一条完整控制规格。"""
+
     _SPECS.append(
         ControlSpec(
             key=key,
@@ -256,6 +294,8 @@ def _direct(
     scope: str | None = None,
     setter_mode: str = "value",
 ) -> None:
+    """注册可直接映射到单个 API 方法的控制规格。"""
+
     resolved_getter = method.replace("set_", "get_", 1) if getter == "auto" else getter
     _add(
         key,
@@ -1739,6 +1779,8 @@ def parse_control_assignment(raw: str, *, source: str = "--set") -> ControlReque
 
 
 def parse_control_assignments(assignments: Iterable[str]) -> list[ControlRequest]:
+    """批量解析控制表达式并拒绝重复定义。"""
+
     requests = [parse_control_assignment(raw) for raw in assignments]
     seen: dict[tuple[str, tuple[EntitySelector, ...]], ControlRequest] = {}
     for request in requests:
@@ -1752,6 +1794,8 @@ def parse_control_assignments(assignments: Iterable[str]) -> list[ControlRequest
 
 
 def parse_control_value(raw_value: str, spec: ControlSpec) -> Any:
+    """按控制规格解析文本值并校验类型与范围。"""
+
     value_type = spec.value_type
     try:
         if value_type == "bool":
@@ -1795,6 +1839,8 @@ def parse_control_value(raw_value: str, spec: ControlSpec) -> Any:
 
 
 def validate_wizard_compatibility(requests: Sequence[ControlRequest], *, use_row_wizard: bool) -> None:
+    """校验 RowWizard 开关是否与向导阶段控制项兼容。"""
+
     if use_row_wizard:
         return
     wizard_keys = sorted({request.key for request in requests if request.spec.scope == "wizard"})
@@ -1803,6 +1849,8 @@ def validate_wizard_compatibility(requests: Sequence[ControlRequest], *, use_row
 
 
 def convert_si_length(value: Any, units_factor: float | None) -> Any:
+    """将以米输入的长度转换为几何项目单位。"""
+
     if units_factor is None or units_factor <= 0:
         raise ControlValidationError("几何文件缺少有效 UNITS-FACTOR，无法执行 SI 长度换算")
     if isinstance(value, tuple):
@@ -1874,6 +1922,8 @@ def resolve_control_requests(
 
 
 def list_control_specs(priority: str | None = None) -> list[ControlSpec]:
+    """按优先级筛选并返回已注册的控制规格。"""
+
     if priority is not None:
         normalized = priority.upper()
         if normalized not in PRIORITIES:
@@ -1883,6 +1933,8 @@ def list_control_specs(priority: str | None = None) -> list[ControlSpec]:
 
 
 def describe_control(key: str) -> ControlSpec:
+    """返回指定键的控制规格，不存在时抛出校验错误。"""
+
     try:
         return CONTROL_REGISTRY[key]
     except KeyError as exc:
@@ -1890,6 +1942,8 @@ def describe_control(key: str) -> ControlSpec:
 
 
 def _parse_selector(raw: str) -> EntitySelector:
+    """解析单个实体选择器表达式。"""
+
     if ":" not in raw:
         raise ControlValidationError(
             f"无效实体选择器：{raw}；实体名含 '/' 或 '=' 时必须改用 #N 索引"
@@ -1908,6 +1962,8 @@ def _parse_selector(raw: str) -> EntitySelector:
 
 
 def _validate_range(value: Any, spec: ControlSpec) -> None:
+    """校验标量或元组值是否位于控制规格允许范围内。"""
+
     values = value if isinstance(value, tuple) else (value,)
     if spec.value_type in {"bool", "enum"}:
         return
@@ -1919,6 +1975,8 @@ def _validate_range(value: Any, spec: ControlSpec) -> None:
 
 
 def _candidate_targets(spec: ControlSpec, geometry: Any) -> list[tuple[TargetEntity, ...]]:
+    """根据几何拓扑枚举控制规格可能作用的目标实体。"""
+
     if not spec.hierarchy:
         return [()]
     if spec.hierarchy == ("existing-effect",):
@@ -1973,6 +2031,8 @@ def _candidate_targets(spec: ControlSpec, geometry: Any) -> list[tuple[TargetEnt
 
 
 def _indexed_unknown_targets(prefix: tuple[TargetEntity, ...], kind: str) -> list[tuple[TargetEntity, ...]]:
+    """为几何文件无法计数的既有效果创建静态索引候选。"""
+
     # geomTurbo 不携带这些已有技术效果的可靠数量。保留 #1..#99 的静态候选，
     # AutoGrid 脚本会以正式 accessor 严格确认实体是否真实存在。
     return [prefix + (TargetEntity(kind, index, f"#{index}"),) for index in range(1, 100)]
@@ -1982,6 +2042,8 @@ def _target_matches(
     selectors: tuple[EntitySelector, ...],
     target: tuple[TargetEntity, ...],
 ) -> bool:
+    """判断一组选择器是否与具体目标实体路径匹配。"""
+
     if len(selectors) != len(target):
         return False
     for selector, entity in zip(selectors, target):
@@ -1997,6 +2059,8 @@ def _target_matches(
 
 
 def _hashable_value(value: Any) -> Any:
+    """将列表值转换为可参与冲突检测的可哈希形式。"""
+
     return tuple(value) if isinstance(value, list) else value
 
 

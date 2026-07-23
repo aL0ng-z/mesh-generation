@@ -176,7 +176,6 @@ C:\ProgramData\NUMECA\fine171\_python\_autogrid\Autogrid.py
 审计可复现：
 
 ```powershell
-conda activate LLM
 python -c "from collections import Counter; from controls import audit_autogrid_source; p=r'C:\ProgramData\NUMECA\fine171\_python\_autogrid\Autogrid.py'; print(Counter(x['status'] for x in audit_autogrid_source(p)))"
 ```
 

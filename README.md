@@ -36,11 +36,7 @@ archive/                v0～v6 历史快照；当前实现完全不读取
 
 ## 运行环境
 
-所有 Python 命令和测试均在 conda 环境 `LLM` 中执行：
-
-```powershell
-conda activate LLM
-```
+项目仅依赖 Python 标准库，无需安装第三方包，使用系统任意 Python ≥3.7 即可运行。
 
 真实网格生成需要 NUMECA AutoGrid/IGG 17.1。IGG 路径按以下顺序解析：
 
@@ -251,7 +247,6 @@ quality
 只运行当前根目录测试：
 
 ```powershell
-conda activate LLM
 python -m pytest tests -q
 ```
 
