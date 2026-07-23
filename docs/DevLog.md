@@ -80,3 +80,30 @@
 - 为 `mesh.py`、`geomturbo.py`、`autogrid.py`、`quality.py` 和 `controls.py` 补充中文模块级 docstring。
 - 为上述脚本中的类、属性、公开函数和内部辅助函数补充简洁的中文用途说明。
 - 本次变更仅完善源码文档，不修改网格生成、控制解析或质量判定逻辑。
+
+## 2026-07-23：补充 MESH_CONTROL_ITEMS 和 QUALITY_CRITERIA 文档
+
+### MESH_CONTROL_ITEMS.md 补充内容
+
+- 新增"参数设置途径"章节，详细说明独立 CLI 参数（7 个 P0 高频项及映射表）、通用 `--set` 表达式和 Python API 三种设置方式。
+- 新增"值类型与校验规则"表格，涵盖 bool / int / float / enum / tuple_int / tuple_float / SI 长度七种类型的 CLI 输入格式和校验规则，以及 SI 换算公式。
+- 新增"按作用域分类总览"章节，按 target_kind 分组列出全部 341 个控制键的分布：configuration 20 项、wizard 13 项、row 39 项、blade 121 项、gap/partial-gap/fillet 19 项、interface 12 项、endwall/snubber/blade-sheet/stagnation-point 22 项、holes-line/endwall-holes-line/pin-fins-line/basin-hole 49 项、existing-effect/solid-body/lete-wizard 37 项，末尾附汇总表。
+- 新增"P0 控制项 CLI 映射速查"表，列出 10 个 P0 控制键的 CLI 参数、值类型和范围/枚举。
+- 新增"P1 控制项完整列表"，按 wizard / row / blade Default / gap / interface 分组列出全部 59 个 P1 键。
+
+### QUALITY_CRITERIA.md 补充内容
+
+- 新增"完整指标字段清单"章节（共 10 个子节），逐类列出所有可提取字段：
+  - 全局计数（3 个）：negative_cells / number_of_points / grid_levels
+  - 六类准则统计值（18 个）：每类 min/max/avg 字段名
+  - 最差位置字段（12 个）：每类 critical_location + block 字段名
+  - 壁面距离 SI 换算（4 个）：si.unit + si.min/max/avg
+  - 衍生指标（2 个）：wall_distance_uniformity / generation_time_seconds
+  - 元数据（7 个）：版本/日期/耗时/有效性/重叠状态等
+  - 项目信息（6+ 个）：含逐行字段详解
+  - 逐实体指标：entities[] 结构说明
+  - 质量判定（3 个）：status / accepted / reasons
+  - 辅助字段（2 个）：metrics_source / metrics
+- 新增"指标总数汇总"表，按类别统计独立字段数（基础约 55 个，含逐行约 100+）。
+- 新增"评估必需字段"列表，说明 evaluate_quality() 检查的 8 个必需字段。
+- 新增"CGNS 降级差异"说明，列出 CGNS 内嵌解析无法恢复的字段类别。

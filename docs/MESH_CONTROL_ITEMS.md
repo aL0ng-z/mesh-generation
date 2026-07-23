@@ -200,3 +200,181 @@ python -c "from collections import Counter; from controls import audit_autogrid_
 - setter、getter 或网格生成抛出异常。
 
 dry-run 只在 `controls.resolved` 中记录 `planned`，不会把控制写成 `applied`。
+
+## 参数设置途径
+
+控制参数支持三种设置方式，覆盖从快速原型到批量脚本的不同场景。
+
+### 途径 1：独立 CLI 参数（7 个 P0 高频项）
+
+以下 P0 控制项在 `mesh.py` 中有专用命令行参数，无需书写 `--set` 表达式：
+
+| CLI 参数 | 对应控制键 | 值类型 | 说明 |
+|---|---|---|---|
+| `--mesh-level` | `row/mesh_level` | enum | `coarse`/`medium`/`fine`/`user`，作用于所有行 |
+| `--target-points` | `row/target_points` | int | user 级别的目标点数，作用于所有行 |
+| `--first-cell-width` | `wizard/first_cell_width` | float（米） | 所有行首层单元宽度 |
+| `--spanwise-paths` | `wizard/spanwise_paths` | int | 所有行 RowWizard 展向 flow paths 数 |
+| `--gap-points` | `gap/spanwise_points` | int | 所有已有 gap 的展向点数 |
+| `--optimization-steps` | `row/optimization.steps` | int | 所有行普通优化步数 |
+| `--gap-optimization-steps` | `row/optimization.gap_steps` | int | 所有行 gap 优化步数 |
+
+快捷参数均采用 `row:*` wildcard，作用于几何中所有匹配实体。需要逐行差异化时改用 `--set`。
+
+### 途径 2：通用 `--set` 表达式（全部 341 个控制键）
+
+```bash
+python mesh.py input.geomTurbo --set "row:*/mesh_level=medium"
+python mesh.py input.geomTurbo --set "row:Rotor/blade:#1/b2b.default.streamwise_inlet_points=33"
+python mesh.py input.geomTurbo --set "configuration/grid_levels=3"
+```
+
+`--set` 可在一条命令中重复多次，每次定义一个控制项。
+
+### 途径 3：Python API（程序化调用）
+
+```python
+from controls import parse_control_assignments, resolve_control_requests
+from geomturbo import parse_geomturbo
+
+geometry = parse_geomturbo("input.geomTurbo")
+requests = parse_control_assignments([
+    "row:*/mesh_level=fine",
+    "configuration/grid_levels=3",
+])
+resolved = resolve_control_requests(requests, geometry)
+# resolved 可直接传入 run_autogrid_init(..., controls=resolved)
+```
+
+## 值类型与校验规则
+
+| 值类型 | CLI 输入示例 | 校验规则 |
+|---|---|---|
+| `bool` | `true`、`false`、`1`、`0` | 仅接受这四个字面量，大小写敏感（小写） |
+| `int` | `73`、`-1` | 正则 `[+-]?\d+`，受 `minimum`/`maximum` 约束 |
+| `float` | `0.001`、`1.5e-5` | 必须是有限浮点数（拒绝 `inf`/`nan`），受 min/max 约束 |
+| `enum` | `coarse`、`medium` | 必须精确匹配注册表中的 `enum_values` 列表 |
+| `tuple_int` | `0,5,3` | 逗号分隔定长整数元组，每个元素受 min/max 约束 |
+| `tuple_float` | `0.3,0.4,0.3` | 逗号分隔定长浮点元组，每个元素受 min/max 约束 |
+| **SI 长度** | 以**米**输入 | 自动除以 `UNITS-FACTOR` 转换为项目单位值；缺少有效换算因子时报错 |
+
+长度参数（`si_length=True`）的转换公式：
+
+```text
+project_value = requested_si / units_factor
+```
+
+请求值、项目单位值、传给 API 的值和 getter 回读值均进入 `run_summary.json`，完整可审计。
+
+## 按作用域分类总览
+
+以下按 `target_kind` 列出全部 341 个控制键的分布。完整、可执行的权威来源仍是 `controls.py` 中的 `CONTROL_REGISTRY`；此表用于快速定位。
+
+### configuration（全局配置）— 20 项
+
+| 子类 | 控制键（局部） | 数量 | 类型 | 阶段 |
+|---|---|---|---|---|
+| 多重网格 | `grid_levels` | 1 | int (1–9) | configuration |
+| 支撑曲线 | `support_curve_control_points` | 1 | int (2–10001) | configuration |
+| inlet bulb | `inlet_bulb.topology`、`.streamwise_points`、`.h_streamwise_points`、`.spanwise_points`、`.c_block_points`、`.radial_points`、`.singular_line`、`.smoothing_steps`、`.butterfly_smoothing_steps` | 9 | enum + 6 int + 2 int | topology / distribution / optimization |
+| outlet bulb | `outlet_bulb.topology`、`.streamwise_points`、`.h_streamwise_points`、`.spanwise_points`、`.c_block_points`、`.radial_points`、`.singular_line`、`.smoothing_steps`、`.butterfly_smoothing_steps` | 9 | enum + 6 int + 2 int | topology / distribution / optimization |
+
+### wizard（RowWizard 与声学）— 13 项
+
+| 子类 | 控制键（局部） | 数量 | P0/P1/P2 |
+|---|---|---|---|
+| 基础向导 | `grid_level`、`spanwise_paths`、`first_cell_width`（3 个 P0）；`far_field_spanwise_paths`、`far_field_constant_cells_percent`、`full_matching`、`blade_tip_rounded_topology`（4 个 P1） | 7 | P0×3 + P1×4 |
+| 声学向导 | `acoustic.max_span_cell_size`、`acoustic.max_far_field_span_cell_size`、`acoustic.max_b2b_cell_size`、`acoustic.max_stream_cell_size`、`acoustic.max_bulb_stream_cell_size`（5 个 SI 长度）；`acoustic.far_field_reference_layer`（1 个 int） | 6 | 全部 P2 |
+
+### row（叶排行级）— 39 项
+
+| 子类 | 控制键（局部） | 数量 | P0/P1/P2 |
+|---|---|---|---|
+| 网格密度 | `mesh_level`、`target_points` | 2 | P0 |
+| 流向权重 | `streamwise_weight`（tuple_float×3） | 1 | P1 |
+| 上下游 | `upstream.relaxation`、`upstream.untwist`、`upstream.untwist_location`、`downstream.relaxation`、`downstream.before_nozzle_relaxation`、`downstream.untwist`、`downstream.untwist_location` | 7 | P2×7 |
+| gap 插值 | `gap.hub_interpolation`、`gap.shroud_interpolation`、`gap.hub_interpolation_location`、`gap.shroud_interpolation_location` | 4 | P1 |
+| 展向/聚集/其他 | `span_interpolation`、`clustering`、`enforce_blade_wall_cell_width`、`bladeless_mesh` | 4 | P1×3 + P2×1 |
+| 优化 | `optimization.steps`、`.gap_steps`（2 个 P0）；`.full_multigrid_steps`、`.boundary_steps`、`.straight_boundary`、`.freeze_skin`、`.orthogonality`、`.gap_orthogonality`、`.wake`、`.nmb`、`.skewness`、`.gap_skewness`、`.multigrid`（11 个 P1） | 13 | P0×2 + P1×11 |
+| flow path | `flow_path.number`（P0）；`.hub_clustering`、`.shroud_clustering`、`.constant_cells`、`.control_points`、`.intermediate_points`、`.smoothing_steps`、`.distribution_smoothing_steps`（7 个 P1） | 8 | P0×1 + P1×7 |
+
+### blade（叶片 B2B 与边缘处理）— 121 项
+
+| 子类 | 范围 | 数量 | 优先级 |
+|---|---|---|---|
+| 拓扑选择 | `blade/b2b.topology` | 1 | P2 |
+| Default 拓扑枚举 | `b2b.default.type`、`.periodicity`、`.inlet_stagger`、`.outlet_stagger` | 4 | P2 |
+| Default 布尔开关 | `b2b.default.high_stagger_optimization` 等 12 项（含 wake_control/wake_prolongation 为 P1） | 12 | P1×2 + P2×10 |
+| Default 点数 | `b2b.default.azimuthal_inlet_points` 等 14 项 | 14 | P1 |
+| Default 边界层 | `b2b.default.cell_width_at_wall` 等 9 项 | 9 | P1 |
+| Default 分布 | `b2b.default.throat_points` 等 13 项 | 13 | P2 |
+| HOH | `b2b.hoh.inlet_extension` 等 41 项（含延伸块、点数 16 项、gap 匹配与尺寸比、edge 控制、边界层） | 41 | P2 |
+| H&I | `b2b.hi.h_full` 等 20 项（含 H 块开关 4 项、点数 14 项、聚集松弛 2 项） | 20 | P2 |
+| 边缘处理 | `edge_treatment.leading_blunt` 等 7 项 | 7 | P2 |
+
+### 其他目标实体 — 148 项
+
+| target_kind | 控制键示例 | 数量 | 优先级 |
+|---|---|---|---|
+| `gap` | `topology`（枚举 HO/O/O2H）、`clustering`（P1）、`spanwise_points`（P0）、`constant_cells` | 4 | P0×1 + P1×1 + P2×2 |
+| `partial-gap` | `leading_edge_points`、`trailing_edge_points`、`streamwise_cell_width`（SI）、`spanwise_cell_width`（SI）、`clustering_relaxation`、`constant_cells`、`spanwise_points` | 7 | P2 |
+| `fillet` | `clustering`、`leading_edge_clustering`、`trailing_edge_clustering`、`spanwise_height_clustering`、`constant_cells`、`spanwise_points`、`butterfly_topology`、`butterfly_radial_points` | 8 | P2 |
+| `interface` | `streamwise_points`（P1）、`b2b_control`（P1）、`streamwise_cell_width`（P1/SI）、`streamwise_index`、`geometry_fixed`、`clustering_relaxation_factor`、`relative_location`、`z_cst`、`r_cst`（SI）、`clustering_relaxation_location`、`shape`、`reference_frame` | 12 | P1×3 + P2×9 |
+| `endwall` | `spanwise_points`、`connected_layers`、`optimization_steps`、`generation_type` | 4 | P2 |
+| `snubber` | `clustering`、`skin_expansion`、`leading_edge_relative_control`、`trailing_edge_relative_control`、`spanwise_index`、`skin_points`、`upstream_points`、`downstream_points`、`spanwise_points`、`fillet_butterfly_radial_points` | 10 | P2 |
+| `blade-sheet` | `leading_edge_points`、`trailing_edge_points` | 2 | P2 |
+| `stagnation-point` | `distribution_type`（枚举）、`distribution_cell_length`（SI）、`distribution_absolute_distance`（SI）、`distribution_relative_distance`、`constant_cells_percent`、`parametric_location` | 6 | P2 |
+| `holes-line` | `boundary_layer_points`、`streamwise_points`、`spanwise_points`、`streamwise_left_points`、`streamwise_right_points`、`spanwise_up_points`、`spanwise_down_points`、`inside_optimization_steps`、`around_optimization_steps`、`upstream_wake_length`、`downstream_wake_length`、`preserved_lower_layers`、`preserved_upper_layers`、`intersection_tolerance` | 14 | P2 |
+| `endwall-holes-line` | 继承 holes-line 13 项（不含 spanwise_points）+ 额外 `up_clustering`、`down_clustering`、`azimuthal_points` | 16 | P2 |
+| `pin-fins-line` | 同 holes-line 14 项 | 14 | P2 |
+| `basin-hole` | `optimization_steps`、`streamwise_resolution`、`boundary_optimization_steps`、`hole_side_points`、`boundary_layer_points` | 5 | P2 |
+| `existing-effect` | `maximum_expansion`、`general_maximum_expansion`、`boundary_layer_maximum_expansion`、`boundary_maximum_expansion`、`clustering_relaxation_angle`、`solid_wall_clustering`、`smoothing_steps`、`constant_cells_percent`、`radial_expansion`、`far_field_smoothing_steps`、`theta_deviation_propagation`、`azimuthal_points`、`periodic_fnmb_row_connection`、`periodic_fnmb_rs_connection`、`periodic_rs_connection`、`matching_rs_connection`、`h_topology_corners`、`h_topology_thin_films`、`special_boundary_layer_distribution` | 19 | P2 |
+| `solid-body` | `streamwise_distribution`（枚举）、`azimuthal_points`、`b2b_relaxation`、`keep_blade_mesh`、`keep_mesh_around_skin`、`keep_cooling_channel_mesh`、`keep_skin_mesh` | 7 | P2 |
+| `lete-wizard` | `blade_type`（枚举）、`hub_clustering`、`shroud_clustering`、`layers`、`control_points`、`constant_cells`、`hub_expansion`、`shroud_expansion`、`leading_chord_tolerance`、`trailing_chord_tolerance`、`iteration_steps` | 11 | P2 |
+| `configuration`（bypass） | `bypass.topology`、`bypass.boundary_layer_relative_width`、`bypass.nozzle_index`、`bypass.clustering`、`bypass.spanwise_points`、`bypass.streamwise_points`、`bypass.relative_control_distance`、`bypass.upstream_points`、`bypass.downstream_points`、`bypass.inlet_distribution_relaxation` | 10 | P2 |
+
+### 汇总
+
+| 作用域大类 | 控制键数 |
+|---|---:|
+| configuration（含 bypass） | 20 |
+| wizard（含 acoustic） | 13 |
+| row | 39 |
+| blade（B2B + edge treatment） | 121 |
+| gap / partial-gap / fillet | 19 |
+| interface | 12 |
+| endwall / snubber / blade-sheet / stagnation-point | 22 |
+| holes-line / endwall-holes-line / pin-fins-line / basin-hole | 49 |
+| existing-effect / solid-body / lete-wizard | 37 |
+| **合计** | **341**（P0: 10, P1: 59, P2: 272） |
+
+## P0 控制项 CLI 映射速查
+
+| 控制键 | CLI 快捷参数 | 值类型 | 范围/枚举 |
+|---|---|---|---|
+| `configuration/grid_levels` | 仅 `--set` | int | 1–9 |
+| `row/mesh_level` | `--mesh-level` | enum | coarse / medium / fine / user |
+| `row/target_points` | `--target-points` | int | 100–2,000,000,000 |
+| `row/flow_path.number` | 仅 `--set` | int | 3–10001 |
+| `row/optimization.steps` | `--optimization-steps` | int | 0–100000 |
+| `row/optimization.gap_steps` | `--gap-optimization-steps` | int | 0–100000 |
+| `wizard/grid_level` | 仅 `--set` | enum | coarse / medium / fine / user |
+| `wizard/first_cell_width` | `--first-cell-width` | float（米） | > 0 |
+| `wizard/spanwise_paths` | `--spanwise-paths` | int | 3–10001 |
+| `gap/spanwise_points` | `--gap-points` | int | 2–10001 |
+
+## P1 控制项完整列表
+
+查询实时目录：`python mesh.py --list-controls P1`。以下为 P1 全部 59 项的速览：
+
+**wizard（4 项）：** `wizard/far_field_spanwise_paths`、`wizard/far_field_constant_cells_percent`、`wizard/full_matching`、`wizard/blade_tip_rounded_topology`
+
+**row（27 项）：** `row/streamwise_weight`、`row/gap.hub_interpolation`、`row/gap.shroud_interpolation`、`row/gap.hub_interpolation_location`、`row/gap.shroud_interpolation_location`、`row/enforce_blade_wall_cell_width`、`row/span_interpolation`、`row/clustering`、`row/optimization.full_multigrid_steps`、`row/optimization.boundary_steps`、`row/optimization.straight_boundary`、`row/optimization.freeze_skin`、`row/optimization.orthogonality`、`row/optimization.gap_orthogonality`、`row/optimization.wake`、`row/optimization.nmb`、`row/optimization.skewness`、`row/optimization.gap_skewness`、`row/optimization.multigrid`、`row/flow_path.hub_clustering`、`row/flow_path.shroud_clustering`、`row/flow_path.constant_cells`、`row/flow_path.control_points`、`row/flow_path.intermediate_points`、`row/flow_path.smoothing_steps`、`row/flow_path.distribution_smoothing_steps`
+
+**blade Default（25 项）：** `blade/b2b.default.wake_control`（P1）、`blade/b2b.default.wake_prolongation`（P1）、`blade/b2b.default.azimuthal_inlet_points` 等 14 项点数、`blade/b2b.default.cell_width_at_wall` 等 9 项边界层/单元宽度
+
+**gap（1 项）：** `gap/clustering`
+
+**interface（3 项）：** `interface/streamwise_points`、`interface/b2b_control`、`interface/streamwise_cell_width`
+
+> **注意：** 除以上标注外，`row/mesh_level`、`row/target_points`、`row/flow_path.number`、`row/optimization.steps`、`row/optimization.gap_steps`、`wizard/grid_level`、`wizard/first_cell_width`、`wizard/spanwise_paths`、`gap/spanwise_points`、`configuration/grid_levels` 属于 P0，不在 P1 列表中。
