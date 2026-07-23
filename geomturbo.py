@@ -11,6 +11,9 @@ class BladeInfo:
     name: str
     number_of_blades: int | None = None
     has_tip_gap: bool = False
+    gap_sides: tuple[str, ...] = ()
+    partial_gap_sides: tuple[str, ...] = ()
+    fillet_sides: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -105,12 +108,25 @@ def _parse_rows(text: str) -> list[RowInfo]:
                     "name": f"blade_{len(current_row['blades']) + 1}",
                     "number_of_blades": None,
                     "has_tip_gap": False,
+                    "gap_sides": [],
+                    "partial_gap_sides": [],
+                    "fillet_sides": [],
                 }
-            elif block == "nitipgap":
+            elif block in {"nitipgap", "nishroudgap", "nihubgap"}:
                 if current_blade is not None:
-                    current_blade["has_tip_gap"] = True
+                    side = "hub" if block == "nihubgap" else "shroud"
+                    current_blade["gap_sides"].append(side)
+                    current_blade["has_tip_gap"] = side == "shroud" or current_blade["has_tip_gap"]
                 if current_row is not None:
                     current_row["has_tip_gap"] = True
+            elif block in {"nitippartialgap", "nishroudpartialgap", "nihubpartialgap"}:
+                if current_blade is not None:
+                    side = "hub" if block == "nihubpartialgap" else "shroud"
+                    current_blade["partial_gap_sides"].append(side)
+            elif block in {"nitipfillet", "nishroudfillet", "nihubfillet"}:
+                if current_blade is not None:
+                    side = "hub" if block == "nihubfillet" else "shroud"
+                    current_blade["fillet_sides"].append(side)
             elif block == "ninonaxisurfaces" and block_arg == "tip_gap" and current_row is not None:
                 current_row["has_tip_gap"] = True
             continue
@@ -124,6 +140,9 @@ def _parse_rows(text: str) -> list[RowInfo]:
                         name=current_blade["name"],
                         number_of_blades=current_blade["number_of_blades"],
                         has_tip_gap=current_blade["has_tip_gap"],
+                        gap_sides=_unique_tuple(current_blade["gap_sides"]),
+                        partial_gap_sides=_unique_tuple(current_blade["partial_gap_sides"]),
+                        fillet_sides=_unique_tuple(current_blade["fillet_sides"]),
                     )
                 )
                 current_blade = None
@@ -189,3 +208,7 @@ def _to_int(value: str) -> int | None:
         return int(float(value.split()[0]))
     except (IndexError, ValueError):
         return None
+
+
+def _unique_tuple(values: list[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(values))

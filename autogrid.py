@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+import re
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
+
+from controls import CONTROL_REGISTRY, MAPPED_SETTERS, ResolvedControl
+
+
+CONTROL_RESULT_MARKER = "AGMESH_CONTROL_RESULT:"
 
 
 @dataclass(frozen=True)
@@ -16,6 +23,8 @@ class AutoGridRun:
     run_dir: str
     script: str
     outputs: dict[str, str]
+    control_results: list[dict[str, Any]] = field(default_factory=list)
+    error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -30,6 +39,7 @@ def run_autogrid_init(
     use_row_wizard: bool = True,
     dry_run: bool = False,
     timeout_seconds: int | None = None,
+    controls: Sequence[ResolvedControl] = (),
 ) -> AutoGridRun:
     run_path = Path(run_dir)
     run_path.mkdir(parents=True, exist_ok=True)
@@ -45,6 +55,7 @@ def run_autogrid_init(
             geomturbo_path=geom_copy.resolve(),
             output_prefix=output_prefix,
             use_row_wizard=use_row_wizard,
+            controls=controls,
         ),
         encoding="utf-8",
     )
@@ -58,25 +69,62 @@ def run_autogrid_init(
         str(script_path.resolve()),
     ]
     if dry_run:
-        return AutoGridRun(command=command, returncode=None, run_dir=str(run_path), script=str(script_path), outputs={})
+        return AutoGridRun(
+            command=command,
+            returncode=None,
+            run_dir=str(run_path),
+            script=str(script_path),
+            outputs={},
+            control_results=[control.to_dict() for control in controls],
+            error=None,
+        )
 
-    completed = subprocess.run(
-        command,
-        cwd=run_path.resolve(),
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=timeout_seconds,
-    )
-    (run_path / "stdout.log").write_text(completed.stdout, encoding="utf-8")
-    (run_path / "stderr.log").write_text(completed.stderr, encoding="utf-8")
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=run_path.resolve(),
+            text=False,
+            capture_output=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+        stdout = _completed_text(completed.stdout)
+        stderr = _completed_text(completed.stderr)
+        process_returncode = completed.returncode
+        runner_error = None
+    except subprocess.TimeoutExpired as exc:
+        stdout = _completed_text(exc.stdout)
+        stderr = _completed_text(exc.stderr)
+        process_returncode = 1
+        runner_error = f"AutoGrid 超时（{timeout_seconds} 秒）"
+        stderr = (stderr + "\n" + runner_error).strip()
+    except OSError as exc:
+        stdout = ""
+        stderr = f"{type(exc).__name__}: {exc}"
+        process_returncode = 1
+        runner_error = f"无法启动 IGG：{exc}"
+    (run_path / "stdout.log").write_text(stdout, encoding="utf-8")
+    (run_path / "stderr.log").write_text(stderr, encoding="utf-8")
     outputs = collect_outputs(run_path, output_prefix)
+    parsed_events = parse_control_results(stdout)
+    control_results = merge_control_results(controls, parsed_events)
+    failed_control = next((event for event in parsed_events if event.get("status") == "failed"), None)
+    script_error = _script_error(stderr)
+    effective_returncode = process_returncode
+    if effective_returncode == 0 and (failed_control is not None or script_error is not None):
+        effective_returncode = 1
+    if runner_error is None and failed_control is not None:
+        runner_error = failed_control.get("error") or "AutoGrid 控制应用失败"
+    if runner_error is None and script_error is not None:
+        runner_error = script_error
     return AutoGridRun(
         command=command,
-        returncode=completed.returncode,
+        returncode=effective_returncode,
         run_dir=str(run_path),
         script=str(script_path),
         outputs={key: str(value) for key, value in outputs.items()},
+        control_results=control_results,
+        error=runner_error,
     )
 
 
@@ -85,114 +133,410 @@ def render_autogrid_script(
     geomturbo_path: str | Path,
     output_prefix: str = "mesh",
     use_row_wizard: bool = True,
+    controls: Sequence[ResolvedControl | dict[str, Any]] = (),
 ) -> str:
-    return f'''# Auto-generated for NUMECA AutoGrid5 / IGG batch execution.
-# Starts from geomTurbo only; no .trb template and no manual mesh-parameter overrides.
+    control_plan = _serialize_control_plan(controls)
+    control_plan_json = json.dumps(control_plan, ensure_ascii=True, sort_keys=True)
+    return f'''# -*- coding: utf-8 -*-
+# 由 mesh.py 自动生成，目标版本仅限 NUMECA AutoGrid 17.1。
+# 仅从 geomTurbo 初始化；不读取模板，不修改 .trb 文本。
 
 import os
+import json
 
 GEOMTURBO_FILE = r"{Path(geomturbo_path)}"
 OUTPUT_PREFIX = r"{output_prefix}"
 USE_ROW_WIZARD = {bool(use_row_wizard)!r}
+CONTROL_RESULT_MARKER = {CONTROL_RESULT_MARKER!r}
+CONTROL_PLAN = json.loads({control_plan_json!r})
 
 
-def _call_first(names, args=(), required=True):
-    for name in names:
-        func = globals().get(name)
-        if callable(func):
-            print("Calling", name)
-            return func(*args)
-    message = "No available AutoGrid API among: " + ", ".join(names)
-    if required:
-        raise RuntimeError(message)
-    print(message)
-    return None
+def _require_global(name):
+    value = globals().get(name)
+    if not callable(value):
+        raise RuntimeError(u"缺少 AutoGrid 17.1 API：" + name)
+    return value
 
 
-def _try_method(obj, names, args=()):
-    if obj is None:
+def _entity_name(entity):
+    getter = getattr(entity, "get_name", None)
+    if not callable(getter):
         return None
-    for name in names:
-        method = getattr(obj, name, None)
-        if callable(method):
-            try:
-                print("Calling method", name)
-                return method(*args)
-            except Exception as exc:
-                print("Method failed", name, exc)
+    return getter()
+
+
+def _safe_text(value):
+    try:
+        text_type = unicode
+    except NameError:
+        text_type = str
+    if isinstance(value, text_type):
+        return value
+    if isinstance(value, str):
+        try:
+            return value.decode("utf-8")
+        except Exception:
+            return value.decode("latin1", "replace")
+    try:
+        return text_type(value)
+    except Exception:
+        return text_type(repr(value))
+
+
+def _require_entity(entity, label):
+    if entity is None or entity == 0:
+        raise RuntimeError(u"控制目标不存在：" + label)
+    return entity
+
+
+def _part(control, kind):
+    for item in control.get("target", []):
+        if item.get("kind") == kind:
+            return item
     return None
 
 
-def _try_row_wizard():
+def _row_target(control):
+    item = _part(control, "row")
+    if item is None:
+        raise RuntimeError(u"控制目标缺少 row：" + control["key"])
+    index = int(item["index"])
+    if index < 1 or index > ROW_COUNT:
+        raise RuntimeError(u"叶排索引超出范围：" + str(index))
+    entity = _require_entity(_require_global("row")(index), "row:#" + str(index))
+    actual_name = _entity_name(entity)
+    if actual_name is not None and actual_name != item.get("name"):
+        raise RuntimeError(u"叶排名称与静态解析不一致，索引 #" + str(index) + u"：" + str(actual_name))
+    return entity
+
+
+def _blade_target(control, row_entity):
+    item = _part(control, "blade")
+    if item is None:
+        raise RuntimeError(u"控制目标缺少 blade：" + control["key"])
+    entity = _require_entity(row_entity.blade(int(item["index"])), control.get("target_path", "blade"))
+    actual_name = _entity_name(entity)
+    if actual_name is not None and actual_name != item.get("name"):
+        raise RuntimeError(u"叶片名称与静态解析不一致，索引 #" + str(item["index"]) + u"：" + str(actual_name))
+    return entity
+
+
+def _resolve_target(control):
+    kind = control["target_kind"]
+    if kind == "configuration":
+        return None
+    if kind == "existing-effect":
+        item = _part(control, "existing-effect")
+        index = int(item["index"])
+        count = int(_require_global("a5_get_ZR_effect_number")())
+        if index > count:
+            raise RuntimeError(u"ZR 技术效果索引超出范围：" + str(index))
+        return _require_entity(_require_global("technologicalEffectZR")(index), control.get("target_path", "existing-effect"))
+    row_entity = _row_target(control)
+    if kind == "row":
+        return row_entity
+    if kind == "wizard":
+        return _require_entity(row_entity.row_wizard(), control.get("target_path", "wizard"))
+    if kind == "acoustic-wizard":
+        return _require_entity(row_entity.acoustic_wizard(), control.get("target_path", "acoustic-wizard"))
+    if kind == "interface":
+        name = _part(control, "interface")["name"]
+        accessor = {{"inlet": "inlet", "outlet": "outlet", "outlet2": "outlet2"}}.get(name)
+        if accessor is None:
+            raise RuntimeError(u"不支持的接口选择器：" + str(name))
+        method = getattr(row_entity, accessor, None)
+        if not callable(method):
+            raise RuntimeError(u"缺少 AutoGrid 17.1 接口 accessor：" + accessor)
+        return _require_entity(method(), control.get("target_path", "interface"))
+    if kind == "endwall":
+        name = _part(control, "endwall")["name"]
+        accessor = {{"hub": "hub_end_wall", "shroud": "shroud_end_wall"}}.get(name)
+        method = getattr(row_entity, accessor, None)
+        if not callable(method):
+            raise RuntimeError(u"缺少 AutoGrid 17.1 端壁 accessor：" + str(accessor))
+        return _require_entity(method(), control.get("target_path", "endwall"))
+    if kind == "snubber":
+        index = int(_part(control, "snubber")["index"])
+        if index > int(row_entity.get_number_of_snubbers()):
+            raise RuntimeError(u"Snubber 索引超出范围：" + str(index))
+        return _require_entity(row_entity.snubber(index), control.get("target_path", "snubber"))
+    if kind == "endwall-holes-line":
+        endwall_name = _part(control, "endwall")["name"]
+        endwall = row_entity.hub_end_wall() if endwall_name == "hub" else row_entity.shroud_end_wall()
+        endwall = _require_entity(endwall, control.get("target_path", "endwall"))
+        index = int(_part(control, kind)["index"])
+        return _require_entity(endwall.holes_line(index), control.get("target_path", kind))
+    blade_entity = _blade_target(control, row_entity)
+    if kind == "blade":
+        return blade_entity
+    if kind in ("gap", "partial-gap", "fillet"):
+        item = _part(control, kind)
+        side = item["name"]
+        accessors = {{
+            "gap": {{"hub": "get_hub_gap", "shroud": "get_shroud_gap"}},
+            "partial-gap": {{"hub": "get_hub_partial_gap", "shroud": "get_shroud_partial_gap"}},
+            "fillet": {{"hub": "get_hub_fillet", "shroud": "get_shroud_fillet"}},
+        }}
+        accessor = accessors[kind].get(side)
+        method = getattr(blade_entity, accessor, None)
+        if not callable(method):
+            raise RuntimeError(u"缺少 AutoGrid 17.1 accessor：" + str(accessor))
+        return _require_entity(method(), control.get("target_path", kind))
+    if kind == "blade-sheet":
+        return _require_entity(blade_entity.sheet(), control.get("target_path", kind))
+    if kind == "solid-body":
+        _require_entity(blade_entity.solid_body(), control.get("target_path", kind))
+        return blade_entity
+    if kind == "lete-wizard":
+        return _require_entity(blade_entity.wizard_le_te(), control.get("target_path", kind))
+    if kind == "stagnation-point":
+        name = _part(control, kind)["name"]
+        accessor = "leadingEdgeControl" if name == "leading" else "trailingEdgeControl"
+        return _require_entity(getattr(blade_entity, accessor)(), control.get("target_path", kind))
+    if kind == "holes-line":
+        index = int(_part(control, kind)["index"])
+        if index > int(blade_entity.number_of_holes_lines()):
+            raise RuntimeError(u"孔列索引超出范围：" + str(index))
+        return _require_entity(blade_entity.holes_line(index), control.get("target_path", kind))
+    if kind == "basin-hole":
+        index = int(_part(control, kind)["index"])
+        if index > int(blade_entity.number_of_basin_holes()):
+            raise RuntimeError(u"Basin hole 索引超出范围：" + str(index))
+        return _require_entity(blade_entity.basin_hole(index), control.get("target_path", kind))
+    if kind == "pin-fins-line":
+        index = int(_part(control, kind)["index"])
+        channel = _require_entity(blade_entity.cooling_channel(), control.get("target_path", "cooling-channel"))
+        pin_channel = _require_entity(channel.pinFinsChannel(1), control.get("target_path", "pin-fins-channel"))
+        return _require_entity(pin_channel.pinFins_line(index), control.get("target_path", kind))
+    raise RuntimeError(u"不支持的注册目标类型：" + str(kind))
+
+
+def _check_topology(control, target):
+    allowed = control.get("topologies") or []
+    if not allowed:
+        return
+    getter = getattr(target, "get_b2b_topology_type", None)
+    if not callable(getter):
+        raise RuntimeError(u"控制缺少拓扑 getter：" + control["key"])
+    raw = getter()
+    topology = {{0: "default", 1: "hoh", 2: "user", 3: "hi"}}.get(raw, str(raw).lower())
+    if topology not in allowed:
+        raise RuntimeError(
+            u"控制 " + control["key"] + u" 不适用于拓扑 " + str(topology)
+        )
+
+
+def _control_method(control, target):
+    name = control["setter"]
+    if control.get("setter_mode") == "interface_bool":
+        return None
+    method = _require_global(name) if target is None else getattr(target, name, None)
+    if not callable(method):
+        raise RuntimeError(u"缺少 AutoGrid 17.1 setter：" + name)
+    return method
+
+
+def _invoke_control(control, target):
+    mode = control.get("setter_mode", "value")
+    value = control.get("api_value")
+    if mode == "interface_bool":
+        if control["setter"] == "__bool_b2b_control__":
+            name = "enable_b2b_control" if value else "disable_b2b_control"
+        elif control["setter"] == "__bool_geometry_fixed__":
+            name = "geometry_is_fixed" if value else "geometry_is_not_fixed"
+        else:
+            raise RuntimeError(u"未知接口布尔 setter：" + control["setter"])
+        method = getattr(target, name, None)
+        if not callable(method):
+            raise RuntimeError(u"缺少 AutoGrid 17.1 setter：" + name)
+        return method()
+    method = _control_method(control, target)
+    if mode == "no_args":
+        return method()
+    if mode == "tuple_args":
+        return method(*value)
+    if mode == "row_accuracy_level":
+        getter = getattr(target, "get_coarse_grid_level_target", None)
+        current_target = getter() if callable(getter) else 250000
+        return method(value, current_target)
+    if mode == "row_accuracy_target":
+        getter = getattr(target, "get_coarse_grid_level", None)
+        current_level = getter() if callable(getter) else 4
+        return method(current_level, value)
+    return method(value)
+
+
+def _readback(control, target):
+    name = control.get("getter")
+    if not name:
+        return None
+    getter = _require_global(name) if target is None else getattr(target, name, None)
+    if not callable(getter):
+        raise RuntimeError(u"缺少 AutoGrid 17.1 getter：" + name)
+    return getter()
+
+
+def _emit_control(control, status, readback=None, error=None):
+    event = {{
+        "id": control.get("id"),
+        "key": control.get("key"),
+        "target_path": control.get("target_path"),
+        "requested": control.get("requested"),
+        "project_value": control.get("project_value"),
+        "status": status,
+        "readback": readback,
+        "error": error,
+    }}
+    print(CONTROL_RESULT_MARKER + json.dumps(event, sort_keys=True))
+
+
+def _apply_control(control):
+    try:
+        target = _resolve_target(control)
+        _check_topology(control, target)
+        _invoke_control(control, target)
+        readback = _readback(control, target)
+        _emit_control(control, "applied", readback, None)
+    except Exception as exc:
+        message = _safe_text(exc.__class__.__name__) + u": " + _safe_text(exc)
+        _emit_control(control, "failed", None, message)
+        raise
+
+
+def _apply_stage(stage):
+    for control in CONTROL_PLAN:
+        if control.get("stage") == stage:
+            _apply_control(control)
+
+
+def _generate_row_wizards():
     if not USE_ROW_WIZARD:
         return
-    row_getter = globals().get("row")
-    if not callable(row_getter):
-        print("No row() accessor; skipping row wizard.")
-        return
-    try:
-        row_count = _guess_row_count()
-    except Exception:
-        row_count = 1
-    for index in range(1, row_count + 1):
-        try:
-            row_object = row_getter(index)
-        except Exception as exc:
-            print("Could not access row", index, "skipping row wizard:", exc)
-            continue
-        wizard = _try_method(row_object, ["row_wizard", "get_row_wizard", "wizard"])
-        if wizard is None:
-            print("No row wizard object for row", index)
-            continue
-        _try_method(wizard, ["generate", "apply", "compute"])
+    for index in range(1, ROW_COUNT + 1):
+        row_entity = _require_entity(_require_global("row")(index), "row:#" + str(index))
+        wizard = _require_entity(row_entity.row_wizard(), "row:#" + str(index) + "/wizard")
+        generate = getattr(wizard, "generate", None)
+        if not callable(generate):
+            raise RuntimeError(u"缺少 AutoGrid 17.1 RowWizard.generate")
+        generate()
 
 
-def _guess_row_count():
-    row_getter = globals().get("row")
-    if not callable(row_getter):
-        return 1
-    count = 0
-    for index in range(1, 100):
-        try:
-            value = row_getter(index)
-        except Exception:
-            break
-        if value is None:
-            break
-        count = index
-    return max(count, 1)
+_require_global("a5_new_project")(1)
+_require_global("a5_init_new_project_from_a_geomTurbo_file")(GEOMTURBO_FILE)
+ROW_COUNT = int(_require_global("a5_get_row_number")())
+if ROW_COUNT < 1:
+    raise RuntimeError(u"a5_get_row_number() 未返回有效叶排")
 
+# 阶段顺序：configuration -> wizard setter -> RowWizard.generate。
+_apply_stage("configuration")
+_apply_stage("wizard")
+_generate_row_wizards()
 
-_call_first(["a5_new_project", "a5_create_project", "a5_reset_project"], (1,), required=False)
-_call_first(
-    [
-        "a5_init_new_project_from_a_geomTurbo_file",
-        "a5_init_from_geomTurbo_file",
-        "a5_open_geomturbo",
-        "a5_import_geomturbo",
-        "a5_initialize_from_geomturbo",
-    ],
-    (GEOMTURBO_FILE,),
-)
-_try_row_wizard()
+# wizard 完成后依次应用拓扑、分布、边界层、优化、接口和已有技术效果。
+_apply_stage("topology")
+_apply_stage("distribution")
+_apply_stage("boundary_layer")
+_apply_stage("optimization")
+_apply_stage("interface")
+_apply_stage("existing_effect")
 
 _TRB_OUT = os.path.join(os.getcwd(), OUTPUT_PREFIX + ".trb")
 _IGG_OUT = os.path.join(os.getcwd(), OUTPUT_PREFIX + ".igg")
 _CGNS_OUT = os.path.join(os.getcwd(), OUTPUT_PREFIX + ".cgns")
 
-# AutoGrid derives the .qualityReport file name from the saved project path.
-# Saving only after 3D generation leaves the report name undefined in batch mode.
+# 预保存仅通过正式 API；.trb 永不做字符串修改。
 print("Saving project before generation:", _TRB_OUT)
-_call_first(["a5_save_project"], (_TRB_OUT,), required=False)
+_require_global("a5_save_project")(_TRB_OUT)
 
-_call_first(["a5_generate_b2b_grid", "a5_generate_b2b", "a5_compute_b2b"])
-_call_first(["a5_generate_3d", "a5_generate_3d_grid", "a5_generate_mesh", "a5_compute_mesh"])
+_require_global("a5_generate_flow_paths")()
+_require_global("a5_generate_b2b")()
+_require_global("a5_generate_3d")()
 
-_call_first(["a5_save_project", "a5_save_template"], (_TRB_OUT,), required=False)
-_call_first(["a5_save_mesh"], (_IGG_OUT,))
-_call_first(["a5_export_CGNS_project", "a5_export_unstructured_CGNS"], (_CGNS_OUT,), required=False)
+_require_global("a5_save_project")(_TRB_OUT)
+_require_global("a5_save_mesh")(_IGG_OUT)
+_require_global("a5_export_CGNS_project")(_CGNS_OUT)
 print("AutoGrid geomTurbo init script completed for", OUTPUT_PREFIX)
 '''
+
+
+def _serialize_control_plan(
+    controls: Sequence[ResolvedControl | dict[str, Any]],
+) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    for control in controls:
+        data = control.to_dict() if isinstance(control, ResolvedControl) else dict(control)
+        key = data.get("key")
+        spec = CONTROL_REGISTRY.get(str(key))
+        if spec is None:
+            raise ValueError(f"未知控制键：{key}")
+        setter = data.get("setter")
+        allowed_setters = {method for method in (spec.setter,) if method}
+        allowed_setters.update(method for _, method in spec.setter_by_value)
+        if setter not in allowed_setters or (setter not in MAPPED_SETTERS and not str(setter).startswith("__bool_")):
+            raise ValueError(f"控制 {key} 使用了未注册 setter：{setter}")
+        if spec.setter_by_value:
+            data["setter_mode"] = "no_args"
+        serialized.append(data)
+    return serialized
+
+
+def parse_control_results(stdout: str) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        marker_index = line.find(CONTROL_RESULT_MARKER)
+        if marker_index < 0:
+            continue
+        payload = line[marker_index + len(CONTROL_RESULT_MARKER) :].strip()
+        try:
+            value = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("id"):
+            results.append(value)
+    return results
+
+
+def merge_control_results(
+    controls: Sequence[ResolvedControl],
+    events: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    event_by_id = {str(event.get("id")): dict(event) for event in events}
+    merged: list[dict[str, Any]] = []
+    for control in controls:
+        data = control.to_dict()
+        event = event_by_id.get(control.control_id)
+        if event:
+            data.update(
+                {
+                    "status": event.get("status", "failed"),
+                    "readback": event.get("readback"),
+                    "error": event.get("error"),
+                }
+            )
+        else:
+            data.update({"status": "not_applied", "readback": None, "error": "未收到 AutoGrid 控制结果标记"})
+        merged.append(data)
+    return merged
+
+
+def _completed_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        for encoding in ("utf-8", "gb18030"):
+            try:
+                return value.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def _script_error(stderr: str) -> str | None:
+    if not re.search(r"(?:Traceback \(most recent call last\)|SyntaxError:|RuntimeError:|ValueError:)", stderr):
+        return None
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    return lines[-1] if lines else "AutoGrid Python 脚本执行失败"
 
 
 def collect_outputs(run_dir: str | Path, output_prefix: str = "mesh") -> dict[str, Path]:

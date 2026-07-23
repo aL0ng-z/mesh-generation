@@ -1,173 +1,203 @@
-# AutoGrid 网格控制项调研
+# AutoGrid 17.1 网格控制目录与 API 审计
 
-本文档记录当前主实现（原 v6）后续可能实现的网格控制项。当前只是调研和边界整理，不表示这些参数已经在
-`mesh.py` 中开放。
+本文档说明当前已实现的控制模型。完整、可执行的唯一参数来源是项目根目录 `controls.py` 中的静态 `ControlSpec` 注册表；本文不维护第二份容易失步的手工键清单。
 
-## 当前主实现的实际行为
+## 实现边界
 
-当前主实现只从 `.geomTurbo` 初始化 AutoGrid 项目，然后执行默认网格流程：
+当前只开放“不改变物理几何”的网格生成控制，包括拓扑选择、点数、分布、聚集、边界层、优化、接口以及已有技术效果的网格离散控制。
 
-```text
-geomTurbo -> AutoGrid 初始化 -> 可选 row wizard -> B2B 网格 -> 3D 网格 -> 输出 mesh.*
-```
+明确排除：
 
-当前命令行里真正会影响网格生成的只有：
+- 周期数、转速、通道数量和物理项目类型；
+- gap/partial-gap/fillet 的物理宽度、半径和几何位置；
+- 入口、出口、端壁和远场的物理域位置；
+- 曲面链接、输入几何替换、几何修复或变形；
+- 实体创建、删除、复制和重命名；
+- 仅显示、交互选择、demo、legacy 空操作和重复别名。
 
-| 控制项 | 当前入口 | 影响 |
+程序不接受任意 AutoGrid 方法名，也不提供 `.trb` 字符串覆盖入口。
+
+## 注册表契约
+
+每个 `ControlSpec` 都包含：
+
+| 字段 | 含义 |
+|---|---|
+| `key` | 稳定语义键 |
+| `scope` / `target_kind` / `hierarchy` | 作用域、运行时对象和选择器层级 |
+| `value_type` | `bool`、`int`、`float`、`enum`、整数元组或浮点元组 |
+| `minimum` / `maximum` / `enum_values` | 已知数值边界或合法枚举 |
+| `si_length` | 是否以米作为 CLI 输入单位 |
+| `priority` | P0/P1/P2 使用优先级 |
+| `stage` | 固定应用阶段 |
+| `setter` / `setter_by_value` | 正式 AutoGrid 17.1 API |
+| `getter` | 可选回读 API；为空表示 setter 无异常即视为已应用 |
+| `topologies` | 适用 B2B 拓扑；不匹配时严格失败 |
+| `not_applicable_when` | 已知不适用条件说明 |
+
+当前注册表共有 341 个控制键：P0 10 个、P1 59 个、P2 272 个。
+
+## P0：高频基础控制
+
+| 控制键 | 作用域 | 含义 |
 |---|---|---|
-| 输入几何 | `geomturbo` 位置参数 | 决定通道、叶片、行数、周期数、tip gap 等几何基础。 |
-| 是否调用 row wizard | `--no-row-wizard` | 默认尝试调用 row wizard；关闭后直接生成 B2B 和 3D 网格。 |
+| `configuration/grid_levels` | configuration | 全局多重网格层级 |
+| `row/mesh_level` | row | coarse/medium/fine/user 网格级别 |
+| `row/target_points` | row | user 级别目标点数 |
+| `row/flow_path.number` | row | 叶排 flow path 数 |
+| `row/optimization.steps` | row | 普通优化步数 |
+| `row/optimization.gap_steps` | row | gap 优化步数 |
+| `wizard/grid_level` | row wizard | RowWizard 网格级别 |
+| `wizard/first_cell_width` | row wizard | 首层单元宽度，输入单位为米 |
+| `wizard/spanwise_paths` | row wizard | RowWizard 展向 flow paths 数 |
+| `gap/spanwise_points` | 已有 gap | gap 展向点数 |
 
-其余参数如 `--out`、`--igg`、`--dry-run`、`--timeout` 只控制运行环境和输出目录，不是网格参数。
+其中高频项还具有 `mesh.py` 的显式 CLI 参数；其余控制统一通过 `--set` 使用。
 
-## Row Wizard 是什么
+## P1：常用精细控制
 
-Row Wizard 可以理解为 AutoGrid/Fidelity 面向单个叶轮机械 blade row 的“向导式自动网格设置器”。
-它不是单个网格参数，而是一组自动化步骤：根据当前行的几何和机器类型，设置或重置一批
-B2B/3D 网格参数，然后生成初始结构化网格。
+P1 共 59 项，覆盖：
 
-在当前主实现里，`autogrid.py` 只做了很浅的一层调用：
+- 流向权重和 span interpolation；
+- hub/shroud 点聚集与流向分布；
+- Default B2B 点数及表面流向点数；
+- 边界层点数、厚度、膨胀率和增长率；
+- 前缘/尾缘尺度和聚集；
+- skewness、orthogonality、wake、high-stagger 优化控制；
+- row-to-row matching、interface 相对位置和 matching 精度。
 
-```text
-row(index) -> row_wizard/get_row_wizard/wizard -> generate/apply/compute
-```
-
-也就是说，当前主实现不会在 wizard 对话框层面设置机器类型、转速、gap、fillet、flow path 或
-B2B 参数；它只是尽量调用 AutoGrid 暴露出来的默认 wizard 能力。
-
-Row Wizard 的作用可以概括为：
-
-- 给每个 blade row 建立一套初始网格设置。
-- 自动选择或调整适合该行的拓扑和点分布。
-- 处理常见叶轮机械特征，例如 rotor/stator、周期数、tip/hub gap、fillet、splitter blade。
-- 生成可进一步人工或脚本调整的初始 B2B/3D 网格。
-
-Row Wizard 的价值在于快速得到“可用初值”，不是保证最终质量最优。公开案例中常见工作流是：
-导入 `.geomTurbo`，运行 row wizard 得到初始网格，再手动调整 B2B 和 3D 网格属性以改善质量。
-
-## 资料结论
-
-公开资料能支撑以下判断：
-
-- Cadence 官方把 Row Wizard 描述为快速生成叶轮机械网格的入口。
-- Cadence 官方说明 Fidelity/AutoGrid 支持结构化网格模板、Python API、自动网格点分布、平滑算法、
-  多级/扩压器/旁路等叶轮机械配置。
-- Cadence 官方说明 Fidelity CFD 的 Python API 可访问 GUI 功能，因此理论上可脚本化更多网格设置。
-- 可检索的 AutoGrid5 手册片段说明，3D row mesh 是把 B2B 网格沿 hub-to-shroud flow paths
-  堆叠生成；在无 hub/shroud gap 的情况下，`coarse`、`medium`、`fine` grid level 的默认
-  flow paths 数量分别是 33、57、97。
-- 可检索的 AutoGrid5 教程片段给出过 `Spanwise Grid Point Number = 33`、首层壁面单元宽度
-  `1e-5 m`、B2B 点数建议满足 `4n + 1` 以便 FINE 多重网格使用至少 3 个 grid levels 等设置例子。
-- 公开研究案例中，AutoGrid 常见关键控制量包括壁面/尾缘单元宽度、hub-to-shroud flow paths、
-  tip/hub gap 尺寸、B2B 拓扑、优化步数、gap 优化步数、span interpolation 等。
-- 本仓库已有运行产物 `mesh.trb` 里能看到这些参数名，例如 `FIRST_CELL_WIDTH`、
-  `OPTIMIZATION`、`GAP_OPTIMIZATION_STEPS`、`HOHSkinNStrBlade`、`HOHbladeNpt*`、
-  `HOH_gap_n*`、`WIDTH_AT_LEADING_EDGE`、`WIDTH_AT_TRAILING_EDGE` 等。
-
-## 可实现控制项分级
-
-### 取值/设置示例的使用边界
-
-下面的取值用于增强直观性，不是当前主实现已支持的命令行接口，也不是所有算例可直接照搬的推荐值。
-
-- 单位必须跟随项目单位。`geometries/Rotor37.geomTurbo` 使用 `Meters`，运行产物里 `FIRST_CELL_WIDTH = 1e-005`；
-  `geometries/WP100_comp.geomTurbo` 使用 `Millimeters`，运行产物里 `FIRST_CELL_WIDTH = 0.01`，两者都相当于
-  `1e-5 m`。
-- 点数参数通常受拓扑和多重网格约束。B2B 点数建议优先选 `4n + 1` 形式，例如 `17`、`33`、`57`、
-  `97`。
-- 多行、tandem row、splitter blade 和 matching interface 会引入行间一致性要求；不能只改单行某个
-  点数而不检查接口点数。
-- 如果继续使用 row wizard，网格控制值更稳妥的时机通常是 wizard 之后再设置，或者设置后重新读取
-  `.trb` 验证没有被 wizard 重置。
-
-### A. 适合优先实现的少量控制项
-
-这些项目对用户价值高，语义相对清楚，也不需要把当前主实现变成大配置系统。
-
-| 控制项 | 建议入口 | 作用 | 取值/设置示例 | 实现风险 |
-|---|---|---|---|---|
-| 网格级别预设 | `--mesh-level <level>` | 用少量预设控制整体点数、优化步数和 gap 点数。 | `level` 可取 `coarse`、`medium`、`fine`；可先分别对应 33、57、97 flow paths。该对应关系来自可检索 AutoGrid5 手册片段对无 gap blade 的 grid level 描述。 | 中 |
-| 首层单元高度 | `--first-cell-width <value>` | 控制壁面第一层厚度，服务 y+ 初值。 | 以当前样例为参考：米制算例可写 `1e-5`；毫米制算例可写 `0.01`。该值应由目标 `y+`、速度、密度、黏度和参考长度估算，而不是固定常数。 | 中 |
-| spanwise flow paths | `--spanwise-paths <int>` | 控制 hub-to-shroud 方向分辨率。 | `33` 用于快速检查；`57` 用于中等初筛；`97` 用于更细 spanwise 分辨率。教程案例中也出现过 `Spanwise Grid Point Number = 33`。 | 中 |
-| gap 网格点数 | `--gap-points <int>` 或包含在 preset 中 | 控制 tip/hub gap 内部分辨率。 | 当前 `Rotor37` 和 `WP100` 产物里可见 `HOH_gap_n1 = 5`、`HOH_gap_n2 = 33`。若开放单一 CLI，建议先只控制最小 gap spanwise 点数，例如 `--gap-points 5`、`--gap-points 9`。 | 中 |
-| 优化步数 | `--optimization-steps <int>` | 控制 B2B/3D 平滑优化强度。 | 当前产物里 `OPTIMIZATION = 200`；快速预览可考虑较低值，例如 `50` 或 `100`；正式初始网格保持 `200` 更接近现状。 | 低到中 |
-| gap 优化步数 | `--gap-optimization-steps <int>` | 专门改善 gap 区域质量。 | 当前产物里 `GAP_OPTIMIZATION_STEPS = 100`；无 gap 行可忽略；有 tip/hub gap 的行可用 `50`、`100` 做 preset 档位。 | 低到中 |
-
-建议优先做 `--mesh-level`。它比直接暴露几十个 AutoGrid 内部字段更稳，也符合当前主实现保持简化的方向。
-
-假设后续开放这些入口，命令行可以长这样：
+查询完整目录：
 
 ```powershell
-python mesh.py geometries/Rotor37.geomTurbo --mesh-level coarse --dry-run
-python mesh.py geometries/Rotor37.geomTurbo --mesh-level medium --first-cell-width 1e-5
-python mesh.py geometries/WP100_comp.geomTurbo --mesh-level fine --spanwise-paths 97 --optimization-steps 200 --gap-optimization-steps 100
+python mesh.py --list-controls P1
+python mesh.py --describe-control blade/b2b.default.streamwise_inlet_points
 ```
 
-注意：以上命令是后续接口草案，当前 `mesh.py` 尚不支持这些参数。
+## P2：高级与已有实体控制
 
-### B. 可实现但需要更谨慎的控制项
+P2 共 272 项，覆盖：
 
-这些控制项有明确价值，但一旦直接暴露，会变成 v5 风格的参数覆盖面。更适合在内部 preset 中使用，
-或只给高级用户开放少数稳定参数。
+- Default、HOH、H&I B2B 拓扑及其完整点数/聚集控制；
+- gap 与 partial-gap 拓扑、点数和优化控制；
+- 高级入口、出口、喉部、重叠、声学和远场控制；
+- fillet、snubber、endwall、blade sheet 和 solid-body 的纯网格控制；
+- 已存在孔、端壁孔、针肋、basin hole 和 ZR/3D 技术效果的点数、聚集与优化控制。
 
-| 控制项 | 可能对应的 AutoGrid/.trb 参数 | 说明 | 取值/设置示例 |
-|---|---|---|---|
-| B2B 点数分布 | `HOHbladeNpt1` 到 `HOHbladeNpt8`、`HINBlade*` | 控制叶片前缘、叶身、尾缘、上下游方向点数。 | 当前产物常见组合是 `33, 17, 33, 17, 17, 17, 17, 17`。若手工加密，优先保持 `4n + 1`，例如把局部 `17` 提到 `33`，或把关键方向 `33` 提到 `57`。 |
-| 叶片表面点数 | `HOHSkinNStrBlade*` | 控制 blade skin 方向分辨率。 | `Rotor37` 产物为 `89`；`WP100` 多数行为 `81`，其中一处 `HOHSkinNStrBladeDown = 137`。可作为 preset 内部随 `mesh-level` 增减的候选字段。 |
-| blade-to-blade 聚集 | `HOHBladeToBladeclusteringRatio` | 控制 B2B 方向聚集强度。 | 当前产物为 `0.0125`。建议先只在 preset 内保持或小幅调整，避免用户直接输入无量纲聚集强度。 |
-| streamwise 聚集 | `HOHStreamwiseClusteringRatio` | 控制流向聚集强度。 | 当前产物为 `0.2`。适合跟 B2B 点数一起作为 preset 内部细节。 |
-| 边界层数量/增长 | `HOHSkinNBndLayerGap`、`HOHSkinExpansionRatio` | 控制壁面层和 gap 边界层。 | 当前产物里 `HOHSkinNBndLayerGap = 17`；`HOHSkinExpansionRatio` 约在 `1.05` 到 `1.27`。通常应结合首层高度和总边界层厚度一起调整。 |
-| wake/orthogonality 控制 | `OPTIMIZATION_WAKECONTROL_LEVEL`、`OPTIMIZATION_ORTHOGONALITY_LEVEL` | 控制平滑优化目标权重。 | 当前产物为 `0.5`、`0.5`，gap 内正交性权重也是 `0.5`。更适合作为质量修复策略的一部分，而不是普通 CLI。 |
-| tip/hub 控制宽度 | `TIP_CONTROL_WIDTH_*`、`HUB_CONTROL_WIDTH_*` | 控制端壁附近影响区。 | 单位跟随算例：`Rotor37` tip 控制宽度为 `0.000356 m`；`WP100` tip 控制宽度可见 `0.2 mm` 和 `0.605 mm`，hub 控制宽度可见 `1.347 mm`。不建议跨算例复用。 |
-| gap 前后缘宽度 | `WIDTH_AT_LEADING_EDGE`、`WIDTH_AT_TRAILING_EDGE` | 来自几何或 gap 定义，修改会改变物理间隙。 | `Rotor37` 为 `0.000356 m`；`WP100` 部分行为 `0.2 mm`。这更像几何/gap 定义，不应作为单纯加密参数。 |
+这些控制不会创建技术效果实体。选择器指向不存在的实体或不适用的拓扑时，AutoGrid 阶段会返回失败，不会静默忽略。
 
-注意：`WIDTH_AT_LEADING_EDGE` 和 `WIDTH_AT_TRAILING_EDGE` 更像几何/gap 定义，不只是网格密度。
-如果开放修改，可能改变算例物理含义，应默认从 `.geomTurbo` 读取，不建议作为普通网格参数。
+查询完整目录：
 
-### C. 不建议在当前主实现直接开放的控制项
+```powershell
+python mesh.py --list-controls P2
+python mesh.py --describe-control blade/b2b.hoh.wake_control
+```
 
-| 控制项 | 原因 |
-|---|---|
-| 任意 `.trb` 字段覆盖 | 会重新引入大配置面，违背当前主实现的简化目标。 |
-| 每个 block 的任意点数覆盖 | 易产生拓扑不一致、奇偶点数错误或连接失败。 |
-| 机器类型、转速、rotor/stator 手工覆盖 | 这些更接近 row wizard 的物理/工况定义，应优先从几何或项目语义获得。 |
-| 任意拓扑类型选择 | H&I、O4H、出口 H-topology 等对几何敏感，错误选择会直接破坏网格质量。 |
-| 自动调参闭环 | 需要失败诊断、重试策略和质量目标，不应混入当前初始网格脚本。 |
+## 路径与选择器
 
-## 推荐的实现路线
+控制表达式格式为：
 
-如果后续要开发，建议分三步推进：
+```text
+<实体选择器路径>/<局部键>=<值>
+```
 
-1. 保持当前无配置文件风格，只增加少量 CLI 参数。
-2. 优先实现 `--mesh-level coarse|medium|fine`，内部映射到少数稳定字段。
-3. 在确认 AutoGrid Python API 的正式 setter 之前，避免依赖脆弱的字符串替换。
+示例：
 
-可能的 preset 方向：
+```text
+configuration/grid_levels=3
+row:*/optimization.steps=200
+row:diffuser_axial/flow_path.number=89
+row:#2/blade:#1/b2b.default.streamwise_inlet_points=33
+row:Rotor/blade:Main Blade/gap:shroud/spanwise_points=17
+```
 
-| preset | 目标 | 示例映射草案 |
-|---|---|---|
-| `coarse` | 快速生成，低点数，用于检查几何和流程。 | `spanwise-paths = 33`；B2B 点数尽量保留当前默认；`OPTIMIZATION` 可用 `50` 到 `100`。 |
-| `medium` | 默认工程初筛，保持当前 row wizard 生成水平附近。 | `spanwise-paths = 57`；`FIRST_CELL_WIDTH` 默认由 row wizard 或 y+ 估算值给出；`OPTIMIZATION = 200`、`GAP_OPTIMIZATION_STEPS = 100` 可作为当前样例基准。 |
-| `fine` | 增加 spanwise/B2B 点数和优化步数，用于质量改善或网格无关性第一步。 | `spanwise-paths = 97`；局部 B2B 点数从 `33` 增到 `57` 或从 `57` 增到 `97`；优化步数是否继续增加需实机验证。 |
+规则：
 
-## 实现前需要确认的问题
+1. `*` 表示 wildcard，`#N` 表示从 1 开始的索引，其他文本表示区分大小写的实体名。
+2. 名称包含 `/` 或 `=` 时必须改用索引。
+3. 精确选择器优先于 wildcard；参数顺序不影响解析结果。
+4. 同一选择器、同一键重复出现直接报错。
+5. 静态几何未携带可靠数量的已有技术效果，在 AutoGrid 内通过正式数量/accessor API 再做严格确认。
 
-- AutoGrid 当前版本是否提供稳定 Python API 来设置 B2B/3D 参数，而不是只能保存 `.trb` 后修改。
-- 参数应该在 row wizard 前设置，还是 row wizard 后设置。Row wizard 可能会重置 expert mode 参数。
-- 多行算例中参数是全局统一，还是允许按 row 名称设置。
-- splitter blade 是否和 main blade 共用控制项。
-- gap 参数是来自 `.geomTurbo` 的几何定义，还是由 AutoGrid 后处理配置生成。
-- 质量失败时是否只报告，还是进入自动重试。
+## 类型与单位
 
-## 参考资料
+控制值不会执行任意 Python：
 
-- [Cadence: Fidelity Turbomachinery Meshing with the Row Wizard](https://resources.system-analysis.cadence.com/computational-fluid-dynamics/fidelity-turbomachinery-meshing-with-the-row-wizard)
-- [Cadence: Fidelity CFD Platform](https://www.cadence.com/en_US/home/tools/system-analysis/computational-fluid-dynamics/fidelity.html)
-- [Cadence: Fidelity CFD Pre-Processing and Meshing](https://www.cadence.com/en_US/home/tools/system-analysis/computational-fluid-dynamics/pre-processing-meshing.html)
-- [Cadence: Fidelity Fine Turbo Datasheet](https://www.cadence.com/en_US/home/resources/datasheets/fidelity-fine-turbo-accelerates-turbomachinery-designs-ds.html)
-- [Cadence: Compute Grid Spacing for a Given Y+](https://www.cadence.com/en_US/home/tools/system-analysis/computational-fluid-dynamics/y-plus.html)
-- [AutoGrid5 v8 user manual excerpt: flow paths and grid level](https://www.scribd.com/document/638134105/Untitled)
-- [AutoGrid5 tutorial excerpt: first wall cell width and spanwise points](https://www.scribd.com/document/837559122/Tutorial-3-%E7%A6%BB%E5%BF%83%E6%B3%B5)
-- [AutoGrid5 advanced tutorial excerpt: B2B grid point rule](https://www.scribd.com/document/89020372/Tutorial-Guide-AutoGrid-82-1-Advanced-Acrov5)
-- [Diener, Development of a Mixed-Flow Compressor Impeller for Micro Gas Turbine Application](https://cfturbo.com/fileadmin/content/down/publications/students/2016-03-Diener-Mixed-Flow-Compressor.pdf)
-- [Effect of Hub Gap on Expanding Stability of Centrifugal Compressor](https://www.researchgate.net/publication/351076552_Effect_of_Hub_Gap_on_Expanding_Stability_of_Centrifugal_Compressor/fulltext/609b977845851525ed871bb7/Effect-of-Hub-Gap-on-Expanding-Stability-of-Centrifugal-Compressor.pdf)
+- 布尔：`true`、`false`、`1`、`0`；
+- 整数和有限浮点数；
+- 注册表中列出的精确枚举；
+- 逗号分隔的定长整数/浮点元组。
+
+长度参数始终按米输入。转换公式为：
+
+```text
+project_value = requested_si / units_factor
+```
+
+请求值、项目单位值、传给 API 的值和 getter 回读值均进入 `run_summary.json`。
+
+## 应用阶段
+
+控制顺序不依赖命令行书写顺序，而由注册表阶段确定：
+
+```text
+configuration
+→ wizard
+→ RowWizard.generate()
+→ topology
+→ distribution
+→ boundary_layer
+→ optimization
+→ interface
+→ existing_effect
+→ B2B/3D 网格生成
+```
+
+这可避免 RowWizard 覆盖后置的拓扑、点数和优化设置。
+
+## AutoGrid 17.1 setter 审计
+
+审计针对本机正式文件：
+
+```text
+C:\ProgramData\NUMECA\fine171\_python\_autogrid\Autogrid.py
+```
+
+`audit_autogrid_source()` 按“所属类 + 方法名”逐个检查所有 `set_*` 和 `a5_set_*` 定义。当前结果：
+
+| 状态 | 数量 | 含义 |
+|---|---:|---|
+| `mapped` | 361 | 映射到至少一个规范控制键 |
+| `excluded` | 360 | 有明确静态理由或受控规则排除 |
+| `unaudited` | 0 | 不允许存在 |
+| 合计 | 721 | AutoGrid 17.1 setter 定义数 |
+
+`audit_control_bindings()` 反向验证注册表引用的方法确实存在于正确的 17.1 对象上。当前 703 个绑定中，701 个是正式 API 方法，2 个是对 `RSInterface` enable/disable 成对接口的受控布尔适配；缺失绑定为 0。
+
+审计可复现：
+
+```powershell
+conda activate LLM
+python -c "from collections import Counter; from controls import audit_autogrid_source; p=r'C:\ProgramData\NUMECA\fine171\_python\_autogrid\Autogrid.py'; print(Counter(x['status'] for x in audit_autogrid_source(p)))"
+```
+
+精确排除理由保存在 `EXCLUDED_SETTERS` 和 `AUDIT_EXCLUSION_RULES`；测试要求每个 17.1 setter 必须是 `mapped` 或 `excluded`，并要求注册表不存在缺失 setter/getter。
+
+## 严格失败策略
+
+以下情况返回静态错误码 2，且不启动 IGG：
+
+- 未知控制键；
+- 类型、枚举或范围错误；
+- 选择器层级错误或几何实体未匹配；
+- 重复定义或等优先级冲突；
+- `--no-row-wizard` 与 wizard 控制同时出现；
+- 长度控制缺少有效 `UNITS-FACTOR`。
+
+以下情况在 AutoGrid 阶段返回错误码 1，并记录失败控制：
+
+- 实体在 AutoGrid 项目中不存在；
+- 控制不适用于当前拓扑；
+- 17.1 setter/getter 或实体 accessor 缺失；
+- setter、getter 或网格生成抛出异常。
+
+dry-run 只在 `controls.resolved` 中记录 `planned`，不会把控制写成 `applied`。
