@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>AutoGrid 17.1 网格控制与质量速查</title>
+<style>
+  @page { size: A4 landscape; margin: 12mm 10mm; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+    font-size: 8pt; line-height: 1.35; color: #1a1a1a;
+    column-count: 3; column-gap: 12px; column-rule: 1px solid #ccc;
+    padding: 4mm;
+  }
+  h1 {
+    font-size: 14pt; text-align: center; column-span: all;
+    border-bottom: 3px solid #1a56db; padding-bottom: 4px; margin-bottom: 8px;
+    color: #1a56db;
+  }
+  h2 {
+    font-size: 9.5pt; color: #1a56db; border-bottom: 1.5px solid #93c5fd;
+    padding-bottom: 1px; margin: 8px 0 3px 0;
+  }
+  h3 { font-size: 8.5pt; color: #1e40af; margin: 5px 0 2px 0; }
+  table {
+    width: 100%; border-collapse: collapse; margin: 2px 0 5px 0;
+    font-size: 7.2pt; page-break-inside: avoid;
+  }
+  th { background: #1a56db; color: #fff; padding: 2px 3px; text-align: left; font-weight: 600; }
+  td { padding: 1.5px 3px; border-bottom: 1px solid #e5e7eb; }
+  tr:nth-child(even) td { background: #f8fafc; }
+  .tag { display: inline-block; padding: 0 3px; border-radius: 2px; font-size: 6.5pt; font-weight: 600; }
+  .p0 { background: #dcfce7; color: #166534; }
+  .p1 { background: #dbeafe; color: #1e40af; }
+  .p2 { background: #f3f4f6; color: #6b7280; }
+  .si { background: #fef3c7; color: #92400e; }
+  .warn { color: #dc2626; font-weight: 600; }
+  .ok { color: #16a34a; }
+  .mono { font-family: "Cascadia Code", "Consolas", monospace; font-size: 7pt; }
+  ul { padding-left: 12px; margin: 2px 0; }
+  li { margin-bottom: 0.5px; }
+  .note { font-size: 7pt; color: #6b7280; margin: 2px 0; }
+  .mini { font-size: 6.8pt; }
+  .breaker { column-span: all; height: 1px; margin: 4px 0; }
+  .big-table { font-size: 6.5pt; }
+  .big-table th, .big-table td { padding: 1px 2px; }
+</style>
+</head>
+<body>
+
+<h1>🛠 AutoGrid 17.1 网格控制 &amp; 质量速查</h1>
+
+<!-- ====== 1. OVERVIEW ====== -->
+<h2>一、控制参数总览</h2>
+<table>
+  <tr><th>优先级</th><th>数量</th><th>含义</th></tr>
+  <tr><td><span class="tag p0">P0</span></td><td>10</td><td>高频基础控制，7 个有独立 CLI 参数</td></tr>
+  <tr><td><span class="tag p1">P1</span></td><td>59</td><td>常用精细控制（点数、边界层、优化权重等）</td></tr>
+  <tr><td><span class="tag p2">P2</span></td><td>272</td><td>高级与已有实体控制（HOH/H&I 拓扑、孔列、ZR 效果等）</td></tr>
+  <tr style="font-weight:700"><td>合计</td><td>341</td><td></td></tr>
+</table>
+
+<!-- ====== 2. P0 TABLE ====== -->
+<h2>二、P0 控制项（10 项）及 CLI 映射</h2>
+<table class="big-table">
+  <tr><th>控制键</th><th>CLI 参数</th><th>类型</th><th>范围/枚举</th><th>阶段</th></tr>
+  <tr><td class="mono">configuration/grid_levels</td><td>仅 --set</td><td>int</td><td>1 – 9</td><td>config</td></tr>
+  <tr><td class="mono">row/mesh_level</td><td>--mesh-level</td><td>enum</td><td>coarse / medium / fine / user</td><td>dist</td></tr>
+  <tr><td class="mono">row/target_points</td><td>--target-points</td><td>int</td><td>100 – 2×10⁹</td><td>dist</td></tr>
+  <tr><td class="mono">row/flow_path.number</td><td>仅 --set</td><td>int</td><td>3 – 10001</td><td>dist</td></tr>
+  <tr><td class="mono">row/optimization.steps</td><td>--optimization-steps</td><td>int</td><td>0 – 100000</td><td>opt</td></tr>
+  <tr><td class="mono">row/optimization.gap_steps</td><td>--gap-optimization-steps</td><td>int</td><td>0 – 100000</td><td>opt</td></tr>
+  <tr><td class="mono">wizard/grid_level</td><td>仅 --set</td><td>enum</td><td>coarse / medium / fine / user</td><td>wizard</td></tr>
+  <tr><td class="mono">wizard/first_cell_width</td><td>--first-cell-width</td><td class="si">float (m)</td><td>&gt; 0</td><td>wizard</td></tr>
+  <tr><td class="mono">wizard/spanwise_paths</td><td>--spanwise-paths</td><td>int</td><td>3 – 10001</td><td>wizard</td></tr>
+  <tr><td class="mono">gap/spanwise_points</td><td>--gap-points</td><td>int</td><td>2 – 10001</td><td>dist</td></tr>
+</table>
+<p class="note">⚠ 快捷 CLI 参数均以 row:* wildcard 作用于所有匹配实体；逐行差异化需使用 --set。</p>
+
+<!-- ====== 3. SETTING METHODS ====== -->
+<h2>三、参数设置三种途径</h2>
+
+<h3>① 独立 CLI 参数（7 项 P0）</h3>
+<p class="mono">python mesh.py in.geomTurbo --mesh-level fine --target-points 500000 --first-cell-width 1e-5</p>
+
+<h3>② --set 表达式（全部 341 项）</h3>
+<p class="mono">--set "row:*/mesh_level=medium"<br>
+--set "row:Rotor/blade:#1/b2b.default.streamwise_inlet_points=33"<br>
+--set "configuration/grid_levels=3"</p>
+<p class="note">选择器：* = wildcard， #N = 1基索引， 名称 = 区分大小写实体名</p>
+
+<h3>③ Python API</h3>
+<p class="mono mini">from controls import parse_control_assignments, resolve_control_requests<br>
+requests = parse_control_assignments(["row:*/mesh_level=fine"])<br>
+resolved = resolve_control_requests(requests, geometry)</p>
+
+<!-- ====== 4. VALUE TYPES ====== -->
+<h2>四、值类型与校验</h2>
+<table class="big-table">
+  <tr><th>类型</th><th>示例</th><th>规则</th></tr>
+  <tr><td>bool</td><td class="mono">true / false / 1 / 0</td><td>仅四字面量，小写</td></tr>
+  <tr><td>int</td><td class="mono">73</td><td>正则 [+-]?\d+，受 min/max 约束</td></tr>
+  <tr><td>float</td><td class="mono">0.001 / 1.5e-5</td><td>有限浮点，拒绝 inf/nan</td></tr>
+  <tr><td>enum</td><td class="mono">coarse</td><td>精确匹配 enum_values 列表</td></tr>
+  <tr><td>tuple_int</td><td class="mono">0,5,3</td><td>逗号分隔定长整数</td></tr>
+  <tr><td>tuple_float</td><td class="mono">0.3,0.4,0.3</td><td>逗号分隔定长浮点</td></tr>
+  <tr><td><span class="tag si">SI 长度</span></td><td class="mono">1e-5（米）</td><td>project = si / units_factor；缺因子报错</td></tr>
+</table>
+
+<!-- ====== 5. STAGE ORDER ====== -->
+<h2>五、应用阶段顺序</h2>
+<p class="mono" style="font-size:7pt">configuration → wizard → RowWizard.generate() → topology → distribution → boundary_layer → optimization → interface → existing_effect → B2B/3D 生成</p>
+<p class="note">阶段由注册表固定，与 CLI 书写顺序无关。RowWizard 先生成再覆盖，确保后置设置不被重置。</p>
+
+<!-- ====== 6. SCOPE BREAKDOWN ====== -->
+<h2>六、341 项按作用域分布</h2>
+<table class="big-table">
+  <tr><th>作用域</th><th>数量</th><th>涵盖内容</th></tr>
+  <tr><td>configuration</td><td>20</td><td>多重网格层级、支撑曲线、inlet/outlet bulb（拓扑+点数+光顺）、bypass</td></tr>
+  <tr><td>wizard</td><td>13</td><td>网格级别、flow paths、首层宽度、全匹配、圆钝叶尖；声学 6 项</td></tr>
+  <tr><td>row</td><td>39</td><td>mesh_level、target_points、流向权重、上下游松弛/去扭曲、gap 插值、span 聚集、优化 13 项、flow path 8 项</td></tr>
+  <tr><td>blade</td><td>121</td><td>B2B 拓扑选择、Default 52 项（枚举+bool+点数+边界层+分布）、HOH 41 项、H&I 20 项、edge treatment 7 项</td></tr>
+  <tr><td>gap / partial-gap / fillet</td><td>19</td><td>拓扑、聚集、点数、单元宽度（SI）、蝶形拓扑</td></tr>
+  <tr><td>interface</td><td>12</td><td>流向点数/索引、B2B 控制、几何固定、单元宽度（SI）、相对位置、形状、参考系</td></tr>
+  <tr><td>endwall / snubber / blade-sheet / stagnation</td><td>22</td><td>展向点数、连接层、优化步数、聚集、停滞点分布类型与距离</td></tr>
+  <tr><td>holes / endwall-holes / pin-fins / basin</td><td>49</td><td>边界层/流向/展向点数、上下/左右点数、优化步数、尾迹长度、交线容差</td></tr>
+  <tr><td>existing-effect / solid-body / lete-wizard</td><td>37</td><td>膨胀比、聚集松弛、周期/匹配连接、固体域保留、LETE 层数与光顺</td></tr>
+</table>
+
+<!-- ====== 7. P1 FULL LIST ====== -->
+<h2>七、P1 控制项速览（59 项）</h2>
+<table class="big-table">
+  <tr><th>分类</th><th>键（局部）</th></tr>
+  <tr><td>wizard (4)</td><td class="mono">far_field_spanwise_paths, far_field_constant_cells_percent, full_matching, blade_tip_rounded_topology</td></tr>
+  <tr><td>row (27)</td><td class="mono">streamwise_weight, gap.hub_interpolation, gap.shroud_interpolation, gap.hub_interpolation_location, gap.shroud_interpolation_location, enforce_blade_wall_cell_width, span_interpolation, clustering, optimization.full_multigrid_steps, optimization.boundary_steps, optimization.straight_boundary, optimization.freeze_skin, optimization.orthogonality, optimization.gap_orthogonality, optimization.wake, optimization.nmb, optimization.skewness, optimization.gap_skewness, optimization.multigrid, flow_path.hub_clustering, flow_path.shroud_clustering, flow_path.constant_cells, flow_path.control_points, flow_path.intermediate_points, flow_path.smoothing_steps, flow_path.distribution_smoothing_steps</td></tr>
+  <tr><td>blade (25)</td><td class="mono">b2b.default.wake_control, b2b.default.wake_prolongation, b2b.default.{azimuthal_inlet/outlet/inlet_up/outlet_up/inlet_down/outlet_down}_points, b2b.default.{streamwise_inlet/outlet/suction/pressure}_points, b2b.default.boundary_layer_points, b2b.default.boundary_layer_gap_points, b2b.default.leading_edge_index, b2b.default.trailing_edge_index, b2b.default.{cell_width_at_wall, hub_cell_width_at_wall, shroud_cell_width_at_wall, boundary_layer_width, wall_width_interpolation, trailing_edge_cell_width, leading_edge_cell_width, boundary_layer_expansion, skin_max_expansion}</td></tr>
+  <tr><td>gap (1)</td><td class="mono">gap/clustering</td></tr>
+  <tr><td>interface (3)</td><td class="mono">interface/streamwise_points, interface/b2b_control, interface/streamwise_cell_width</td></tr>
+</table>
+<p class="note">注意：row/mesh_level, row/target_points, row/flow_path.number, row/optimization.steps, row/optimization.gap_steps, wizard/grid_level, wizard/first_cell_width, wizard/spanwise_paths, gap/spanwise_points, configuration/grid_levels 属 P0，不在此列。</p>
+
+<!-- ====== QUALITY SECTION ====== -->
+<h2>八、质量指标 — 六类准则</h2>
+<table>
+  <tr><th>准则</th><th>最差极值</th><th>硬门槛</th><th>min 字段</th><th>max 字段</th><th>avg 字段</th></tr>
+  <tr><td>偏斜角</td><td class="warn">min</td><td class="warn">≥ 15°</td><td class="mono">min_skewness_angle</td><td class="mono">max_skewness_angle</td><td class="mono">avg_skewness_angle</td></tr>
+  <tr><td>展向偏斜角</td><td class="warn">min</td><td class="warn">180°−min ≤ 40°</td><td class="mono">min_spanwise_skewness_angle</td><td class="mono">max_spanwise_skewness_angle</td><td class="mono">avg_spanwise_skewness_angle</td></tr>
+  <tr><td>展向膨胀比</td><td>max</td><td class="warn">≤ 2.0</td><td class="mono">min_spanwise_expansion_ratio</td><td class="mono">max_spanwise_expansion_ratio</td><td class="mono">avg_spanwise_expansion_ratio</td></tr>
+  <tr><td>长宽比</td><td>max</td><td class="warn">≤ 15000</td><td class="mono">min_aspect_ratio</td><td class="mono">max_aspect_ratio</td><td class="mono">avg_aspect_ratio</td></tr>
+  <tr><td>膨胀比</td><td>max</td><td class="warn">≤ 3.0</td><td class="mono">min_expansion_ratio</td><td class="mono">max_expansion_ratio</td><td class="mono">avg_expansion_ratio</td></tr>
+  <tr><td>壁面距离</td><td>max</td><td class="ok">无硬限</td><td class="mono">min_wall_distance</td><td class="mono">max_wall_distance</td><td class="mono">avg_wall_distance</td></tr>
+</table>
+
+<!-- ====== 9. LOCATION & DERIVED ====== -->
+<h2>九、最差位置 &amp; 衍生指标</h2>
+<table class="big-table">
+  <tr><th>准则</th><th>位置字段</th><th>block 字段</th></tr>
+  <tr><td>偏斜角</td><td class="mono">min_skewness_angle_critical_location</td><td class="mono">min_skewness_angle_block</td></tr>
+  <tr><td>展向偏斜角</td><td class="mono">min_spanwise_skewness_angle_critical_location</td><td class="mono">min_spanwise_skewness_angle_block</td></tr>
+  <tr><td>展向膨胀比</td><td class="mono">max_spanwise_expansion_ratio_critical_location</td><td class="mono">max_spanwise_expansion_ratio_block</td></tr>
+  <tr><td>长宽比</td><td class="mono">max_aspect_ratio_critical_location</td><td class="mono">max_aspect_ratio_block</td></tr>
+  <tr><td>膨胀比</td><td class="mono">max_expansion_ratio_critical_location</td><td class="mono">max_expansion_ratio_block</td></tr>
+  <tr><td>壁面距离</td><td class="mono">max_wall_distance_critical_location</td><td class="mono">max_wall_distance_block</td></tr>
+</table>
+<p class="note">每个 location 含: { extreme, reported_extreme, block, i, j, k }。注意偏斜角的工程最差值是 minimum，因此用 min_* 前缀。</p>
+
+<p><strong>衍生指标：</strong></p>
+<table>
+  <tr><th>字段</th><th>计算</th><th>条件</th></tr>
+  <tr><td class="mono">wall_distance_uniformity</td><td>max_wall / min_wall</td><td>min ≠ 0</td></tr>
+  <tr><td class="mono">generation_time_seconds</td><td>HH:MM:SS → 秒</td><td>报告含时间行</td></tr>
+</table>
+
+<!-- ====== 10. ALL FIELDS INVENTORY ====== -->
+<h2>十、完整可提取字段清单</h2>
+
+<table class="big-table">
+  <tr><th>类别</th><th>字段数</th><th>关键字段</th></tr>
+  <tr><td>全局计数</td><td>3</td><td class="mono mini">negative_cells, number_of_points, grid_levels</td></tr>
+  <tr><td>六类准则 min/max/avg</td><td>18</td><td class="mono mini">min_skewness_angle … avg_wall_distance</td></tr>
+  <tr><td>最差位置</td><td>12</td><td class="mono mini">min_skewness_angle_critical_location / _block × 6</td></tr>
+  <tr><td>壁面距离 SI</td><td>3</td><td class="mono mini">wall_distance.si.{min,max,avg}（单位 m）</td></tr>
+  <tr><td>衍生指标</td><td>2</td><td class="mono mini">wall_distance_uniformity, generation_time_seconds</td></tr>
+  <tr><td>元数据</td><td>7</td><td class="mono mini">autogrid_version, generation_date/time/seconds, mesh_validity, overlapping_status/message</td></tr>
+  <tr><td>项目信息</td><td>6+</td><td class="mono mini">name, template_path, units, units_factor, number_of_points, number_of_rows, rows[]</td></tr>
+  <tr><td>逐行信息</td><td>6×N</td><td class="mono mini">rows[].{name, main_blades, splitter_blades, number_of_points, layers, b2b_topology}</td></tr>
+  <tr><td>质量判定</td><td>2</td><td class="mono mini">result.status (PASS/FAIL/UNKNOWN), result.accepted, result.reasons</td></tr>
+  <tr><td>辅助</td><td>1</td><td class="mono mini">metrics_source</td></tr>
+  <tr style="font-weight:700"><td>基础合计</td><td>~55</td><td>（不含逐行和 entities 展开）</td></tr>
+  <tr style="font-weight:700"><td>含 entities (N行)</td><td>~100+</td><td>每行 entity 含 3 全局 + 18 准则值 + 12 位置</td></tr>
+</table>
+
+<!-- ====== 11. EVALUATION ====== -->
+<h2>十一、质量评估规则</h2>
+
+<table>
+  <tr><th>状态</th><th>条件</th><th>accepted</th></tr>
+  <tr><td><span class="ok">PASS</span></td><td>8 项必需字段全存在 + 7 项硬门槛全满足</td><td class="ok">true</td></tr>
+  <tr><td><span class="warn">FAIL</span></td><td>字段齐全但 ≥1 项硬门槛违反</td><td class="warn">false</td></tr>
+  <tr><td>UNKNOWN</td><td>任一必需字段缺失，或无可用质量源</td><td>false</td></tr>
+</table>
+
+<p><strong>8 项必需字段：</strong><span class="mono mini">negative_cells, number_of_points, grid_levels, min_skewness_angle, max_expansion_ratio, min_spanwise_skewness_angle, max_spanwise_expansion_ratio, max_aspect_ratio</span></p>
+
+<p><strong>7 项硬门槛：</strong></p>
+<table class="big-table">
+  <tr><th>#</th><th>指标</th><th>条件</th></tr>
+  <tr><td>1</td><td class="mono">negative_cells</td><td>= 0</td></tr>
+  <tr><td>2</td><td class="mono">grid_levels</td><td>≥ 3</td></tr>
+  <tr><td>3</td><td class="mono">min_skewness_angle</td><td>≥ 15°</td></tr>
+  <tr><td>4</td><td class="mono">max_expansion_ratio</td><td>≤ 3.0</td></tr>
+  <tr><td>5</td><td>180° − min_spanwise_skewness_angle</td><td>≤ 40°</td></tr>
+  <tr><td>6</td><td class="mono">max_spanwise_expansion_ratio</td><td>≤ 2.0</td></tr>
+  <tr><td>7</td><td class="mono">max_aspect_ratio</td><td>≤ 15000</td></tr>
+</table>
+
+<!-- ====== 12. DATA SOURCE ====== -->
+<h2>十二、数据源优先级 &amp; CGNS 降级</h2>
+<p>① <span class="mono">.qualityReport</span>（AutoGrid 原生，最完整）→ ② CGNS 内嵌 <span class="mono">NIGridQuality</span>（降级）→ ③ UNKNOWN（无数据源）</p>
+<p class="note">CGNS 降级无法恢复：metadata 全部字段、project 全部字段、逐行 entities（仅含一个 entire_mesh）。</p>
+
+<!-- ====== 13. REGRESSION ====== -->
+<h2>十三、三算例基线</h2>
+<table class="big-table">
+  <tr><th>几何</th><th>点数</th><th>min 偏斜角</th><th>max 膨胀比</th><th>min 展向偏斜</th><th>max 长宽比</th><th>状态</th></tr>
+  <tr><td>Rotor37</td><td>1,464,289</td><td class="ok">21.76°</td><td class="ok">1.73</td><td class="ok">168.31°</td><td class="ok">342</td><td class="ok">PASS</td></tr>
+  <tr><td>WP100_comp</td><td>4,239,316</td><td class="ok">21.70°</td><td class="warn">3.72</td><td class="warn">119.89°</td><td class="ok">317</td><td class="warn">FAIL</td></tr>
+  <tr><td>ori1</td><td>2,744,343</td><td class="warn">10.16°</td><td class="ok">2.67</td><td class="warn">134.33°</td><td class="ok">942</td><td class="warn">FAIL</td></tr>
+</table>
+
+<!-- ====== 14. QUICK COMMANDS ====== -->
+<h2>十四、常用命令</h2>
+<table class="big-table">
+  <tr><th>用途</th><th>命令</th></tr>
+  <tr><td>列出全部控制</td><td class="mono">python mesh.py --list-controls</td></tr>
+  <tr><td>列 P1 控制</td><td class="mono">python mesh.py --list-controls P1</td></tr>
+  <tr><td>查看单项详情</td><td class="mono">python mesh.py --describe-control blade/b2b.default.streamwise_inlet_points</td></tr>
+  <tr><td>dry-run 验证</td><td class="mono">python mesh.py in.geomTurbo --dry-run --set "row:*/mesh_level=fine"</td></tr>
+  <tr><td>实机生成</td><td class="mono">python mesh.py in.geomTurbo --mesh-level fine --target-points 500000</td></tr>
+  <tr><td>多项控制</td><td class="mono">python mesh.py in.geomTurbo --set "config/grid_levels=3" --set "row:*/flow_path.number=73"</td></tr>
+  <tr><td>审计 setter</td><td class="mono">python -c "from controls import audit_autogrid_source; ..."</td></tr>
+</table>
+
+<p style="text-align:center; margin-top:8px; color:#9ca3af; font-size:6.5pt; column-span:all">
+AutoGrid 17.1 网格控制与质量速查 · 基于 controls.py (341 项) &amp; quality.py · 2026-07-23
+</p>
+
+</body>
+</html>
