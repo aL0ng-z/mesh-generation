@@ -1,5 +1,332 @@
 # 开发日志
 
+## 2026-07-25：测试脚本重命名与归档 + low_memory_usage 修复 + 全量指标比对
+
+### 测试脚本归档
+
+- `campaign_runner.py` → `tests/test_campaign_runner.py`
+- `analyze_results.py` → `tests/test_analyze_results.py`
+- 两者均为纯测试/验证基础设施，不影响项目主要功能。移入 `tests/` 后遵循 `test_*.py` 命名约定。
+- `test_campaign_runner.py` 的 `PROJECT_ROOT` 修正为 `parent.parent`（适配新目录层级）。输出目录 `runs/` 不变。
+- 用法更新为：`python tests/test_campaign_runner.py`、`python tests/test_analyze_results.py <campaign_dir>`
+
+### row/low_memory_usage 修复
+
+- **根因**：AutoGrid 17.1 `enable_low_memory_usage()` 内部调用 `set_row_properties_(impl, "memory_use", 1)`，传入 int 但底层 C 函数期望字符串。
+- **修复**（`controls.py`）：绕过 broken enable/disable 方法，改为直接调用全局 `set_row_properties_` 并传入 `"1"`/`"0"` 字符串值。
+  - `setter="set_row_properties_"`、`value_map=((True, "1"), (False, "0"))`、`setter_mode="row_property_memory_use"`
+- **修复**（`autogrid.py`）：`_invoke_control()` 新增 `row_property_memory_use` 分支，通过 `_require_global("set_row_properties_")` 调用并传入 `target.impl`。
+- **修复**（`controls.py` 审计）：新增 `_RUNTIME_GLOBALS` 集合，`audit_control_bindings()` 增加模块级函数回退查找。`set_row_properties_` 是 C 扩展暴露的全局 helper，不在源码中以 `def` 定义。
+
+### 分类器重写：从单指标 → 全量指标比对
+
+- **旧行为**：`classify_control_result()` 只检查 `total_points` 一项是否与基线不同 → 可能漏掉只改变质量指标但不改变点数的参数。
+- **新行为**（`tests/test_campaign_runner.py`）：
+  - `collect_quality_metrics()` 自动抽取 `.qualityReport` metrics 中**全部 22 个标量数值字段**（`number_of_points`、`min/max/avg_*`、`negative_cells`、`wall_distance_uniformity` 等）。
+  - `classify_control_result()` 遍历全部指标逐一与基线比对，**任意一项不同 → EFFECT_OK**。
+  - 质量判定（`status`/`accepted`）变化 → 升级为 QUALITY_SENSITIVE。
+  - CALL_ONLY 现在意味着 22+ 项指标全部与基线严格一致。
+
+## 2026-07-25：第三轮验证活动 — 405/406 (99.8%) + Python 2 unicode 修复 + 测试值生成完善
+
+### 第三轮验证结果
+
+全面修复后运行 `python campaign_runner.py`：
+- **405/406 成功（99.8%）**，仅 1 个残余失败
+- 修复项：unicode 编码 ×2、测试值生成 ×11、far_field_constant_cells_percent float→int
+
+### 本轮修复
+
+| 修复项 | 文件 | 说明 |
+|---|---|---|
+| Python 2 unicode→str 编码 | `autogrid.py` | 新增 `_ensure_str()` 辅助函数，将 JSON 解码的 unicode API 值编码为 bytes（`str`），避免 Python 2 C 扩展报 `TypeError: Expecting string` |
+| multigrid value_map 恢复 | `controls.py` | 从 `((True, 1), (False, 0))` 恢复为 `((True, "yes"), (False, "no"))`——unicode 编码修复后字符串可正常工作 |
+| low_memory_usage getter 禁用 | `controls.py` | `getter=None`——`get_low_memory_usage()` 在 Python 2 下返回类型与 JSON 序列化冲突 |
+| far_field_constant_cells_percent | `controls.py` | `value_type` float→int（float→int 修复遗漏项） |
+| int 测试值范围修复 | `campaign_runner.py` | `generate_test_values()` int 分支重写：窄范围 [0,1] 取边界值、target_points "points"→专用大值分支、通用 int 取 v1 和 v1×5 |
+| relaxation/blend/interpolation | `campaign_runner.py` | 测试值从 `[5, 25]`（越界）→ `[0, 1]`（合法） |
+
+### 残余问题
+
+- **`row/low_memory_usage`**（1 例）：`enable_low_memory_usage()` / `disable_low_memory_usage()` 在 AutoGrid 17.1 Row 对象上调用时报 `TypeError: Expecting string`——方法可能期望字符串参数而非无参调用。需查阅 AutoGrid 17.1 API 文档确认正确调用签名。
+
+### 进展总结
+
+| 指标 | 初始 | 最终 | 改进 |
+|---|---|---|---|
+| 成功率 | 332/406 (81.8%) | 405/406 (99.8%) | +73 例 |
+| 失败根因分类 | 5 类 | 1 类 | 81% 类别消除 |
+| 已修复 API 类型不匹配 | 0 | 17 | 全覆盖 |
+| 已修复脚本级缺陷 | 0 | 3 | getter 容错 + unicode 编码 + SI int 转换 |
+
+### 第二轮验证结果
+
+修复后运行 `python campaign_runner.py`：
+- **392/406 成功（96.6%）**，相比上轮 332/406（81.8%）提升 **14.8 个百分点**
+- 74 个失败 → 14 个失败（**减少 81%**）
+
+### 已确认修复的类别
+
+| 类别 | 上轮失败 | 本轮失败 | 状态 |
+|---|---|---|---|
+| wizard 路径前缀缺失 | 7 | 0 | ✅ 已确认修复 |
+| gap/stagnation 拓扑误注入 | 12 | 0 | ✅ 已确认修复 |
+| float→int 类型不匹配 | 11 | 0 | ✅ 已确认修复 |
+| enum/bool 类型不匹配 | 4 | 0 | ✅ 已确认修复 |
+| getter 签名不匹配 | 2 | 0 | ✅ 已确认修复 |
+| 值超出合法范围 | 1 | 1 | ⚠️ 仍存在（target_points 测试值 < 100） |
+
+### 剩余 14 个失败的根因与修复
+
+| 子类别 | 案例数 | 根因 | 修复状态 |
+|---|---|---|---|
+| int 值超出 [0,1] 范围 | 9 | campaign_runner 测试值生成未限制到合法范围 | ✅ 已修复（`generate_test_values()` 新增 `hi <= 2` 分支） |
+| wizard/far_field_constant_cells_percent | 2 | float→int 修复遗漏项 | ✅ 已修复（`controls.py` value_type） |
+| Python 2 str/unicode 残余 | 2 | multigrid / low_memory_usage setter 内部期望 `str`（bytes），但 JSON 解码后为 `unicode` | 待修复（需在 autogrid_init.py 脚本模板中对 unicode→bytes 编码） |
+| 测试值超限 | 1 | target_points 测试值 33 < 100 | 待调整测试值 |
+
+### 修改文件
+
+- `controls.py`：far_field_constant_cells_percent float→int
+- `campaign_runner.py`：`generate_test_values()` int 分支增加 `hi <= 2` 边界处理
+
+### 预期下轮结果
+
+修复 11 个剩余案例后：**403/406 ≈ 99.3%**（仅剩 3 个需脚本级修复）
+
+## 2026-07-25：修复 17 个 API 类型不匹配 + getter 容错 + SI int 转换
+
+### 修复 11 个 float→int 类型不匹配（controls.py）
+
+AutoGrid 17.1 的以下 setter 实际期望 `int`，但 ControlSpec 中声明为 `float`：
+
+| 控制键 | 修改 |
+|---|---|
+| `row/upstream.relaxation` | float → int，范围 [0, 1] |
+| `row/downstream.relaxation` | float → int，范围 [0, 1] |
+| `row/downstream.before_nozzle_relaxation` | float → int，范围 [0, 1] |
+| `row/optimization.straight_boundary` | float → int，范围 [0, 1] |
+| `blade/edge_treatment.leading_blend` | float → int，范围 [0, 1] |
+| `blade/edge_treatment.trailing_blend` | float → int，范围 [0, 1] |
+| `blade/b2b.default.wall_width_interpolation` | float → int，范围 [0, 1]（从循环中独立为单独 `_direct()` 调用） |
+| `blade/b2b.default.throat_inlet_relaxation` | float → int，范围 [0, 1] |
+| `blade/b2b.default.throat_outlet_relaxation` | float → int，范围 [0, 1] |
+| `blade/b2b.default.intersection_quality` | float → int，范围 [0, ] |
+| `blade/b2b.hoh.{leading,trailing}_edge_cell_length` | float → int，通过循环内条件判断区分 cell_length |
+
+### 修复 2 个 enum + 1 个 bool 类型不匹配（controls.py）
+
+- **`row/optimization.skewness`** / **`row/optimization.gap_skewness`**：添加 `value_map=(("no", 0), ("medium", 1), ("yes", 2))`。原无 value_map，Python 2 下 JSON 解码的 unicode 字符串传入 API 导致 "TypeError: Expecting string"。改用 int 值绕过 str/unicode 歧义。
+- **`row/optimization.multigrid`**：`value_map` 从 `((True, "yes"), (False, "no"))` 改为 `((True, 1), (False, 0))`。同理避免 Python 2 str/unicode 问题。
+- **`row/low_memory_usage`**：暂未修复（含 1 次失败），需进一步分析 getter 行为。
+
+### 修复 getter 容错（autogrid.py）
+
+- **`_apply_control()` 分离 getter 失败**：原逻辑中 `_readback()` 失败会抛出异常，导致整个控制（含已成功的 setter）标记为 failed。修改后，getter 异常被独立捕获，setter 成功时状态仍为 "applied"，错误信息记录在单独字段中。
+- **HOH extension_location getter 禁用**：`blade/b2b.hoh.{inlet,outlet}_extension_location` 的 getter 需要额外参数（如 `cst_cells`），当前读回约定不支持。将其从循环中分离，显式设置 `getter=None`。setter 仍正常执行，网格变化检测不受影响。
+
+### 修复 SI 长度转换后 int 保持（controls.py）
+
+- `resolve_control_requests()` 中：`convert_si_length()` 总是返回 float，但对于 `value_type="int"`（如 HOH cell_length），需要 int 值传给 API。修改后在 SI 转换后对 int/tuple_int 类型额外执行 `int()` 转换。
+
+### 测试
+
+- 全量 26 测试通过（0.20s），所有修改后的 ControlSpec 类型和 value_map 经代码级验证。
+
+### 进行中
+
+- 第二轮验证活动（`campaign_runner.py`）正在后台执行，预计恢复 17 个 API 类失败 + 2 个 getter 类失败 = 共约 36 个案例。
+
+## 2026-07-24：Rotor37 拓扑控制验证活动执行与事后分析
+
+### 活动执行
+
+- 运行 `python campaign_runner.py`，执行 406 个 OFAT 测试案例 + 12 个基线。
+- **结果**：332/406 成功（81.8%），74 失败（18.2%），0 超时。
+
+### 基线发现
+
+| 拓扑 | 点数 | 负体积 | 质量 | 关键指标 |
+|---|---|---|---|---|
+| **Default** | 1,464,289 | 0 | PASS | 偏斜角 21.8°, 增长率 1.73, 长宽比 342 |
+| **HOH** | 618,495 | **29,944** | UNKNOWN | 偏斜角 ~0°, 增长率 100, 长宽比 21,893,000（负体积副作用） |
+| **H&I** | 490,320 | 0 | FAIL | 偏斜角 42.4°, 增长率 4.76, 长宽比 884 |
+| 重复性 | 完全确定 | — | 完全确定 | 三种拓扑 4×A/A 均一致 |
+
+关键发现：**HOH 拓扑对 Rotor37 产生无效网格**（29,944 个负体积单元跨 4 个 block），不能直接用于 CFD 计算。H&I 网格虽无负体积但质量明显劣于 Default。
+
+### 74 个失败案例的根因分析
+
+| 类别 | 数量 | 根因 | 状态 |
+|---|---|---|---|
+| wizard 路径前缀缺失 | 7 | campaign_runner 生成 `row:#1/grid_level` 而非 `row:#1/wizard/grid_level` | ✅ 已修复 |
+| gap/stagnation 拓扑误注入 | 12 | b2b.topology 注入到 gap/stagnation 实体路径而非 blade 路径 | ✅ 已修复 |
+| float 参数实际需要 int | 11 | ControlSpec value_type 与 AutoGrid API 签名不符 | 待修复 |
+| enum/bool 类型不匹配 | 4 | value_map/setter_by_value 映射类型与 API 约定不一致 | 待修复 |
+| getter 签名不匹配 | 2 | getter 需要额外参数，当前 _readback() 只传 1 个 | 待修复 |
+| 值超出合法范围 | 1 | `row/target_points` 测试值 < 100 | 待调整测试值 |
+
+### 控制参数有效性
+
+| 分类 | 总数 | EFFECT_OK | CALL_ONLY | FAILED_ALL | 有效率 |
+|---|---|---|---|---|---|
+| COMMON_CORE | 97 | 7 | 61 | 29 | 7.2% |
+| COMMON_TOPOLOGY | 1 | 1 | 0 | 0 | 100% |
+| CONDITIONAL_DEFAULT | 52 | 15 | 33 | 4 | 28.8% |
+| CONDITIONAL_HOH | 41 | 18 | 20 | 3 | 43.9% |
+| CONDITIONAL_HI | 19 | 3 | 16 | 0 | 15.8% |
+| **合计** | **210** | **44** | **130** | **36** | **21.0%** |
+
+- 仅 21% 的参数产生可检测的网格点数变化。
+- 61.9% 为 CALL_ONLY（setter/getter 成功但网格不变）。
+- H&I 拓扑最突出：19 项条件参数中 16 项（84%）为 CALL_ONLY。
+
+### campaign_runner bug 修复
+
+- **Bug 1（wizard 路径）**：`spec.target_kind == "wizard"` 时 entity_path 从 `row:#1` 纠正为 `row:#1/wizard`。
+- **Bug 2（gap/stagnation 拓扑注入）**：新增 `topo_entity_path` 参数，将拓扑上下文与参数路径分离。gap/stagnation 控制的 `--set` 从 `{entity}/b2b.topology=X` 改为 `{blade_path}/b2b.topology=X --set {entity}/param=Y`。
+
+### 新增分析工具
+
+- **`analyze_results.py`**（~450 行）：独立的深度分析脚本，从 campaign 活动目录读取全部 run_summary.json，生成包含根因诊断、逐参数点变化、质量影响和修复建议的综合中文 Markdown 报告。
+- 产物：`analysis_report.md`（综合报告）+ `analysis_data.json`（结构化分析数据）。
+
+### 测试
+
+- 全量 54 测试通过。campaign_runner 修复后通过 dry-run 验证。
+
+## 2026-07-24：campaign_runner.py — Rotor37 拓扑控制验证活动执行器
+
+### 新增文件
+
+- **`campaign_runner.py`**（~500 行）：按 PLAN.md 方案编排完整验证活动的独立脚本。
+
+### 功能概览
+
+| 阶段 | 说明 |
+|---|---|
+| Phase 1 | 生成 3 拓扑 × 4 重复 = 12 个 A/A 基线 |
+| Phase 2 | 构建测试矩阵（基线 + 拓扑切换 + OFAT），并发执行 |
+| Phase 3 | 收集结果、分类（EFFECT_OK / QUALITY_SENSITIVE / CALL_ONLY / FAILED_ALL）、生成 Markdown 报告 |
+
+### 测试矩阵规模
+
+- **基线**：12 例（default/hoh/hi 各 4 次）
+- **拓扑切换**：3 例（每种拓扑值单独运行）
+- **OFAT 参数测试**：403 例，覆盖 210 个 Rotor37 适用控制参数
+  - `core`（拓扑无关，固定 default 上下文）：155 例
+  - `conditional_default`：129 例
+  - `conditional_hoh`：83 例
+  - `conditional_hi`：33 例
+  - `topology`（选择器枚举值）：3 例
+- **总计**：418 例
+
+### Rotor37 适用性过滤
+
+- `_is_rotor37_applicable()`：自动排除 holes-line、basin-hole、pin-fins-line、endwall、snubber、blade-sheet、solid-body、lete-wizard、partial-gap、fillet 等 Rotor37 不存在的几何实体控制。
+- 排除 `not_applicable_when` 不为空的控制（如 bypass、acoustic 专用控制）。
+- `ROTOR37_APPLICABLE_TARGETS` 显式允许：configuration、wizard、row、blade、gap、interface、stagnation-point。
+
+### 执行特性
+
+- 基于 `concurrent.futures.ThreadPoolExecutor`（经验证无许可证串行限制，4 workers 加速比 3.3-3.7×）。
+- 默认并发 32 workers（可配 `--workers N`）。
+- 每例超时 1800s，失败案例可单独复跑。
+- 增量保存 `campaign_state.json`，支持 `--resume` 从中断处恢复。
+- `--dry-run` 模式：只生成 mesh.py 调用验证命令正确性，不启动 IGG。
+- `--list-matrix`：打印完整测试矩阵概况。
+
+### 用法
+
+```powershell
+# 查看测试矩阵
+python campaign_runner.py --list-matrix
+
+# 全部执行（基线 + 测试 + 报告）
+python campaign_runner.py
+
+# 分阶段执行
+python campaign_runner.py --phase 1          # 只生成基线
+python campaign_runner.py --phase 2          # 只执行测试矩阵
+python campaign_runner.py --phase 3          # 只生成报告
+
+# 断点续跑
+python campaign_runner.py --resume runs/rotor37-control-validation/20260724_120000
+
+# 减少并发
+python campaign_runner.py --workers 16
+```
+
+### 产物结构
+
+```
+runs/rotor37-control-validation/<timestamp>/
+├─ baselines/{default,hoh,hi}/A01..A04/   # 基线 run_summary.json
+├─ topology/{default,hoh,hi}/              # 拓扑切换结果
+├─ cases/{core,default,hoh,hi}/            # OFAT 测试结果
+├─ campaign_state.json                     # 恢复点
+├─ baselines_results.json                  # 基线汇总
+├─ test_results.json                       # 测试汇总
+├─ classification.json                     # 参数分类
+└─ validation_report.md                    # 中文 Markdown 报告
+```
+
+## 2026-07-24：B2B 拓扑依赖排序、自动注入与冲突检测（PLAN.md 实施）
+
+### 新增控制项注册（3 项）
+
+- **`row/low_memory_usage`**（P2, wizard）：Row 级低内存占用模式，通过 `enable_low_memory_usage` / `disable_low_memory_usage` 切换。
+- **`stagnation-point/distribution_from_expansion_ratio`**（P2, existing_effect）：停滞点膨胀比分布模式开关。
+- **`stagnation-point/desired_expansion_ratio`**（P2, existing_effect）：停滞点目标膨胀比，setter 为非标准命名 `desired_expansion_ratio(value)`。
+- **非标准 setter 支持**：新增 `_ALL_KNOWN_SETTERS` 全局集合，收集所有 ControlSpec 中引用的 setter（含非 `set_*` 命名），`autogrid.py` 的 `_serialize_control_plan()` 校验同步放宽，允许 `desired_expansion_ratio` 等非标准方法通过。
+
+### 修复 C-02：B2B 拓扑依赖排序
+
+- **根因**：`resolve_control_requests()` 在同一阶段内按目标路径和键名（字典序）排序，`blade/b2b.hoh.*`（'h' 开头）排在 `blade/b2b.topology`（'t' 开头）之前，导致条件参数在拓扑选择器之前执行。
+- **修复**：新增 `_topology_sort_key()`——`blade/b2b.topology` 在同阶段同目标内强制优先（排序权重 0），其他控制为 1。
+- **验证**：`test_topology_selector_before_conditional_within_same_stage`、`test_topology_selector_before_hoh_conditional`、`test_topology_selector_before_hi_conditional` 三个测试覆盖 Default/HOH/H&I 三种拓扑。
+
+### B2B 拓扑自动注入
+
+- **`_ensure_topology_selectors()`**：在 wildcard 展开后、精确选择器覆盖前运行。
+  - 若使用了 `b2b.default.*` / `b2b.hoh.*` / `b2b.hi.*` 条件参数但未显式设置 `b2b.topology`，自动注入对应拓扑选择器（source=`auto-inject`）。
+  - 若显式拓扑已存在且兼容，不覆盖。
+  - 通过 `CONDITIONAL_KEY_TOPOLOGY` 反向映射确定所需拓扑值。
+
+### 跨拓扑冲突检测
+
+- **同一叶片跨拓扑族**：同时使用 HOH 和 H&I 条件参数 → `ControlValidationError("跨拓扑冲突")`。
+- **显式拓扑与条件参数不匹配**：设置 `b2b.topology=default` 但使用 `b2b.hoh.*` → `ControlValidationError("拓扑冲突")`。
+- **同一 control_id 无需额外校验**：跨拓扑冲突在 auto-inject 阶段提前检测，不依赖 IGG 运行时 `_check_topology()`。
+
+### 控制项过滤器
+
+新增按拓扑依赖关系分组的过滤器常量（`controls.py`）：
+
+| 常量 | 说明 | 数量 |
+|---|---|---|
+| `COMMON_CORE_KEYS` | 拓扑无关通用控制 | ~300 项 |
+| `COMMON_TOPOLOGY_KEYS` | 拓扑选择器本身 | 1 项 |
+| `TOPOLOGY_DEFAULT_KEYS` | `topologies=("default",)` | ~30 项 |
+| `TOPOLOGY_HOH_KEYS` | `topologies=("hoh",)` | ~24 项 |
+| `TOPOLOGY_HI_KEYS` | `topologies=("hi",)` | ~13 项 |
+| `COMMON_KEYS` | 以上全部并集 | ~370 项 |
+
+另有 `TOPOLOGY_KEY_MAP`（拓扑值→键集合）和 `CONDITIONAL_KEY_TOPOLOGY`（条件键→所需拓扑值）两个辅助映射。
+
+### 测试
+
+- 新增 `TopologyDependencyTests` 测试类，15 个测试覆盖：
+  - 拓扑排序（3 个）
+  - 自动注入（4 个，含 Default/HOH/H&I 各自验证及显式不覆盖验证）
+  - 冲突检测（2 个：跨拓扑混用 + 显式/条件不匹配）
+  - 通用控制不触发注入（1 个）
+  - 注册表完整性（2 个：3 新控制 + 非标准 setter）
+  - 过滤器非空（1 个）
+  - user 拓扑枚举（1 个）
+- 全量 **54 测试通过**（39 旧 + 15 新）。
+- 未修改 `archive/`、`geomturbo.py`、`quality.py`、`mesh.py`。
+
 ## 2026-07-24：并行许可证测试 + 修复 RowWizard 覆盖 mesh_level/target_points
 
 - **并行许可证测试**：在 Rotor37 上使用 4 组控制参数（coarse/medium/fine/user+800k），以串行、线程并行、进程并行三种方式各执行 1 次（共 12 次 IGG 运行），验证 NUMECA AutoGrid 17.1 许可证并发能力。

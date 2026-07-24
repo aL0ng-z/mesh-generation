@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
-from controls import CONTROL_REGISTRY, MAPPED_SETTERS, ResolvedControl
+from controls import CONTROL_REGISTRY, MAPPED_SETTERS, _ALL_KNOWN_SETTERS, ResolvedControl
 
 
 CONTROL_RESULT_MARKER = "AGMESH_CONTROL_RESULT:"
@@ -173,6 +173,19 @@ def _entity_name(entity):
     if not callable(getter):
         return None
     return getter()
+
+
+def _ensure_str(value):
+    """将 unicode API 值编码为 str（bytes），避免 Python 2 C 扩展报 Expecting string。"""
+    try:
+        unicode_type = unicode
+    except NameError:
+        return value
+    if isinstance(value, unicode_type):
+        return value.encode(\"utf-8\")
+    if isinstance(value, tuple):
+        return tuple(_ensure_str(v) for v in value)
+    return value
 
 
 def _safe_text(value):
@@ -348,7 +361,7 @@ def _control_method(control, target):
 
 def _invoke_control(control, target):
     mode = control.get("setter_mode", "value")
-    value = control.get("api_value")
+    value = _ensure_str(control.get("api_value"))
     if mode == "interface_bool":
         if control["setter"] == "__bool_b2b_control__":
             name = "enable_b2b_control" if value else "disable_b2b_control"
@@ -360,6 +373,11 @@ def _invoke_control(control, target):
         if not callable(method):
             raise RuntimeError(u"缺少 AutoGrid 17.1 setter：" + name)
         return method()
+    if mode == "row_property_memory_use":
+        # 绕过 AutoGrid 17.1 enable_low_memory_usage 的 int/string bug，
+        # 直接调用全局 set_row_properties_ 并传入字符串值。
+        func = _require_global("set_row_properties_")
+        return func(target.impl, "memory_use", value)
     method = _control_method(control, target)
     if mode == "no_args":
         return method()
@@ -405,8 +423,13 @@ def _apply_control(control):
         target = _resolve_target(control)
         _check_topology(control, target)
         _invoke_control(control, target)
-        readback = _readback(control, target)
-        _emit_control(control, "applied", readback, None)
+        readback_error = None
+        try:
+            readback = _readback(control, target)
+        except Exception as getter_exc:
+            readback = None
+            readback_error = _safe_text(getter_exc.__class__.__name__) + u": " + _safe_text(getter_exc)
+        _emit_control(control, "applied", readback, readback_error)
     except Exception as exc:
         message = _safe_text(exc.__class__.__name__) + u": " + _safe_text(exc)
         _emit_control(control, "failed", None, message)
@@ -484,7 +507,11 @@ def _serialize_control_plan(
         setter = data.get("setter")
         allowed_setters = {method for method in (spec.setter,) if method}
         allowed_setters.update(method for _, method in spec.setter_by_value)
-        if setter not in allowed_setters or (setter not in MAPPED_SETTERS and not str(setter).startswith("__bool_")):
+        if setter not in allowed_setters or (
+            setter not in MAPPED_SETTERS
+            and setter not in _ALL_KNOWN_SETTERS
+            and not str(setter).startswith("__bool_")
+        ):
             raise ValueError(f"控制 {key} 使用了未注册 setter：{setter}")
         if spec.setter_by_value:
             data["setter_mode"] = "no_args"

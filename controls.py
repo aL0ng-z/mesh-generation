@@ -414,7 +414,7 @@ _add(
 for _key, _method, _getter, _label, _kind, _minimum, _maximum, _si in (
     ("spanwise_paths", "set_flow_path_number", "get_flow_path_number", "展向 flow paths", "int", 3, 10001, False),
     ("far_field_spanwise_paths", "set_flow_path_number_far_field", "get_flow_path_number_far_field", "远场展向 flow paths", "int", 3, 10001, False),
-    ("far_field_constant_cells_percent", "set_cst_cell_number_far_field", "get_cst_cell_number_far_field", "远场常值单元比例", "float", 0, 100, False),
+    ("far_field_constant_cells_percent", "set_cst_cell_number_far_field", "get_cst_cell_number_far_field", "远场常值单元比例", "int", 0, 100, False),
     ("full_matching", "set_full_matching_topology", "get_full_matching_topology", "全匹配拓扑", "bool", None, None, False),
     ("first_cell_width", "set_row_cell_width_at_wall", "get_row_cell_width_at_wall", "首层单元宽度", "float", 0, None, True),
     ("blade_tip_rounded_topology", "set_blade_tip_rounded_topology", "get_blade_tip_rounded_topology", "圆钝叶尖拓扑", "bool", None, None, False),
@@ -507,9 +507,9 @@ _add(
     setter_mode="tuple_args",
 )
 for _key, _method, _label, _kind, _priority, _stage, _minimum, _maximum in (
-    ("upstream.relaxation", "set_upstream_block_relaxation", "上游块聚集松弛", "float", "P2", "distribution", 0, 1),
-    ("downstream.relaxation", "set_downstream_block_relaxation", "下游块聚集松弛", "float", "P2", "distribution", 0, 1),
-    ("downstream.before_nozzle_relaxation", "set_downstream_block_relaxation_before_nozzle", "喷嘴前下游块松弛", "float", "P2", "distribution", 0, 1),
+    ("upstream.relaxation", "set_upstream_block_relaxation", "上游块聚集松弛", "int", "P2", "distribution", 0, 1),
+    ("downstream.relaxation", "set_downstream_block_relaxation", "下游块聚集松弛", "int", "P2", "distribution", 0, 1),
+    ("downstream.before_nozzle_relaxation", "set_downstream_block_relaxation_before_nozzle", "喷嘴前下游块松弛", "int", "P2", "distribution", 0, 1),
     ("upstream.untwist", "set_untwist_upstream_block", "上游块去扭曲", "bool", "P2", "topology", None, None),
     ("downstream.untwist", "set_untwist_downstream_block", "下游块去扭曲", "bool", "P2", "topology", None, None),
     ("upstream.untwist_location", "set_untwist_upstream_block_stream_location", "上游去扭曲流向位置", "float", "P2", "distribution", 0, 1),
@@ -526,7 +526,7 @@ for _key, _method, _label, _kind, _priority, _stage, _minimum, _maximum in (
     ("optimization.gap_steps", "set_row_optimization_steps_in_gap", "gap 优化步数", "int", "P0", "optimization", 0, 100000),
     ("optimization.full_multigrid_steps", "set_row_full_multigrid_optimization_steps", "全多重网格优化步数", "int", "P1", "optimization", 0, 100000),
     ("optimization.boundary_steps", "set_row_bnd_optimization_steps", "边界优化步数", "int", "P1", "optimization", 0, 100000),
-    ("optimization.straight_boundary", "set_row_straight_bnd_control", "直边界控制", "float", "P1", "optimization", 0, 1),
+    ("optimization.straight_boundary", "set_row_straight_bnd_control", "直边界控制", "int", "P1", "optimization", 0, 1),
     ("optimization.freeze_skin", "set_row_optimization_freeze_skin_mesh", "冻结 skin 网格", "bool", "P1", "optimization", None, None),
     ("optimization.orthogonality", "set_row_optimization_orthogonality_control", "正交性优化权重", "float", "P1", "optimization", 0, 1),
     ("optimization.gap_orthogonality", "set_row_optimization_orthogonality_control_in_gap", "gap 正交性优化权重", "float", "P1", "optimization", 0, 1),
@@ -569,6 +569,7 @@ for _key, _method, _getter, _label in (
         priority="P1",
         stage="optimization",
         enum_values=("no", "medium", "yes"),
+        value_map=(("no", 0), ("medium", 1), ("yes", 2)),
     )
 _add(
     "row/optimization.multigrid",
@@ -582,6 +583,27 @@ _add(
     priority="P1",
     stage="optimization",
     value_map=((True, "yes"), (False, "no")),
+)
+
+
+# 行级低内存模式。
+# 注意：AutoGrid 17.1 的 enable_low_memory_usage()/disable_low_memory_usage()
+# 内部调用 set_row_properties_(impl, "memory_use", 1/0)，但底层 C 函数期望字符串
+# 值导致 "TypeError: Expecting string"。通过 row_property_memory_use setter_mode
+# 直接调用 set_row_properties_ 并传入 "1"/"0" 字符串绕过。
+_add(
+    "row/low_memory_usage",
+    "低内存占用模式",
+    scope="row",
+    target_kind="row",
+    hierarchy=("row",),
+    value_type="bool",
+    setter="set_row_properties_",
+    getter=None,
+    priority="P2",
+    stage="wizard",
+    value_map=((True, "1"), (False, "0")),
+    setter_mode="row_property_memory_use",
 )
 
 
@@ -681,7 +703,6 @@ for _key, _suffix, _label, _si, _minimum, _maximum in (
     ("hub_cell_width_at_wall", "cell_width_at_wall_at_hub", "hub 端首层宽度", True, 0, None),
     ("shroud_cell_width_at_wall", "cell_width_at_wall_at_shroud", "shroud 端首层宽度", True, 0, None),
     ("boundary_layer_width", "bnd_layer_width", "边界层厚度", True, 0, None),
-    ("wall_width_interpolation", "cell_width_at_wall_interpolation", "壁面宽度插值", False, 0, 1),
     ("trailing_edge_cell_width", "cell_width_at_trailing_edge", "尾缘单元宽度", True, 0, None),
     ("leading_edge_cell_width", "cell_width_at_leading_edge", "前缘单元宽度", True, 0, None),
     ("boundary_layer_expansion", "expansion_ratio_in_bnd_layer", "边界层增长率", False, 1, None),
@@ -701,15 +722,29 @@ for _key, _suffix, _label, _si, _minimum, _maximum in (
         si_length=_si,
         topologies=("default",),
     )
+# wall_width_interpolation 的 API 期望 int（0=禁用, 1=启用）。
+_direct(
+    "blade/b2b.default.wall_width_interpolation",
+    "set_b2b_default_topology_cell_width_at_wall_interpolation",
+    "壁面宽度插值",
+    target_kind="blade",
+    hierarchy=("row", "blade"),
+    value_type="int",
+    priority="P1",
+    stage="boundary_layer",
+    minimum=0,
+    maximum=1,
+    topologies=("default",),
+)
 for _key, _method, _label, _kind, _minimum, _maximum in (
     ("throat_points", "set_b2b_default_topology_throat_control", "喉部点数", "int", 0, 10001),
     ("throat_projection_type", "set_b2b_default_topology_throat_projection_type", "喉部投影类型", "int", 0, 10),
-    ("throat_inlet_relaxation", "set_b2b_default_topology_throat_projection_inlet_relaxation", "喉部入口松弛", "float", 0, 1),
-    ("throat_outlet_relaxation", "set_b2b_default_topology_throat_projection_outlet_relaxation", "喉部出口松弛", "float", 0, 1),
+    ("throat_inlet_relaxation", "set_b2b_default_topology_throat_projection_inlet_relaxation", "喉部入口松弛", "int", 0, 1),
+    ("throat_outlet_relaxation", "set_b2b_default_topology_throat_projection_outlet_relaxation", "喉部出口松弛", "int", 0, 1),
     ("outlet_angle", "set_b2b_default_topology_outlet_angle", "出口网格角", "float", -180, 180),
     ("inlet_angle", "set_b2b_default_topology_inlet_angle", "入口网格角", "float", -180, 180),
     ("wake_deviation_angle", "set_b2b_default_topology_wake_control_deviation_angle", "尾迹偏转角", "float", -180, 180),
-    ("intersection_quality", "set_b2b_default_topology_intersection_quality", "交线质量控制", "float", 0, None),
+    ("intersection_quality", "set_b2b_default_topology_intersection_quality", "交线质量控制", "int", 0, None),
     ("intersection_law", "set_b2b_default_topology_intersection_law", "交线分布律", "int", 0, 20),
     ("intersection_control_points", "set_b2b_default_topology_intersection_control_point_number", "交线控制点数", "int", 2, 10001),
     ("intersection_precision_ratio", "set_b2b_intersection_precision_check_ratio", "交线精度检查比", "float", 0, None),
@@ -768,23 +803,34 @@ for _side in ("inlet", "outlet"):
         ),
         topologies=("hoh",),
     )
-    for _key, _method_suffix, _kind, _minimum, _maximum in (
-        ("extension_location", "extension_location", "float", 0, 1),
-        ("extension_streamwise_points", "extension_streamwise_npts", "int", 2, 10001),
-    ):
-        _direct(
-            f"blade/b2b.hoh.{_side}_{_key}",
-            f"set_b2b_hoh_topology_{_side}_{_method_suffix}",
-            f"HOH {_side} {_key}",
-            target_kind="blade",
-            hierarchy=("row", "blade"),
-            value_type=_kind,
-            priority="P2",
-            stage="distribution",
-            minimum=_minimum,
-            maximum=_maximum,
-            topologies=("hoh",),
-        )
+    # extension_location 的 getter 需要额外参数，禁用读回；setter 仍可正常执行。
+    _direct(
+        f"blade/b2b.hoh.{_side}_extension_location",
+        f"set_b2b_hoh_topology_{_side}_extension_location",
+        f"HOH {_side} extension_location",
+        target_kind="blade",
+        hierarchy=("row", "blade"),
+        value_type="float",
+        priority="P2",
+        stage="distribution",
+        minimum=0,
+        maximum=1,
+        topologies=("hoh",),
+        getter=None,
+    )
+    _direct(
+        f"blade/b2b.hoh.{_side}_extension_streamwise_points",
+        f"set_b2b_hoh_topology_{_side}_extension_streamwise_npts",
+        f"HOH {_side} extension_streamwise_points",
+        target_kind="blade",
+        hierarchy=("row", "blade"),
+        value_type="int",
+        priority="P2",
+        stage="distribution",
+        minimum=2,
+        maximum=10001,
+        topologies=("hoh",),
+    )
 for _key, _suffix, _label in (
     ("boundary_layer_points", "npts_in_boundary_layer", "边界层点数"),
     ("around_boundary_layer_points", "npts_around_boundary_layer", "边界层周围点数"),
@@ -868,13 +914,15 @@ for _edge in ("leading", "trailing"):
         topologies=("hoh",),
     )
     for _kind, _si, _minimum in (("absolute_distance", True, 0), ("relative_distance", False, 0), ("cell_length", True, 0)):
+        # cell_length 的 API setter 期望 int 而非 float。
+        _value_type = "int" if _kind == "cell_length" else "float"
         _direct(
             f"blade/b2b.hoh.{_edge}_edge_{_kind}",
             f"set_b2b_hoh_{_edge}_edge_control_{_kind}",
             f"HOH {_edge} edge {_kind}",
             target_kind="blade",
             hierarchy=("row", "blade"),
-            value_type="float",
+            value_type=_value_type,
             priority="P2",
             stage="distribution",
             minimum=_minimum,
@@ -1214,6 +1262,36 @@ _add(
     enum_values=("absolute_distance", "relative_distance", "cell_length"),
     setter_by_value=tuple((value, f"set_distribution_type_{value}") for value in ("absolute_distance", "relative_distance", "cell_length")),
 )
+_add(
+    "stagnation-point/distribution_from_expansion_ratio",
+    "停滞点膨胀比分布模式",
+    scope="existing-effect",
+    target_kind="stagnation-point",
+    hierarchy=("row", "blade", "stagnation-point"),
+    value_type="bool",
+    setter=None,
+    getter="get_distribution_type",
+    priority="P2",
+    stage="existing_effect",
+    setter_by_value=(
+        (True, "enable_distribution_from_expansion_ratio"),
+        (False, "disable_distribution_from_expansion_ratio"),
+    ),
+)
+_add(
+    "stagnation-point/desired_expansion_ratio",
+    "停滞点目标膨胀比",
+    scope="existing-effect",
+    target_kind="stagnation-point",
+    hierarchy=("row", "blade", "stagnation-point"),
+    value_type="float",
+    setter="desired_expansion_ratio",
+    getter=None,
+    priority="P2",
+    stage="existing_effect",
+    minimum=1.0,
+    setter_mode="value",
+)
 _EXISTING_LINE_FIELDS = (
     ("boundary_layer_points", "set_number_of_points_in_boundary_layer", "int", 2, 10001),
     ("streamwise_points", "set_number_of_points_streamwise", "int", 2, 10001),
@@ -1351,8 +1429,8 @@ for _key, _method, _label, _kind, _minimum, _maximum in (
     ("leading_sharp", "set_sharp_treatment_at_leading_edge", "前缘 sharp 处理", "bool", None, None),
     ("trailing_sharp", "set_sharp_treatment_at_trailing_edge", "尾缘 sharp 处理", "bool", None, None),
     ("trailing_rounded", "set_rounded_treatment_at_trailing_edge", "尾缘 rounded 处理", "bool", None, None),
-    ("leading_blend", "set_blend_treatment_at_leading_edge", "前缘 blend 权重", "float", 0, 1),
-    ("trailing_blend", "set_blend_treatment_at_trailing_edge", "尾缘 blend 权重", "float", 0, 1),
+    ("leading_blend", "set_blend_treatment_at_leading_edge", "前缘 blend 权重", "int", 0, 1),
+    ("trailing_blend", "set_blend_treatment_at_trailing_edge", "尾缘 blend 权重", "int", 0, 1),
 ):
     _direct(
         f"blade/edge_treatment.{_key}",
@@ -1491,6 +1569,43 @@ for _spec_item in CONTROL_REGISTRY.values():
         raise RuntimeError(f"控制 {_spec_item.key} 未指定 setter")
 
 
+# 控制项过滤器：按拓扑依赖关系分组，用于验证活动中的用例筛选。
+# 键名与 PLAN.md "参数分层" 章节对齐。
+TOPOLOGY_SELECTOR_KEY = "blade/b2b.topology"
+
+COMMON_CORE_KEYS: frozenset[str] = frozenset(
+    key for key, spec in CONTROL_REGISTRY.items()
+    if not spec.topologies and key != TOPOLOGY_SELECTOR_KEY
+)
+COMMON_TOPOLOGY_KEYS: frozenset[str] = frozenset({TOPOLOGY_SELECTOR_KEY})
+TOPOLOGY_DEFAULT_KEYS: frozenset[str] = frozenset(
+    key for key, spec in CONTROL_REGISTRY.items()
+    if spec.topologies == ("default",)
+)
+TOPOLOGY_HOH_KEYS: frozenset[str] = frozenset(
+    key for key, spec in CONTROL_REGISTRY.items()
+    if spec.topologies == ("hoh",)
+)
+TOPOLOGY_HI_KEYS: frozenset[str] = frozenset(
+    key for key, spec in CONTROL_REGISTRY.items()
+    if spec.topologies == ("hi",)
+)
+ALL_CONDITIONAL_KEYS: frozenset[str] = TOPOLOGY_DEFAULT_KEYS | TOPOLOGY_HOH_KEYS | TOPOLOGY_HI_KEYS
+COMMON_KEYS: frozenset[str] = COMMON_CORE_KEYS | COMMON_TOPOLOGY_KEYS | ALL_CONDITIONAL_KEYS
+
+# 拓扑值 -> 对应条件键集合的映射。
+TOPOLOGY_KEY_MAP: dict[str, frozenset[str]] = {
+    "default": TOPOLOGY_DEFAULT_KEYS,
+    "hoh": TOPOLOGY_HOH_KEYS,
+    "hi": TOPOLOGY_HI_KEYS,
+}
+# 条件键 -> 所需拓扑值的反向查找。
+CONDITIONAL_KEY_TOPOLOGY: dict[str, str] = {}
+for _topo, _keys in TOPOLOGY_KEY_MAP.items():
+    for _key in _keys:
+        CONDITIONAL_KEY_TOPOLOGY[_key] = _topo
+
+
 # setter 审计：映射项来自注册表，排除规则只用于审计，绝不参与运行时调用。
 CONTROL_TARGET_OWNERS: dict[str, tuple[str, ...]] = {
     "configuration": ("",),
@@ -1528,6 +1643,18 @@ for _spec_item in CONTROL_REGISTRY.values():
             MAPPED_SETTERS_BY_OWNER[_owner_key] = tuple(
                 sorted(set(MAPPED_SETTERS_BY_OWNER.get(_owner_key, ()) + (_spec_item.key,)))
             )
+
+_ALL_KNOWN_SETTERS: set[str] = set()
+for _spec_item in CONTROL_REGISTRY.values():
+    if _spec_item.setter:
+        _ALL_KNOWN_SETTERS.add(_spec_item.setter)
+    for _, _method in _spec_item.setter_by_value:
+        _ALL_KNOWN_SETTERS.add(_method)
+
+# 已知的运行时全局 helper 函数（C 扩展暴露，源码中无 def 定义，
+# 但在 AutoGrid Python 环境中可直接调用）。
+_RUNTIME_GLOBALS: frozenset[str] = frozenset({"set_row_properties_"})
+
 
 EXCLUDED_SETTERS: dict[str, str] = {
     "a5_set_configuration_units": "项目单位属性，不是网格控制",
@@ -1721,6 +1848,11 @@ def audit_control_bindings(path: str | Path) -> list[dict[str, Any]]:
             available_owners = tuple(
                 candidate for candidate in expected_owners if method in methods_by_owner.get(candidate, set())
             )
+            # 模块级函数（包括 C 扩展暴露的全局 helper，不通过 def 定义）
+            # 在源码中不可追踪，但在 AutoGrid 运行时环境中可用。
+            if not available_owners:
+                if method in methods_by_owner.get("", set()) or method in _RUNTIME_GLOBALS:
+                    available_owners = ("<module>",)
             results.append(
                 {
                     "control_key": spec.key,
@@ -1862,9 +1994,14 @@ def resolve_control_requests(
     requests: Sequence[ControlRequest],
     geometry: Any,
 ) -> list[ResolvedControl]:
-    """按几何实体展开 wildcard，并以最精确选择器覆盖 wildcard。"""
+    """按几何实体展开 wildcard，并以最精确选择器覆盖 wildcard。
+
+    同时自动注入拓扑选择器、检测跨拓扑冲突，并按拓扑依赖排序。
+    """
 
     units_factor = getattr(geometry, "units_factor", None)
+
+    # Step 1: wildcard 展开。
     candidates_by_identity: dict[tuple[str, tuple[TargetEntity, ...]], list[ControlRequest]] = {}
     for request in requests:
         targets = _candidate_targets(request.spec, geometry)
@@ -1874,6 +2011,10 @@ def resolve_control_requests(
         for target in matches:
             candidates_by_identity.setdefault((request.key, target), []).append(request)
 
+    # Step 2: 拓扑自动注入与跨拓扑冲突检测。
+    _ensure_topology_selectors(candidates_by_identity)
+
+    # Step 3: 精确选择器优先。
     chosen: list[tuple[ControlRequest, tuple[TargetEntity, ...]]] = []
     for (key, target), candidates in candidates_by_identity.items():
         max_specificity = max(candidate.specificity for candidate in candidates)
@@ -1884,17 +2025,22 @@ def resolve_control_requests(
             raise ControlValidationError(f"控制 {key} 对同一实体存在等优先级冲突：{paths}")
         chosen.append((sorted(winners, key=lambda item: item.selector_path)[0], target))
 
-    chosen.sort(
-        key=lambda item: (
-            STAGE_ORDER[item[0].spec.stage],
-            "/".join(part.name for part in item[1]),
-            item[0].key,
-        )
-    )
+    # Step 4: 阶段内拓扑依赖排序——b2b.topology 永远先于其条件子参数。
+    chosen.sort(key=_topology_sort_key)
+
+    # Step 5: 生成已解析控制列表。
     resolved: list[ResolvedControl] = []
     for index, (request, target) in enumerate(chosen, start=1):
         spec = request.spec
-        project_value = convert_si_length(request.value, units_factor) if spec.si_length else request.value
+        if spec.si_length:
+            project_value = convert_si_length(request.value, units_factor)
+            if spec.value_type in ("int", "tuple_int"):
+                if isinstance(project_value, tuple):
+                    project_value = tuple(int(v) for v in project_value)
+                else:
+                    project_value = int(project_value)
+        else:
+            project_value = request.value
         api_value = spec.map_api_value(project_value)
         setter = spec.setter_for_value(request.value)
         if setter is None:
@@ -1919,6 +2065,88 @@ def resolve_control_requests(
             )
         )
     return resolved
+
+
+def _topology_sort_key(
+    item: tuple[ControlRequest, tuple[TargetEntity, ...]],
+) -> tuple[int, str, int, str]:
+    """排序键：阶段 → 目标 → 拓扑选择器优先 → 键名。
+
+    确保 blade/b2b.topology 在同一阶段、同一目标内永远先于
+    b2b.default.* / b2b.hoh.* / b2b.hi.* 等条件子参数。
+    """
+    request, target = item
+    stage_order = STAGE_ORDER[request.spec.stage]
+    target_path = "/".join(part.name for part in target)
+    # 拓扑选择器优先级最高（0），其他控制为 1。
+    is_topo_selector = 0 if request.key == TOPOLOGY_SELECTOR_KEY else 1
+    return (stage_order, target_path, is_topo_selector, request.key)
+
+
+def _ensure_topology_selectors(
+    candidates_by_identity: dict[tuple[str, tuple[TargetEntity, ...]], list[ControlRequest]],
+) -> None:
+    """为拓扑条件参数自动注入 b2b.topology，并检测跨拓扑冲突。
+
+    规则：
+    - 若同一叶片使用了不同拓扑族的条件参数 → 报错。
+    - 若已显式设置 b2b.topology 但与条件参数不匹配 → 报错。
+    - 若未显式设置 b2b.topology 但条件参数可唯一确定拓扑 → 自动注入。
+    """
+    blade_topo_needs: dict[tuple[TargetEntity, ...], str] = {}
+    blade_explicit_topo: dict[tuple[TargetEntity, ...], str] = {}
+
+    for (key, target), candidates in candidates_by_identity.items():
+        # 只关心 blade 级拓扑相关控制。
+        blade_target = _blade_part(target)
+        if blade_target is None:
+            continue
+        if key == TOPOLOGY_SELECTOR_KEY:
+            winner = max(candidates, key=lambda c: c.specificity)
+            blade_explicit_topo[target] = str(winner.value)
+        elif key in CONDITIONAL_KEY_TOPOLOGY:
+            required = CONDITIONAL_KEY_TOPOLOGY[key]
+            if target in blade_topo_needs and blade_topo_needs[target] != required:
+                raise ControlValidationError(
+                    f"同一叶片存在跨拓扑冲突：同时使用了 {blade_topo_needs[target]} "
+                    f"和 {required} 拓扑的条件参数；请明确选择一种拓扑"
+                )
+            blade_topo_needs[target] = required
+
+    # 逐一校验和注入。
+    for target, required_topo in blade_topo_needs.items():
+        if target in blade_explicit_topo:
+            if blade_explicit_topo[target] != required_topo:
+                raise ControlValidationError(
+                    f"拓扑冲突：显式设置 b2b.topology={blade_explicit_topo[target]}，"
+                    f"但条件参数要求 {required_topo} 拓扑"
+                )
+            continue
+
+        # 自动注入隐式 b2b.topology。
+        topo_spec = CONTROL_REGISTRY[TOPOLOGY_SELECTOR_KEY]
+        selectors = tuple(
+            EntitySelector(kind=entity.kind, mode="index", value=entity.index)
+            for entity in target
+            if entity.index is not None
+        )
+        implicit_req = ControlRequest(
+            raw=f"auto:b2b.topology={required_topo}",
+            key=TOPOLOGY_SELECTOR_KEY,
+            selectors=selectors,
+            value=required_topo,
+            spec=topo_spec,
+            source="auto-inject",
+        )
+        candidates_by_identity[(TOPOLOGY_SELECTOR_KEY, target)] = [implicit_req]
+
+
+def _blade_part(target: tuple[TargetEntity, ...]) -> TargetEntity | None:
+    """返回目标中的 blade 实体，若不存在则返回 None。"""
+    for entity in target:
+        if entity.kind == "blade":
+            return entity
+    return None
 
 
 def list_control_specs(priority: str | None = None) -> list[ControlSpec]:
@@ -2065,7 +2293,12 @@ def _hashable_value(value: Any) -> Any:
 
 
 __all__ = [
+    "ALL_CONDITIONAL_KEYS",
     "AUDIT_EXCLUSION_RULES",
+    "COMMON_CORE_KEYS",
+    "COMMON_KEYS",
+    "COMMON_TOPOLOGY_KEYS",
+    "CONDITIONAL_KEY_TOPOLOGY",
     "CONTROL_REGISTRY",
     "CONTROL_TARGET_OWNERS",
     "EXCLUDED_SETTERS",
@@ -2073,11 +2306,20 @@ __all__ = [
     "MAPPED_SETTERS_BY_OWNER",
     "PRIORITIES",
     "STAGES",
+    "TOPOLOGY_DEFAULT_KEYS",
+    "TOPOLOGY_HI_KEYS",
+    "TOPOLOGY_HOH_KEYS",
+    "TOPOLOGY_KEY_MAP",
+    "TOPOLOGY_SELECTOR_KEY",
     "ControlRequest",
     "ControlSpec",
     "ControlValidationError",
     "EntitySelector",
     "ResolvedControl",
+    "TargetEntity",
+    "_ALL_KNOWN_SETTERS",
+    "_ensure_topology_selectors",
+    "_topology_sort_key",
     "audit_autogrid_source",
     "audit_control_bindings",
     "audit_setter",
