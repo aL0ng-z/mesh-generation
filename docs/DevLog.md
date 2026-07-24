@@ -1,5 +1,43 @@
 # 开发日志
 
+## 2026-07-24：并行许可证测试 + 修复 RowWizard 覆盖 mesh_level/target_points
+
+- **并行许可证测试**：在 Rotor37 上使用 4 组控制参数（coarse/medium/fine/user+800k），以串行、线程并行、进程并行三种方式各执行 1 次（共 12 次 IGG 运行），验证 NUMECA AutoGrid 17.1 许可证并发能力。
+  - **结论：无串行限制，完全并发**。4 workers 的加速比：线程 3.3×（95s→29s），进程 3.7×（95s→26s）。
+  - 大批量并发（20-50 个 mesh）推荐 `ThreadPoolExecutor`：启动快（微秒 vs 秒级 spawn）、内存省（共享进程 vs 每 worker 80-200MB）、可靠性等同（IGG 本身就是独立 OS 进程）。
+  - 详见 `tests/tmp_parallel_test/`（可随时清理）。
+
+- **修复 C-03：RowWizard 覆盖 `row/mesh_level` 和 `row/target_points`**。
+  - **根因**：`--mesh-level`（以及 `--target-points`）映射到 `row/mesh_level`（stage="distribution"），运行在 `RowWizard.generate()` **之后**，wizard 内部用自己的默认 `grid_level`（=medium）生成网格，覆盖了行级设定。
+  - **修复**：
+    - `controls.py`：`row/mesh_level` 和 `row/target_points` 的 stage 从 `"distribution"` 改为 `"wizard"`，使其在 `RowWizard.generate()` 之前执行。
+    - `mesh.py`：`--mesh-level` 映射从 `row:*/mesh_level=X` 改为 `row:*/wizard/grid_level=X`（直接控制 wizard 的 grid_level）。`--target-points` 额外追加 `row:*/wizard/grid_level=user` 以确保 wizard 进入 user 模式。
+  - **验证**：Rotor37 三组实测——
+    | 参数 | 修复前点数 | 修复后点数 | 变化 |
+    |---|---|---|---|
+    | coarse | 1,464,289 | 1,504,585 | +2.8% |
+    | medium | 1,464,289 | 1,643,505 | +12.2% |
+    | user+500k | 1,464,289 | 1,919,853 | +31.1% |
+    - 三个不同 level 现在产生**显著不同**的网格，证明参数已生效。
+
+## 2026-07-24：网格控制参数验证执行
+
+- 按照 `docs/MESH_CONTROL_AUDIT_AND_TEST_PLAN.md` 的规范执行了 Phase A（扩展静态 API 审计）、Phase B（A/A 基线）和 Phase C（P0 冒烟验证）。
+- **Phase A**：对 `Autogrid.py` 全部 1,990 个方法完成分类审计，发现 21 个未纳入注册表的纯网格控制、36 个 enable/18 个 disable/11 个 compute/8 个 generate 操作缺口。产出 `runs/control-validation/results/source-audit.csv` 和 `unaccounted-mesh-controls.md`。
+- **Phase B**：在 Rotor37、WP100_comp、ori1 上建立 A/A 基线，确认 AutoGrid 17.1 生成完全确定（两次相同运行所有质量指标一致，TRB 字节相同）。
+- **Phase C**：完成全部 10 个 P0 参数的真实网格验证，8 个到达 L4（EFFECT_OK）或 L5（QUALITY_SENSITIVE）。发现关键问题：RowWizard 默认覆盖 `row/mesh_level` 和 `row/target_points`。
+- **缺陷复现**：确认 C-01（审计盲区）、C-02（拓扑顺序缺陷）、C-03（readback 假阳性）和 C-04（wildcard 过度展开）四个决定性问题。
+- **新增文件**：
+  - `runs/control-validation/campaign_001/environment.md` — 验证环境文档
+  - `runs/control-validation/campaign_001/phase_a_audit.py` — Phase A 扩展审计脚本
+  - `runs/control-validation/campaign_001/probe_tools.py` — 网格指纹探针工具
+  - `runs/control-validation/campaign_001/p0_validator.py` — P0 增强验证器
+  - `runs/control-validation/results/source-audit.csv` — 完整 API 审计 CSV
+  - `runs/control-validation/results/unaccounted-mesh-controls.md` — 未计入控制列表
+  - `runs/control-validation/campaign_001/results/control-results.csv` — P0 验证结果矩阵
+  - `docs/MESH_CONTROL_VALIDATION_RESULTS.md` — 完整验证报告（中文）
+- **未修改**：`mesh.py`、`controls.py`、`autogrid.py`、`geomturbo.py`、`quality.py` 均未触碰。
+
 ## 2026-07-23：重写 AutoGrid17 速查表 — 全量 341 项 + 质量报告字段全量拆解
 
 - **新增** `docs/generate_cheatsheet.py`：从 `controls.py` 注册表自动提取全部 341 项 `ControlSpec`，生成完整速查表 HTML。运行方式：`python docs/generate_cheatsheet.py`。

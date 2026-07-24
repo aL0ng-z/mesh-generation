@@ -186,8 +186,12 @@ def _build_control_requests(args: argparse.Namespace) -> list[ControlRequest]:
 
     assignments = list(args.set_values)
     explicit = (
-        (args.mesh_level, f"row:*/mesh_level={args.mesh_level}" if args.mesh_level else None),
+        (args.mesh_level, f"row:*/wizard/grid_level={args.mesh_level}" if args.mesh_level else None),
         (args.target_points, f"row:*/target_points={args.target_points}" if args.target_points is not None else None),
+        (
+            args.target_points,
+            "row:*/wizard/grid_level=user" if args.target_points is not None else None,
+        ),
         (
             args.first_cell_width,
             f"row:*/wizard/first_cell_width={args.first_cell_width}"
