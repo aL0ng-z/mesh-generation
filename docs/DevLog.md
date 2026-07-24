@@ -1,5 +1,20 @@
 # 开发日志
 
+## 2026-07-23：重写 AutoGrid17 速查表 — 全量 341 项 + 质量报告字段全量拆解
+
+- **新增** `docs/generate_cheatsheet.py`：从 `controls.py` 注册表自动提取全部 341 项 `ControlSpec`，生成完整速查表 HTML。运行方式：`python docs/generate_cheatsheet.py`。
+- 控制参数：全部 341 项按 10 个作用域分组，每项展示控制键、中文含义、类型/范围、应用阶段、备注（SI 长度/拓扑限制/setter 模式）。
+- **质量部分重写**：不再混杂准则名和字段名，改为严格追溯 `parse_quality_report()` 解析逻辑，分层拆解为 7 个子章节：
+  - 一、报告元数据 metadata（7 字段，含解析来源）
+  - 二、项目信息 project（6 顶层 + rows[] 逐行 6 字段）
+  - 三、实体统计 entities[]（3 全局 + 6 准则 × {min/max/avg/location}，含 wall_distance.si 换算）
+  - 四、扁平化指标 metrics（34 字段完整清单，6 准则各 5 字段：3 统计 + 1 位置 + 1 block + 1 衍生 wall_distance_uniformity）
+  - 五、质量判定 result（8 必需字段 + 7 硬门槛逐条解释 + PASS/FAIL/UNKNOWN 逻辑）
+  - 六、数据源优先级（.qualityReport vs CGNS 降级）
+  - 七、三算例基线
+  - 最差位置对象结构 critical_location（8 字段，含 derived_from 语义）
+- A4 横版单列，含目录导航，PDF 14 页（~1.2MB）。
+
 ## 2026-07-23：编写源码指南
 
 - 将已废止的 `autogrid_backend_py_dev_plan.md` 重写为 `SOURCE_CODE_GUIDE.md`。
