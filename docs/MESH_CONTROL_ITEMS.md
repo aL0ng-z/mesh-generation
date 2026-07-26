@@ -35,7 +35,7 @@
 | `topologies` | 适用 B2B 拓扑；不匹配时严格失败 |
 | `not_applicable_when` | 已知不适用条件说明 |
 
-当前注册表共有 341 个控制键：P0 10 个、P1 59 个、P2 272 个。
+当前注册表共有 344 个控制键：P0 10 个、P1 59 个、P2 275 个。
 
 ## P0：高频基础控制
 
@@ -75,7 +75,7 @@ python mesh.py --describe-control blade/b2b.default.streamwise_inlet_points
 
 ## P2：高级与已有实体控制
 
-P2 共 272 项，覆盖：
+P2 共 275 项，覆盖：
 
 - Default、HOH、H&I B2B 拓扑及其完整点数/聚集控制；
 - gap 与 partial-gap 拓扑、点数和优化控制；
@@ -133,7 +133,8 @@ row:Rotor/blade:Main Blade/gap:shroud/spanwise_points=17
 project_value = requested_si / units_factor
 ```
 
-请求值、项目单位值、传给 API 的值和 getter 回读值均进入 `run_summary.json`。
+请求值、项目单位值、传给 API 的值，以及 setter 前、setter 后和 3D
+网格生成后的 getter 回读值均进入 Schema 3 `run_summary.json`。
 
 ## 应用阶段
 
@@ -221,7 +222,7 @@ dry-run 只在 `controls.resolved` 中记录 `planned`，不会把控制写成 `
 
 快捷参数均采用 `row:*` wildcard，作用于几何中所有匹配实体。需要逐行差异化时改用 `--set`。
 
-### 途径 2：通用 `--set` 表达式（全部 341 个控制键）
+### 途径 2：通用 `--set` 表达式（全部 344 个控制键）
 
 ```bash
 python mesh.py input.geomTurbo --set "row:*/mesh_level=medium"
@@ -264,11 +265,13 @@ resolved = resolve_control_requests(requests, geometry)
 project_value = requested_si / units_factor
 ```
 
-请求值、项目单位值、传给 API 的值和 getter 回读值均进入 `run_summary.json`，完整可审计。
+请求值、项目单位值、传给 API 的值和三阶段 getter 回读均进入
+`run_summary.json`，完整可审计。需要验证网格是否真正改变时可追加
+`--mesh-fingerprint`，生成完整 block 坐标 SHA-256、I/J/K 和固定坐标探针。
 
 ## 按作用域分类总览
 
-以下按 `target_kind` 列出全部 341 个控制键的分布。完整、可执行的权威来源仍是 `controls.py` 中的 `CONTROL_REGISTRY`；此表用于快速定位。
+以下按 `target_kind` 列出全部 344 个控制键的分布。完整、可执行的权威来源仍是 `controls.py` 中的 `CONTROL_REGISTRY`；此表用于快速定位。
 
 ### configuration（全局配置）— 20 项
 
@@ -337,16 +340,16 @@ project_value = requested_si / units_factor
 
 | 作用域大类 | 控制键数 |
 |---|---:|
-| configuration（含 bypass） | 20 |
+| configuration（含 bypass） | 30 |
 | wizard（含 acoustic） | 13 |
-| row | 39 |
-| blade（B2B + edge treatment） | 121 |
+| row | 40 |
+| blade（B2B + edge treatment） | 120 |
 | gap / partial-gap / fillet | 19 |
 | interface | 12 |
-| endwall / snubber / blade-sheet / stagnation-point | 22 |
+| endwall / snubber / blade-sheet / stagnation-point | 24 |
 | holes-line / endwall-holes-line / pin-fins-line / basin-hole | 49 |
 | existing-effect / solid-body / lete-wizard | 37 |
-| **合计** | **341**（P0: 10, P1: 59, P2: 272） |
+| **合计** | **344**（P0: 10, P1: 59, P2: 275） |
 
 ## P0 控制项 CLI 映射速查
 

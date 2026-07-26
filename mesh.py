@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from datetime import datetime
@@ -35,6 +36,11 @@ def main() -> int:
     parser.add_argument("--no-row-wizard", action="store_true", help="不执行 RowWizard。")
     parser.add_argument("--dry-run", action="store_true", help="只生成脚本和摘要，不启动 IGG。")
     parser.add_argument("--timeout", type=int, default=None, help="AutoGrid 超时秒数。")
+    parser.add_argument(
+        "--mesh-fingerprint",
+        action="store_true",
+        help="生成完整 block/坐标网格指纹；用于验证，不影响普通网格控制。",
+    )
     parser.add_argument(
         "--mesh-level",
         choices=("coarse", "medium", "fine", "user"),
@@ -110,6 +116,7 @@ def main() -> int:
         dry_run=args.dry_run,
         timeout_seconds=args.timeout,
         controls=resolved_controls,
+        mesh_fingerprint=args.mesh_fingerprint,
     )
 
     quality_summary: dict[str, Any] | None = None
@@ -150,16 +157,24 @@ def main() -> int:
                 },
             }
 
+    mesh_fingerprint = _finalize_mesh_fingerprint(
+        autogrid_run.mesh_fingerprint,
+        quality_summary,
+    )
+    autogrid_data = autogrid_run.to_dict()
+    autogrid_data["mesh_fingerprint"] = mesh_fingerprint
     run_summary = {
-        "schema_version": 2,
+        "schema_version": 3,
         "run_dir": str(run_dir),
         "geometry": geometry.to_dict(),
         "controls": {
             "requested": [request.to_dict() for request in requests],
             "resolved": [control.to_dict() for control in resolved_controls],
             "applied": [] if args.dry_run else autogrid_run.control_results,
+            "post_generation": [] if args.dry_run else autogrid_run.post_control_results,
         },
-        "autogrid": autogrid_run.to_dict(),
+        "autogrid": autogrid_data,
+        "mesh_fingerprint": mesh_fingerprint,
         "quality": quality_summary,
     }
     _write_json(run_dir / "run_summary.json", run_summary)
@@ -167,7 +182,7 @@ def main() -> int:
     report = _render_report(
         geometry.to_dict(),
         run_summary["controls"],
-        autogrid_run.to_dict(),
+        autogrid_data,
         quality_summary,
         dry_run=args.dry_run,
     )
@@ -179,6 +194,35 @@ def main() -> int:
     if missing_mesh_outputs:
         return 1
     return 0
+
+
+def _finalize_mesh_fingerprint(
+    fingerprint: dict[str, Any] | None,
+    quality_summary: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """把质量报告中的网格层级并入最终比较签名。"""
+
+    if fingerprint is None:
+        return None
+    result = dict(fingerprint)
+    metrics = (quality_summary or {}).get("metrics", {}) or {}
+    grid_levels = metrics.get("grid_levels")
+    result["grid_levels"] = grid_levels
+    comparison_payload = {
+        "aggregate_sha256": result.get("aggregate_sha256"),
+        "number_of_blocks": result.get("number_of_blocks"),
+        "total_block_points": result.get("total_block_points"),
+        "total_block_cells": result.get("total_block_cells"),
+        "grid_levels": grid_levels,
+    }
+    normalized = json.dumps(
+        comparison_payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    result["comparison_sha256"] = hashlib.sha256(normalized).hexdigest()
+    return result
 
 
 def _build_control_requests(args: argparse.Namespace) -> list[ControlRequest]:

@@ -1,5 +1,104 @@
 # 开发日志
 
+## 2026-07-25：网格控制验证结果文档完善
+
+- 将 156 项通用候选控制参数的完整分类写入
+  `docs/MESH_CONTROL_VALIDATION_RESULTS.md`：按 `EFFECT_PASS`（44 项）、
+  `EFFECT_VALID_WITH_QUALITY_WARNING`（25 项）、
+  `EFFECT_INVALID_MESH_ONLY`（13 项）、`NO_MESH_EFFECT`（21 项）、
+  `FAIL_READBACK`（20 项）、`BLOCKED_TOPOLOGY_BASELINE`（33 项）
+  逐项列出键名、中文含义、值类型、取值范围/枚举及 Rotor37 实测表现。
+- 新增"网格生成流程"章节：详细说明不使用控制参数（默认路径）与使用
+  控制参数两种模式下的完整网格生成过程，包括 parse_geomTurbo →
+  解析控制请求 → 渲染脚本 → 按阶段应用控制 → RowWizard.generate() →
+  B2B/3D 生成 → 质量评估的完整链路。
+- 说明固定阶段顺序的设计原因（configuration → wizard →
+  RowWizard.generate() → topology → distribution → boundary_layer →
+  optimization → interface → existing_effect），以及回读三阶段验证
+  （setter 前 / setter 后 / 生成后）的判定逻辑。
+
+## 2026-07-25：Rotor37 通用网格控制全量指纹验证
+
+### 控制策展与 API 审计
+
+- 在不改变完整注册表和既有拓扑依赖行为的前提下，为 `controls.py` 增加
+  显式通用策展集合：拓扑无关 52 项、拓扑选择器 1 项、Default 51 项、
+  HOH 33 项、H&I 19 项，共 156 项；其余 188 项逐键记录排除原因。
+- 建立 `CONTROL_PREREQUISITES` 和依赖深度/排序校验，显式覆盖 user 网格
+  级别、untwist、优化权重、Default 模式、HOH extension/control type、
+  H&I relaxation 和停滞点分布等前置条件，不改变普通 CLI 的隐式行为。
+- 重新审计 344 个注册键、721 个 setter 和 706 个绑定：setter 为
+  361 映射/360 排除，绑定为 704 正式/2 合成；扩展 API 扫描为
+  364 映射、425 排除和 19 个激活动作。
+- 显式记录 AutoGrid 17.1 厂商绑定差异：HOH leading edge cell length
+  使用 SI float；trailing edge 同名 C 绑定只接受 int 且 getter 返回
+  `None`。
+
+### Schema 3 与完整网格指纹
+
+- `mesh.py` 新增可选 `--mesh-fingerprint`；`run_summary.json` 升级为
+  Schema 3，保留原字段并增加 setter 前、setter 后、3D 生成后回读，
+  block I/J/K、点数/单元数、固定坐标探针、多重网格层级和聚合指纹。
+- `autogrid.py` 在 CGNS 导出后由主进程通过 AutoGrid 随附的
+  `hdf5dll.dll` 读取每个结构化 block 的全部连续 Float64
+  `CoordinateX/Y/Z` 数据，流式计算逐 block 和聚合 SHA-256。
+- 实机确认 batch 环境中的 `Block.save_coords(...,0,0,0)` 会静默返回但
+  不创建文件，因此删除未调用的 IGG 侧死代码；正式指纹以完整 CGNS 坐标
+  为准，仍只使用 Python 标准库。
+
+### Campaign runner 与分析器
+
+- 重写 `tests/test_campaign_runner.py`，支持 audit、pilot、baseline、
+  cases、analyze、all、断点续跑、`--list-matrix`、默认 32 并发和
+  1800 秒单例超时。
+- 每个案例保存变量控制、依赖控制、上下文签名、实际参数列表、日志和
+  结果；同一依赖上下文只生成一次 baseline，无效果数值控制自动追加更宽
+  的安全第三值。
+- 实现 Default/H&I/HOH 各 4 次 A/A、低内存负对照、HOH 最多 10 个
+  单参数和 4 个组合有限修复，以及 outlet interface/trailing stagnation
+  point 目标解析 smoke。
+- 重写 `tests/test_analyze_results.py`，输出 344 项支持/排除表、逐参数和
+  逐取值结果、完整指纹、质量指标、临界 block/I/J/K、失败簇以及
+  CSV/JSON/Markdown 报告。
+- 修正回读判定：AutoGrid 枚举/布尔 getter 的稳定整数一一映射视为可靠；
+  只有一个默认值回读成功、其余值被重置时仍判为 `FAIL_READBACK`。
+- 修复 HOH rescue 中跨族 `row/flow_path.number` 被自身 Default 依赖
+  覆盖的问题，新增强制拓扑依赖函数和回归测试；修正后重新执行全部
+  10 个单参数和 4 个组合案例。
+
+### Rotor37 实机结果
+
+- 活动目录：
+  `runs/rotor37-control-validation/20260725_full_validation/`。
+- 实际完成 8 个 pilot、12 个 A/A、40 个上下文基线、328 个主案例、
+  36 个自适应案例和 14 个修正后的 HOH 修复案例，共 438 次成功命令；
+  所有案例网格和日志均保留。
+- Default 四次均为 9 block、1,464,289 点、结构有效且质量 PASS；
+  H&I 四次均为 8 block、490,320 点、结构有效但质量 FAIL；HOH 四次均为
+  7 block、618,495 点且重叠。
+- 修正后的 HOH 14 个修复案例全部仍重叠，33 个 HOH 条件控制最终统一为
+  `BLOCKED_TOPOLOGY_BASELINE`。
+- 156 项最终分类：44 `EFFECT_PASS`、25
+  `EFFECT_VALID_WITH_QUALITY_WARNING`、13
+  `EFFECT_INVALID_MESH_ONLY`、21 `NO_MESH_EFFECT`、20
+  `FAIL_READBACK`、33 `BLOCKED_TOPOLOGY_BASELINE`。
+- 82 项观察到真实网格变化，其中 33 项改变拓扑/尺寸/点数/层级，49 项
+  仅改变完整坐标分布；`row/low_memory_usage` 负对照指纹完全相同。
+
+### 文档与验证
+
+- 新增 `docs/MESH_CONTROL_VALIDATION_RESULTS.md`，同步稳定结论、推荐值域
+  和跨几何迁移边界。
+- 新增活动级 `results/agent_deep_analysis.md`；自动结果同时包含
+  `automated_analysis.md/json`、`control_results.csv/json`、
+  `case_results.csv`、`mesh_fingerprints.csv`、`quality_metrics.csv`
+  和 `failure_clusters.md`。
+- 更新 `README.md`、`docs/MESH_CONTROL_ITEMS.md` 和
+  `docs/SOURCE_CODE_GUIDE.md` 的 344 项注册表与 Schema 3 说明。
+- 全量单元测试：`69 tests passed`；核心脚本 `py_compile` 通过。
+- 本次未读取、搜索、修改或执行 `archive/`，未引入第三方依赖、JSON 配置
+  或包级目录。
+
 ## 2026-07-25：测试脚本重命名与归档 + low_memory_usage 修复 + 全量指标比对
 
 ### 测试脚本归档

@@ -1,6 +1,6 @@
 # geomTurbo → AutoGrid 17.1 网格生成工具
 
-本项目从 `.geomTurbo` 文件直接建立 NUMECA AutoGrid 17.1 项目，应用经过类型校验的纯网格控制，生成 B2B/3D 网格，并把原生 `.qualityReport` 标准化为 Schema v2 运行摘要。
+本项目从 `.geomTurbo` 文件直接建立 NUMECA AutoGrid 17.1 项目，应用经过类型校验的纯网格控制，生成 B2B/3D 网格，并把原生 `.qualityReport` 标准化为 Schema v3 运行摘要。
 
 当前实现保持根目录扁平：不依赖 `.trb` 模板，不读取 JSON/YAML 配置，不对 `.trb` 做字符串修改。所有运行产物写入 `runs/`。
 
@@ -8,13 +8,14 @@
 
 - 解析几何单位、叶排、主叶片、splitter、gap、partial-gap 和 fillet 等选择器信息。
 - 通过 `controls.py` 中唯一的静态 `ControlSpec` 注册表开放 AutoGrid 17.1 纯网格控制。
-- 提供 P0/P1/P2 共 341 个控制键，以及 721 个官方 setter 的映射或明确排除审计。
+- 提供 P0/P1/P2 共 344 个控制键，以及 721 个官方 setter 的映射或明确排除审计。
 - 支持全局、wizard、row、blade、gap、partial-gap、fillet、interface、endwall 和已有技术效果等作用域。
 - 严格校验选择器、类型、枚举、范围、拓扑适用性和 AutoGrid API 能力。
 - 长度控制始终按米输入，并按 `.geomTurbo` 的 `UNITS-FACTOR` 换算为项目单位。
 - 按固定阶段调用正式 AutoGrid 17.1 Python API，并通过 getter 回读可回读参数。
 - 完整解析项目、逐叶排质量统计以及最差 block/I/J/K 位置。
-- 输出 Schema v2 `run_summary.json` 和中文 `report.md`，同时保留旧版扁平质量字段。
+- 输出 Schema v3 `run_summary.json` 和中文 `report.md`，同时保留旧版字段。
+- 可选 `--mesh-fingerprint`，记录完整 CGNS block 坐标 SHA-256、I/J/K 尺寸、固定坐标探针和聚合网格指纹。
 - 在缺少 `.qualityReport` 时降级读取 CGNS 内嵌 `NIGridQuality` 数据。
 
 本阶段不包含自动调参、DOE、优化循环、CFD 求解、`y+` 计算或网格无关性分析。
@@ -22,7 +23,7 @@
 ## 项目结构
 
 ```text
-mesh.py                 命令行入口、Schema v2 摘要和中文报告
+mesh.py                 命令行入口、Schema v3 摘要、网格指纹和中文报告
 controls.py             类型化控制注册表、选择器、校验、SI 换算和 17.1 API 审计
 geomturbo.py            .geomTurbo 元数据与实体选择信息解析
 autogrid.py             AutoGrid 17.1 脚本渲染、执行、回读和结果标记解析
@@ -169,7 +170,7 @@ project_value = requested_si / units_factor
 
 `.trb` 仅由 AutoGrid API 保存，用于复现和人工核对，程序不会读取后再修改其文本。
 
-## 运行产物与 Schema v2
+## 运行产物与 Schema v3
 
 典型运行目录：
 
@@ -184,6 +185,7 @@ runs/<case>_<timestamp>/
   mesh.trb
   mesh.bcs
   mesh.qualityReport
+  mesh_fingerprint.json
   run_summary.json
   report.md
 ```
@@ -191,13 +193,15 @@ runs/<case>_<timestamp>/
 `run_summary.json` 的稳定顶层结构为：
 
 ```text
-schema_version: 2
+schema_version: 3
 geometry
 controls
   requested
   resolved
   applied
+  post_generation
 autogrid
+mesh_fingerprint
 quality
   metrics_source
   metadata
@@ -208,7 +212,8 @@ quality
 ```
 
 - `controls.resolved` 记录静态解析结果；dry-run 中状态为 `planned`。
-- `controls.applied` 只记录真实 AutoGrid 执行结果，包括 `requested`、`project_value`、`readback` 和 `error`。
+- `controls.applied` 记录 setter 前后回读；`controls.post_generation` 记录 3D 网格生成后的 getter 回读。
+- `mesh_fingerprint` 记录每个 block 的 I/J/K、点数/单元数、完整坐标 SHA-256、固定位置探针和聚合指纹；只有指定 `--mesh-fingerprint` 时生成。
 - `quality.entities` 包含 Entire Mesh 和每个 row 的完整统计。
 - `quality.metrics` 与 `quality.result` 保留兼容接口。
 

@@ -1,973 +1,1780 @@
-"""Rotor37 B2B 拓扑控制验证活动执行器。
+"""Rotor37 通用网格控制参数实机验证活动执行器。
 
-按照 PLAN.md 方案执行：
-1. 生成三种拓扑的 A/A 基线（各 4 份）
-2. 测试拓扑切换
-3. 对每个控制参数执行 OFAT 验证（单因子测试）
-4. 并发执行（最多 32 子进程），超时 1800s
-5. 收集结果并按 COMMON_CORE / CONDITIONAL_DEFAULT/HOH/HI / REJECTED 分类
+该脚本同时承担四项职责：
 
-用法：
-  python campaign_runner.py --phase 1          # 只生成基线
-  python campaign_runner.py --phase 2          # 只执行测试矩阵
-  python campaign_runner.py --phase 3          # 只收集结果并生成报告
-  python campaign_runner.py                    # 全部执行
-  python campaign_runner.py --dry-run          # 只打印测试矩阵，不执行
-  python campaign_runner.py --workers 16       # 自定义并发数
+1. 输出当前 344 个注册控制和 AutoGrid 17.1 API 的可审计清单；
+2. 为 156 个通用候选控制建立显式依赖上下文和至少两个测试值；
+3. 以最多 32 个独立 ``mesh.py`` 子进程并发生成真实网格；
+4. 保存可恢复的 campaign 状态，交给 ``test_analyze_results.py`` 汇总。
+
+所有运行产物均位于 ``runs/rotor37-control-validation/<campaign_id>/``。
 """
 
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import csv
 import hashlib
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
-import traceback
-from collections import defaultdict
+import unittest
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+from unittest.mock import patch
 
-# 项目根目录加入 sys.path（脚本位于 tests/ 子目录）
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# 项目模块
-from controls import (
-    COMMON_CORE_KEYS,
-    COMMON_KEYS,
-    COMMON_TOPOLOGY_KEYS,
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from controls import (  # noqa: E402
     CONDITIONAL_KEY_TOPOLOGY,
+    CONTROL_DEPENDENCY_DEPTH,
+    CONTROL_PREREQUISITES,
     CONTROL_REGISTRY,
-    TOPOLOGY_DEFAULT_KEYS,
-    TOPOLOGY_HI_KEYS,
-    TOPOLOGY_HOH_KEYS,
+    EXCLUDED_SETTERS,
+    GENERAL_API_ONLY_EXCLUSIONS,
+    GENERAL_CONTROL_EXCLUSIONS,
+    GENERAL_CONTROL_KEYS,
+    GENERAL_CORE_KEYS,
+    GENERAL_DEFAULT_KEYS,
+    GENERAL_EDGE_TREATMENT_KEYS,
+    GENERAL_HI_KEYS,
+    GENERAL_HOH_KEYS,
+    GENERAL_TOPOLOGY_KEYS,
+    MAPPED_SETTERS_BY_OWNER,
+    STAGE_ORDER,
     TOPOLOGY_SELECTOR_KEY,
     ControlSpec,
+    audit_autogrid_source,
+    audit_control_bindings,
 )
 
 
-# ============================================================================
-# 配置
-# ============================================================================
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
 GEOMETRY_PATH = PROJECT_ROOT / "geometries" / "Rotor37.geomTurbo"
 MESH_PY = PROJECT_ROOT / "mesh.py"
-TIMEOUT_SECONDS = 1800
-DEFAULT_MAX_WORKERS = min(32, (os.cpu_count() or 4))
-BASELINE_REPEATS = 4
+AUTOGRID_171 = Path(r"C:\ProgramData\NUMECA\fine171\_python\_autogrid\Autogrid.py")
+IGG_PYTHON_171 = Path(r"C:\ProgramData\NUMECA\fine171\_python\_igg\PYTHON.py")
+RUNS_ROOT = PROJECT_ROOT / "runs" / "rotor37-control-validation"
 
+DEFAULT_MAX_WORKERS = 32
+DEFAULT_TIMEOUT_SECONDS = 1800
+BASELINE_REPEATS = 4
 TOPOLOGY_VALUES = ("default", "hoh", "hi")
-TOPOLOGY_KEYS_MAP: dict[str, frozenset[str]] = {
-    "default": TOPOLOGY_DEFAULT_KEYS,
-    "hoh": TOPOLOGY_HOH_KEYS,
-    "hi": TOPOLOGY_HI_KEYS,
+REQUIRED_OUTPUTS = frozenset({"igg", "cgns", "trb", "quality_report"})
+
+SOURCE_FILES = (
+    PROJECT_ROOT / "mesh.py",
+    PROJECT_ROOT / "controls.py",
+    PROJECT_ROOT / "autogrid.py",
+    PROJECT_ROOT / "geomturbo.py",
+    PROJECT_ROOT / "quality.py",
+    Path(__file__).resolve(),
+    PROJECT_ROOT / "tests" / "test_analyze_results.py",
+    GEOMETRY_PATH,
+)
+
+TOPOLOGY_GROUPS: dict[str, frozenset[str]] = {
+    "default": GENERAL_DEFAULT_KEYS,
+    "hoh": GENERAL_HOH_KEYS,
+    "hi": GENERAL_HI_KEYS,
 }
 
-# Rotor37 几何特征：单排、36 叶片、shroud tip gap、无分流叶片。
-# 仅以下 target_kind 的控制可实测。
-ROTOR37_APPLICABLE_TARGETS: frozenset[str] = frozenset({
-    "configuration",
-    "wizard",
-    "acoustic-wizard",
-    "row",
-    "blade",
-    "gap",
-    "interface",
-    "stagnation-point",
-})
-
-
-def _is_rotor37_applicable(key: str, spec: ControlSpec) -> bool:
-    """判断控制项是否可用于 Rotor37 几何。"""
-    if spec.target_kind not in ROTOR37_APPLICABLE_TARGETS:
-        return False
-    if spec.not_applicable_when:
-        return False
-    if "splitter" in key.lower():
-        return False
-    if "bypass" in key:
-        return False
-    if spec.target_kind == "interface" and "outlet2" in key:
-        return False
-    if spec.target_kind == "acoustic-wizard":
-        return False  # Rotor37 不是声学行
-    return True
+HOH_RESCUE_KEYS = (
+    "blade/b2b.hoh.boundary_layer_cell_width",
+    "blade/b2b.hoh.boundary_layer_factor",
+    "blade/b2b.hoh.boundary_layer_points",
+    "blade/b2b.hoh.around_boundary_layer_points",
+    "row/flow_path.number",
+)
 
 
 def _timestamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-# ============================================================================
-# 测试值生成
-# ============================================================================
-
-def generate_test_values(spec: ControlSpec) -> list[Any]:
-    """为单个控制参数生成 OFAT 测试值列表。
-
-    规则（PLAN.md）：
-    - 点数类 int（minimum≥2）：取 ~0.75× 和 ~1.25× 合理默认值
-    - 长度/比例 float：取基线两侧安全值
-    - 枚举：所有非默认值
-    - 布尔：测试 true（非默认）
-    """
-    if spec.value_type == "bool":
-        return [True]
-
-    if spec.value_type == "enum":
-        return list(spec.enum_values)
-
-    if spec.value_type == "int":
-        lo = spec.minimum if spec.minimum is not None else 2
-        hi = spec.maximum if spec.maximum is not None else 10001
-        # 窄范围 [0,1] 或 [0,2]：直接取边界值
-        if hi <= 2:
-            return [lo, hi]
-        if "target_points" in spec.key:
-            # user 模式目标点数——需要较大值。取 ~250k 和 ~500k。
-            v1 = max(lo, 250000)
-            v2 = min(hi, max(v1 * 2, 500000))
-            return [v1, v2]
-        # 点数/索引类：两次不同值，确保不低于下限
-        if "points" in spec.key or "index" in spec.key:
-            v1 = max(lo, 17)
-            v2 = max(v1 + 1, min(hi, 33))
-            return [v1, v2]
-        if "steps" in spec.key:
-            return [max(lo, 50), min(hi, 200)]
-        if "level" in spec.key:
-            return [1, 4]
-        # 通用 int：取两个在合法范围内且互异的测试值
-        v1 = max(lo, 5)
-        v2 = min(hi, max(v1 * 5, v1 + 4))
-        if v2 <= v1:
-            v2 = min(hi, v1 + 1)
-        return [v1, v2]
-
-    if spec.value_type == "float":
-        lo = spec.minimum if spec.minimum is not None else 0.0
-        hi = spec.maximum if spec.maximum is not None else float("inf")
-        if spec.si_length:
-            return [max(lo, 1e-6), min(hi, 1e-4)]
-        if "relaxation" in spec.key or "clustering" in spec.key:
-            return [max(lo, 0.2), min(hi, 0.8)]
-        if "expansion" in spec.key or "ratio" in spec.key:
-            return [max(lo, 1.5), min(hi, 3.0)]
-        if "weight" in spec.key or "orthogonality" in spec.key:
-            return [max(lo, 0.3), min(hi, 0.7)]
-        return [max(lo, 0.3), min(hi, 0.7)]
-
-    return []
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-# ============================================================================
-# 案例定义
-# ============================================================================
-
-def _blade_selector(row: int = 1, blade: int = 1) -> str:
-    """返回标准 blade 选择器。"""
-    return f"row:#{row}/blade:#{blade}"
-
-
-def build_baseline_cases(campaign_dir: Path) -> list[dict[str, Any]]:
-    """生成 3 拓扑 × 4 重复 = 12 个基线案例。"""
-    cases: list[dict[str, Any]] = []
-    for topo in TOPOLOGY_VALUES:
-        for run_idx in range(1, BASELINE_REPEATS + 1):
-            out_dir = campaign_dir / "baselines" / topo / f"A{run_idx:02d}"
-            cases.append({
-                "case_id": f"baseline/{topo}/A{run_idx:02d}",
-                "category": "baseline",
-                "topology": topo,
-                "set_args": [f"{_blade_selector()}/b2b.topology={topo}"],
-                "variable_key": None,
-                "variable_value": None,
-                "out_dir": str(out_dir),
-                "run_index": run_idx,
-            })
-    return cases
+def _source_signature() -> str:
+    payload = [
+        (str(path.relative_to(PROJECT_ROOT)), _sha256_file(path))
+        for path in SOURCE_FILES
+        if path.exists()
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
 
-def build_topology_switch_cases(campaign_dir: Path) -> list[dict[str, Any]]:
-    """生成拓扑切换验证案例。"""
-    cases: list[dict[str, Any]] = []
-    for topo in TOPOLOGY_VALUES:
-        out_dir = campaign_dir / "topology" / topo
-        cases.append({
-            "case_id": f"topology/{topo}",
-            "category": "topology_switch",
-            "topology": topo,
-            "set_args": [f"{_blade_selector()}/b2b.topology={topo}"],
-            "variable_key": "blade/b2b.topology",
-            "variable_value": topo,
-            "out_dir": str(out_dir),
-        })
-    return cases
-
-
-def build_ofat_cases(campaign_dir: Path) -> list[dict[str, Any]]:
-    """为所有待测控制参数生成 OFAT 案例。
-
-    按 PLAN.md 参数分层：
-    - COMMON_CORE：拓扑无关，使用 default 拓扑作为固定上下文
-    - TOPOLOGY_DEFAULT/HOH/HI：在对应拓扑下测试
-    """
-    cases: list[dict[str, Any]] = []
-
-    # 通用核心控制（固定 default 拓扑上下文）
-    for key in sorted(COMMON_CORE_KEYS):
-        spec = CONTROL_REGISTRY[key]
-        if not _is_rotor37_applicable(key, spec):
-            continue
-        if spec.scope in ("configuration",):
-            _add_cases_for_key(cases, campaign_dir, key, spec, "core", None, "")
-        elif spec.target_kind == "wizard":
-            # wizard 控制需要 row:#1/wizard 路径
-            _add_cases_for_key(cases, campaign_dir, key, spec, "core", None, f"row:#1/wizard")
-        elif spec.target_kind in ("row", "acoustic-wizard"):
-            _add_cases_for_key(cases, campaign_dir, key, spec, "core", None, f"row:#1")
-        elif spec.target_kind == "blade":
-            _add_cases_for_key(cases, campaign_dir, key, spec, "core", "default", _blade_selector())
-        elif spec.target_kind in ("gap",):
-            # gap 拓扑上下文作用于 blade，参数作用于 gap
-            _add_cases_for_key(cases, campaign_dir, key, spec, "core", "default",
-                               f"{_blade_selector()}/gap:shroud",
-                               topo_entity_path=_blade_selector())
-        elif spec.target_kind == "interface":
-            _add_cases_for_key(cases, campaign_dir, key, spec, "core", None,
-                               f"row:#1/interface:inlet")
-        elif spec.target_kind == "stagnation-point":
-            # stagnation-point 拓扑上下文作用于 blade，参数作用于 stagnation-point
-            _add_cases_for_key(cases, campaign_dir, key, spec, "core", "default",
-                               f"{_blade_selector()}/stagnation-point:leading",
-                               topo_entity_path=_blade_selector())
-
-    # 拓扑选择器
-    for key in sorted(COMMON_TOPOLOGY_KEYS):
-        spec = CONTROL_REGISTRY[key]
-        for topo in TOPOLOGY_VALUES:
-            _add_cases_for_key(cases, campaign_dir, key, spec, "topology", None, _blade_selector(),
-                               override_values=[topo])
-
-    # 条件族：Default / HOH / H&I
-    for topo, keyset in TOPOLOGY_KEYS_MAP.items():
-        for key in sorted(keyset):
-            spec = CONTROL_REGISTRY[key]
-            if not _is_rotor37_applicable(key, spec):
-                continue
-            if spec.target_kind == "blade":
-                _add_cases_for_key(cases, campaign_dir, key, spec, topo, topo, _blade_selector())
-            elif spec.target_kind == "gap":
-                _add_cases_for_key(cases, campaign_dir, key, spec, topo, topo,
-                                   f"{_blade_selector()}/gap:shroud",
-                                   topo_entity_path=_blade_selector())
-
-    return cases
-
-
-def _add_cases_for_key(
-    cases: list[dict[str, Any]],
-    campaign_dir: Path,
-    key: str,
-    spec: ControlSpec,
-    category: str,
-    topology: str | None,
-    entity_path: str,
-    *,
-    topo_entity_path: str | None = None,
-    override_values: list[Any] | None = None,
-) -> None:
-    """为一个控制键生成 OFAT 测试案例。
-
-    Args:
-        topology: 固定拓扑值（None=不注入拓扑上下文）
-        entity_path: 参数 --set 的实体路径
-        topo_entity_path: 拓扑 --set 的实体路径（默认与 entity_path 相同；
-                          对 gap/stagnation-point 应为 blade 路径）
-    """
-    values = override_values if override_values is not None else generate_test_values(spec)
-    if topo_entity_path is None:
-        topo_entity_path = entity_path
-
-    for value in values:
-        value_str = _format_value(value)
-        safe_key = key.replace("/", "_").replace(".", "_")
-        safe_val = str(value).replace("/", "_").replace(".", "_").replace(" ", "")
-        case_dir = campaign_dir / "cases" / category / safe_key / f"value_{safe_val}"
-
-        set_args: list[str] = []
-        # 固定拓扑上下文（作用于 blade 路径）
-        if topology and topo_entity_path:
-            set_args.append(f"{topo_entity_path}/b2b.topology={topology}")
-        # 被测参数（作用于实体路径）
-        if entity_path:
-            set_args.append(f"{entity_path}/{key.split('/', 1)[1]}={value_str}")
-        else:
-            set_args.append(f"{key}={value_str}")
-
-        cases.append({
-            "case_id": f"cases/{category}/{safe_key}/value_{safe_val}",
-            "category": f"conditional_{topology}" if topology else category,
-            "topology": topology,
-            "set_args": set_args,
-            "variable_key": key,
-            "variable_value": value,
-            "value_type": spec.value_type,
-            "out_dir": str(case_dir),
-            "si_length": spec.si_length,
-            "stage": spec.stage,
-        })
+def _safe_name(value: Any, *, limit: int = 96) -> str:
+    text = str(value)
+    text = re.sub(r"[^0-9A-Za-z_-]+", "_", text).strip("_")
+    if not text:
+        text = "empty"
+    if len(text) <= limit:
+        return text
+    suffix = hashlib.sha256(text.encode("utf-8")).hexdigest()[:10]
+    return f"{text[: limit - 11]}_{suffix}"
 
 
 def _format_value(value: Any) -> str:
-    """将 Python 值格式化为 CLI 参数字符串。"""
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, (tuple, list)):
+        return ",".join(_format_value(item) for item in value)
     if isinstance(value, float):
-        return f"{value:.6g}"
+        return format(value, ".12g")
     return str(value)
 
 
-# ============================================================================
-# 执行引擎
-# ============================================================================
+def _write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, default=str),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
 
-def run_single_case(
+
+def _load_json(path: Path, default: Any = None) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return default
+
+
+def _write_csv(path: Path, rows: Iterable[dict[str, Any]], fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _control_group(key: str) -> str:
+    if key in GENERAL_CORE_KEYS:
+        return "GENERAL_CORE"
+    if key in GENERAL_TOPOLOGY_KEYS:
+        return "GENERAL_TOPOLOGY"
+    if key in GENERAL_DEFAULT_KEYS:
+        return "GENERAL_DEFAULT"
+    if key in GENERAL_HOH_KEYS:
+        return "GENERAL_HOH"
+    if key in GENERAL_HI_KEYS:
+        return "GENERAL_HI"
+    return "EXCLUDED"
+
+
+def _registered_setter_names() -> set[tuple[str, str]]:
+    return set(MAPPED_SETTERS_BY_OWNER)
+
+
+def build_extended_api_audit() -> list[dict[str, Any]]:
+    """审计 set/enable/disable/unset/compute/generate 与非标准赋值方法。"""
+
+    if not AUTOGRID_171.exists():
+        return []
+    setter_audit = {
+        str(item["setter"]): item for item in audit_autogrid_source(AUTOGRID_171)
+    }
+    mapped = _registered_setter_names()
+    lines = AUTOGRID_171.read_text(encoding="latin1").splitlines()
+    owner = ""
+    results: list[dict[str, Any]] = []
+    for line_number, line in enumerate(lines, start=1):
+        class_match = re.match(r"class\s+(\w+)", line)
+        if class_match:
+            owner = class_match.group(1)
+        method_match = re.match(r"(\s*)def\s+(\w+)\s*\(([^)]*)\)", line)
+        if not method_match:
+            continue
+        if not method_match.group(1):
+            owner = ""
+        method = method_match.group(2)
+        signature = method_match.group(3)
+        lower = method.lower()
+        kind = None
+        for prefix in ("a5_set_", "set_", "enable_", "disable_", "unset_", "compute_", "generate"):
+            if lower.startswith(prefix):
+                kind = prefix.rstrip("_")
+                break
+        if method == "desired_expansion_ratio":
+            kind = "nonstandard_setter"
+        if kind is None:
+            continue
+
+        qualified = f"{owner}.{method}" if owner else method
+        audit_item = setter_audit.get(qualified) or setter_audit.get(method)
+        if (owner, method) in mapped or ("", method) in mapped:
+            classification = "mapped"
+            reason = "已映射到注册控制"
+        elif audit_item is not None:
+            classification = str(audit_item["status"])
+            reason = str(audit_item.get("reason") or "")
+        elif qualified in GENERAL_API_ONLY_EXCLUSIONS:
+            classification = "excluded"
+            reason = GENERAL_API_ONLY_EXCLUSIONS[qualified]
+        elif lower.startswith(("compute_", "generate")):
+            classification = "activation"
+            reason = "计算/生成激活动作，不是独立持久控制值"
+        elif lower.startswith("unset_"):
+            classification = "excluded"
+            reason = "旧式清除/恢复接口；规范控制通过显式值表达"
+        elif owner in {
+            "Gap",
+            "PartialGap",
+            "Fillet",
+            "HolesLine",
+            "EndWallHolesLine",
+            "BasinHole",
+            "PinFinsLine",
+            "EndWall",
+            "TechnologicalEffectZR",
+            "TechnologicalEffect3D",
+            "WizardLETE",
+        }:
+            classification = "excluded"
+            reason = "依赖特定几何或既有技术效果实体"
+        elif "low_memory" in lower:
+            classification = "excluded"
+            reason = "运行资源策略，不应改变最终网格"
+        elif "full_mesh" in lower or "acoustic" in lower:
+            classification = "excluded"
+            reason = "物理计算域/声学配置，不属于通用网格控制"
+        else:
+            classification = "excluded"
+            reason = "别名、实体状态或非持久网格控制"
+        results.append(
+            {
+                "owner": owner or "<module>",
+                "method": method,
+                "qualified_method": qualified,
+                "signature": signature,
+                "kind": kind,
+                "classification": classification,
+                "reason": reason,
+                "source_line": line_number,
+            }
+        )
+    return results
+
+
+def write_inventory(campaign_dir: Path) -> dict[str, Any]:
+    """输出注册表、策展分组、API 审计和环境指纹。"""
+
+    inventory_dir = campaign_dir / "inventory"
+    inventory_dir.mkdir(parents=True, exist_ok=True)
+
+    control_rows: list[dict[str, Any]] = []
+    for key, spec in sorted(CONTROL_REGISTRY.items()):
+        prerequisites = CONTROL_PREREQUISITES.get(key, ())
+        control_rows.append(
+            {
+                "key": key,
+                "description": spec.description,
+                "scope": spec.scope,
+                "target_kind": spec.target_kind,
+                "value_type": spec.value_type,
+                "enum_values": "|".join(spec.enum_values),
+                "minimum": spec.minimum,
+                "maximum": spec.maximum,
+                "si_length": spec.si_length,
+                "stage": spec.stage,
+                "priority": spec.priority,
+                "setter": spec.setter or "|".join(method for _, method in spec.setter_by_value),
+                "getter": spec.getter,
+                "topologies": "|".join(spec.topologies),
+                "general_group": _control_group(key),
+                "general_candidate": key in GENERAL_CONTROL_KEYS,
+                "exclusion_reason": GENERAL_CONTROL_EXCLUSIONS.get(key, ""),
+                "prerequisites": json.dumps(prerequisites, ensure_ascii=False),
+                "dependency_depth": CONTROL_DEPENDENCY_DEPTH.get(key, 0),
+            }
+        )
+    _write_csv(
+        inventory_dir / "supported_controls.csv",
+        control_rows,
+        list(control_rows[0]),
+    )
+    _write_json(inventory_dir / "supported_controls.json", control_rows)
+
+    setter_audit = (
+        audit_autogrid_source(AUTOGRID_171) if AUTOGRID_171.exists() else []
+    )
+    binding_audit = (
+        audit_control_bindings(AUTOGRID_171) if AUTOGRID_171.exists() else []
+    )
+    extended_audit = build_extended_api_audit()
+    if setter_audit:
+        _write_csv(
+            inventory_dir / "setter_audit.csv",
+            setter_audit,
+            ["setter", "status", "control_keys", "reason"],
+        )
+    if binding_audit:
+        _write_csv(
+            inventory_dir / "binding_audit.csv",
+            binding_audit,
+            [
+                "control_key",
+                "role",
+                "method",
+                "expected_owners",
+                "available_owners",
+                "status",
+            ],
+        )
+    if extended_audit:
+        _write_csv(
+            inventory_dir / "extended_api_audit.csv",
+            extended_audit,
+            list(extended_audit[0]),
+        )
+
+    selection_counts = Counter(_control_group(key) for key in CONTROL_REGISTRY)
+    source_hashes = {
+        str(path): _sha256_file(path)
+        for path in (*SOURCE_FILES, AUTOGRID_171, IGG_PYTHON_171)
+        if path.exists()
+    }
+    summary = {
+        "registered_controls": len(CONTROL_REGISTRY),
+        "general_controls": len(GENERAL_CONTROL_KEYS),
+        "excluded_controls": len(GENERAL_CONTROL_EXCLUSIONS),
+        "selection_counts": dict(sorted(selection_counts.items())),
+        "setter_audit": Counter(item["status"] for item in setter_audit),
+        "binding_audit": Counter(item["status"] for item in binding_audit),
+        "extended_api_audit": Counter(item["classification"] for item in extended_audit),
+        "source_hashes": source_hashes,
+        "python": sys.version,
+        "platform": sys.platform,
+        "source_signature": _source_signature(),
+    }
+    summary = json.loads(json.dumps(summary, default=dict))
+    _write_json(inventory_dir / "inventory_summary.json", summary)
+
+    lines = [
+        "# Rotor37 通用网格控制参数清单",
+        "",
+        f"- 注册控制：{len(CONTROL_REGISTRY)}",
+        f"- 通用候选：{len(GENERAL_CONTROL_KEYS)}",
+        f"- 明确排除：{len(GENERAL_CONTROL_EXCLUSIONS)}",
+        f"- setter 审计：{dict(Counter(item['status'] for item in setter_audit))}",
+        f"- binding 审计：{dict(Counter(item['status'] for item in binding_audit))}",
+        "",
+        "| 分组 | 数量 |",
+        "|---|---:|",
+    ]
+    for group, count in sorted(selection_counts.items()):
+        lines.append(f"| {group} | {count} |")
+    (inventory_dir / "README.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return summary
+
+
+VALUE_OVERRIDES: dict[str, list[Any]] = {
+    "configuration/grid_levels": [3, 4],
+    "configuration/support_curve_control_points": [101, 201],
+    "wizard/first_cell_width": [1.0e-6, 5.0e-6],
+    "wizard/spanwise_paths": [65, 97],
+    "row/flow_path.number": [65, 97],
+    "row/target_points": [500000, 1000000],
+    "row/streamwise_weight": [(0.75, 1.0, 1.0), (1.25, 1.0, 1.0)],
+    "blade/b2b.default.blade_reference_angle": [-5.0, 5.0],
+    "blade/b2b.default.inlet_angle": [-5.0, 5.0],
+    "blade/b2b.default.outlet_angle": [-5.0, 5.0],
+    "blade/b2b.default.throat_points": [0, 9],
+    "blade/b2b.default.throat_projection_type": [0, 1],
+    "blade/b2b.hoh.boundary_layer_factor": [1.1, 1.4],
+    "blade/b2b.hoh.leading_edge_cell_length": [1.0e-5, 5.0e-5],
+    "blade/b2b.hoh.trailing_edge_cell_length": [1, 5],
+    "stagnation-point/desired_expansion_ratio": [1.1, 1.5],
+}
+
+
+def generate_test_values(spec: ControlSpec) -> list[Any]:
+    """为候选控制生成至少两个安全且明显不同的值。"""
+
+    if spec.key in VALUE_OVERRIDES:
+        return list(VALUE_OVERRIDES[spec.key])
+    if spec.value_type == "bool":
+        return [False, True]
+    if spec.value_type == "enum":
+        values = list(spec.enum_values)
+        if spec.key == TOPOLOGY_SELECTOR_KEY:
+            values = [value for value in values if value != "user"]
+        return values
+    if spec.value_type in {"tuple_int", "tuple_float"}:
+        if spec.value_type == "tuple_int":
+            return [(1, 2, 3), (3, 2, 1)]
+        return [(0.75, 1.0, 1.0), (1.25, 1.0, 1.0)]
+
+    minimum = spec.minimum
+    maximum = spec.maximum
+    if spec.value_type == "int":
+        lo = int(minimum if minimum is not None else 0)
+        hi = int(maximum if maximum is not None else 100000)
+        if "grid_levels" in spec.key:
+            return [max(lo, 3), min(hi, 4)]
+        if "target_points" in spec.key:
+            return [max(lo, 500000), min(hi, 1000000)]
+        if "index" in spec.key:
+            return [max(lo, 0), min(hi, 9)]
+        if "points" in spec.key or "npts" in spec.key:
+            return [max(lo, 17), min(hi, 33)]
+        if "control_points" in spec.key:
+            return [max(lo, 17), min(hi, 33)]
+        if "steps" in spec.key:
+            return [max(lo, 0), min(hi, 200)]
+        if hi <= 1:
+            return [lo, hi]
+        if hi <= 10:
+            return [lo, min(hi, max(lo + 1, 1))]
+        return [max(lo, 5), min(hi, max(lo + 4, 9))]
+
+    lo_float = float(minimum if minimum is not None else 0.0)
+    hi_float = float(maximum) if maximum is not None else None
+    if spec.si_length:
+        if "boundary_layer_width" in spec.key:
+            values = [5.0e-5, 2.0e-4]
+        elif "absolute_distance" in spec.key:
+            values = [1.0e-4, 5.0e-4]
+        else:
+            values = [1.0e-6, 5.0e-6]
+    elif minimum is not None and minimum >= 1.0:
+        values = [max(lo_float, 1.1), max(lo_float, 1.5)]
+    elif maximum is not None and maximum <= 1.0:
+        values = [max(lo_float, 0.25), min(float(maximum), 0.75)]
+    elif maximum is not None and maximum <= 100.0 and "percent" in spec.key:
+        values = [max(lo_float, 20.0), min(float(maximum), 60.0)]
+    elif minimum is not None and minimum < 0:
+        values = [max(lo_float, -5.0), min(hi_float or 5.0, 5.0)]
+    elif "expansion" in spec.key or spec.key.endswith("_ratio"):
+        values = [max(lo_float, 1.1), 1.5]
+    elif "clustering" in spec.key or "relaxation" in spec.key or "weight" in spec.key:
+        values = [max(lo_float, 0.25), 0.75]
+    else:
+        values = [max(lo_float, 0.25), 0.75]
+    if hi_float is not None:
+        values = [min(hi_float, value) for value in values]
+    if values[0] == values[1]:
+        candidate = values[0] + max(abs(values[0]) * 0.5, 0.1)
+        values[1] = min(hi_float, candidate) if hi_float is not None else candidate
+    return values
+
+
+def _assignment_for_key(key: str, value: Any, *, target: str | None = None) -> str:
+    spec = CONTROL_REGISTRY[key]
+    local_key = key.split("/", 1)[1]
+    if target is None:
+        if spec.scope == "configuration":
+            target = "configuration"
+        elif spec.target_kind == "wizard":
+            target = "row:#1/wizard"
+        elif spec.target_kind == "row":
+            target = "row:#1"
+        elif spec.target_kind == "blade":
+            target = "row:#1/blade:#1"
+        elif spec.target_kind == "interface":
+            target = "row:#1/interface:inlet"
+        elif spec.target_kind == "stagnation-point":
+            target = "row:#1/blade:#1/stagnation-point:leading"
+        else:
+            raise ValueError(f"通用 campaign 不支持目标类型：{spec.target_kind}")
+    return f"{target}/{local_key}={_format_value(value)}"
+
+
+def _topology_for_key(key: str) -> str | None:
+    if key in GENERAL_DEFAULT_KEYS:
+        return "default"
+    if key in GENERAL_HOH_KEYS:
+        return "hoh"
+    if key in GENERAL_HI_KEYS:
+        return "hi"
+    if key in GENERAL_CORE_KEYS:
+        return "default"
+    return None
+
+
+def _add_dependency(
+    dependencies: dict[str, Any],
+    key: str,
+    value: Any,
+    *,
+    variable_key: str,
+    trail: tuple[str, ...] = (),
+) -> None:
+    if key == variable_key:
+        return
+    if key in trail:
+        raise RuntimeError("campaign 前置条件存在循环：" + " -> ".join(trail + (key,)))
+    for prerequisite_key, prerequisite_value in CONTROL_PREREQUISITES.get(key, ()):
+        _add_dependency(
+            dependencies,
+            prerequisite_key,
+            prerequisite_value,
+            variable_key=variable_key,
+            trail=trail + (key,),
+        )
+    if key in dependencies and dependencies[key] != value:
+        previous = dependencies[key]
+        raise RuntimeError(f"前置条件冲突：{key} 同时要求 {previous!r} 和 {value!r}")
+    dependencies[key] = value
+
+
+def build_dependency_controls(key: str, value: Any) -> list[tuple[str, Any]]:
+    """建立同一案例的完整显式依赖，不把依赖静默注入普通 CLI。"""
+
+    dependencies: dict[str, Any] = {}
+    topology = _topology_for_key(key)
+    if topology is not None and key != TOPOLOGY_SELECTOR_KEY:
+        dependencies[TOPOLOGY_SELECTOR_KEY] = topology
+    if key in GENERAL_EDGE_TREATMENT_KEYS:
+        dependencies["blade/b2b.default.type"] = "streamwise"
+    for prerequisite_key, prerequisite_value in CONTROL_PREREQUISITES.get(key, ()):
+        _add_dependency(
+            dependencies,
+            prerequisite_key,
+            prerequisite_value,
+            variable_key=key,
+        )
+
+    # 值相关的可设置前置条件。
+    if key == "wizard/grid_level" and value == "user":
+        _add_dependency(
+            dependencies,
+            "row/target_points",
+            750000,
+            variable_key=key,
+        )
+
+    ordered = sorted(
+        dependencies.items(),
+        key=lambda item: (
+            STAGE_ORDER[CONTROL_REGISTRY[item[0]].stage],
+            0 if item[0] == TOPOLOGY_SELECTOR_KEY else 1,
+            CONTROL_DEPENDENCY_DEPTH.get(item[0], 0),
+            item[0],
+        ),
+    )
+    return ordered
+
+
+def force_topology_dependency(
+    dependencies: Iterable[tuple[str, Any]],
+    topology: str,
+) -> list[tuple[str, Any]]:
+    """在拓扑救援等跨族上下文中显式覆盖控制自身的默认拓扑。"""
+
+    forced = [
+        (key, value)
+        for key, value in dependencies
+        if key != TOPOLOGY_SELECTOR_KEY
+    ]
+    forced.append((TOPOLOGY_SELECTOR_KEY, topology))
+    return sorted(
+        forced,
+        key=lambda item: (
+            STAGE_ORDER[CONTROL_REGISTRY[item[0]].stage],
+            0 if item[0] == TOPOLOGY_SELECTOR_KEY else 1,
+            CONTROL_DEPENDENCY_DEPTH.get(item[0], 0),
+            item[0],
+        ),
+    )
+
+
+def _context_id(dependencies: Iterable[tuple[str, Any]]) -> str:
+    normalized = json.dumps(list(dependencies), ensure_ascii=True, sort_keys=True)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _case_signature(case: dict[str, Any]) -> str:
+    payload = {
+        "case_id": case["case_id"],
+        "set_args": case.get("set_args", []),
+        "source_signature": _source_signature(),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def make_case(
+    campaign_dir: Path,
+    *,
+    phase: str,
+    category: str,
+    variable_key: str | None,
+    variable_value: Any,
+    dependencies: list[tuple[str, Any]],
+    topology: str | None,
+    target: str | None = None,
+    case_suffix: str | None = None,
+    subroot: str = "cases",
+) -> dict[str, Any]:
+    dependency_assignments = [
+        _assignment_for_key(dep_key, dep_value)
+        for dep_key, dep_value in dependencies
+    ]
+    set_args = list(dependency_assignments)
+    if variable_key is not None:
+        set_args.append(_assignment_for_key(variable_key, variable_value, target=target))
+    key_name = _safe_name(variable_key or category)
+    value_name = _safe_name(
+        case_suffix if case_suffix is not None else _format_value(variable_value)
+    )
+    out_dir = campaign_dir / subroot / category / key_name / f"value_{value_name}"
+    context_id = _context_id(dependencies)
+    case_id = f"{phase}/{category}/{key_name}/value_{value_name}"
+    case = {
+        "case_id": case_id,
+        "phase": phase,
+        "category": category,
+        "topology": topology,
+        "variable_key": variable_key,
+        "variable_value": variable_value,
+        "dependency_controls": [
+            {"key": dep_key, "value": dep_value} for dep_key, dep_value in dependencies
+        ],
+        "context_id": context_id,
+        "set_args": set_args,
+        "out_dir": str(out_dir),
+    }
+    case["signature"] = _case_signature(case)
+    return case
+
+
+def build_baseline_cases(campaign_dir: Path) -> list[dict[str, Any]]:
+    cases: list[dict[str, Any]] = []
+    for topology in TOPOLOGY_VALUES:
+        dependencies = [(TOPOLOGY_SELECTOR_KEY, topology)]
+        for repeat in range(1, BASELINE_REPEATS + 1):
+            cases.append(
+                make_case(
+                    campaign_dir,
+                    phase="baseline",
+                    category=topology,
+                    variable_key=None,
+                    variable_value=None,
+                    dependencies=dependencies,
+                    topology=topology,
+                    case_suffix=f"A{repeat:02d}",
+                    subroot="baselines",
+                )
+            )
+    return cases
+
+
+def build_pilot_cases(campaign_dir: Path) -> list[dict[str, Any]]:
+    cases: list[dict[str, Any]] = []
+    for repeat in (1, 2):
+        cases.append(
+            make_case(
+                campaign_dir,
+                phase="pilot",
+                category="default_aa",
+                variable_key=None,
+                variable_value=None,
+                dependencies=[(TOPOLOGY_SELECTOR_KEY, "default")],
+                topology="default",
+                case_suffix=f"A{repeat:02d}",
+                subroot="pilot",
+            )
+        )
+    for value in (65, 97):
+        dependencies = build_dependency_controls("wizard/spanwise_paths", value)
+        cases.append(
+            make_case(
+                campaign_dir,
+                phase="pilot",
+                category="known_effect",
+                variable_key="wizard/spanwise_paths",
+                variable_value=value,
+                dependencies=dependencies,
+                topology="default",
+                subroot="pilot",
+            )
+        )
+    for topology in ("default", "hi"):
+        cases.append(
+            make_case(
+                campaign_dir,
+                phase="pilot",
+                category="topology_switch",
+                variable_key=TOPOLOGY_SELECTOR_KEY,
+                variable_value=topology,
+                dependencies=[],
+                topology=topology,
+                subroot="pilot",
+            )
+        )
+    for value in (False, True):
+        cases.append(
+            make_case(
+                campaign_dir,
+                phase="pilot",
+                category="negative_control",
+                variable_key="row/low_memory_usage",
+                variable_value=value,
+                dependencies=[(TOPOLOGY_SELECTOR_KEY, "default")],
+                topology="default",
+                subroot="pilot",
+            )
+        )
+    return cases
+
+
+def build_control_cases(
+    campaign_dir: Path,
+    *,
+    hoh_anchor: list[tuple[str, Any]] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    cases: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for key in sorted(GENERAL_CONTROL_KEYS):
+        if key in GENERAL_HOH_KEYS and hoh_anchor is None:
+            blocked.append(
+                {
+                    "case_id": f"cases/blocked/{_safe_name(key)}",
+                    "phase": "cases",
+                    "category": "GENERAL_HOH",
+                    "topology": "hoh",
+                    "variable_key": key,
+                    "variable_value": None,
+                    "dependency_controls": [],
+                    "context_id": "blocked_hoh",
+                    "set_args": [],
+                    "out_dir": "",
+                    "signature": "",
+                    "status": "blocked",
+                    "error": "BLOCKED_TOPOLOGY_BASELINE",
+                    "run_summary": None,
+                }
+            )
+            continue
+        spec = CONTROL_REGISTRY[key]
+        topology = _topology_for_key(key)
+        for value in generate_test_values(spec):
+            dependencies = build_dependency_controls(key, value)
+            if key in GENERAL_HOH_KEYS and hoh_anchor:
+                existing = dict(dependencies)
+                for anchor_key, anchor_value in hoh_anchor:
+                    if anchor_key != key and anchor_key not in existing:
+                        dependencies.append((anchor_key, anchor_value))
+                dependencies = sorted(
+                    dependencies,
+                    key=lambda item: (
+                        STAGE_ORDER[CONTROL_REGISTRY[item[0]].stage],
+                        CONTROL_DEPENDENCY_DEPTH.get(item[0], 0),
+                        item[0],
+                    ),
+                )
+            cases.append(
+                make_case(
+                    campaign_dir,
+                    phase="cases",
+                    category=_control_group(key),
+                    variable_key=key,
+                    variable_value=value,
+                    dependencies=dependencies,
+                    topology=topology if key != TOPOLOGY_SELECTOR_KEY else str(value),
+                )
+            )
+
+    # 目标解析 smoke：不重复全族，仅用代表值验证 outlet/trailing accessor。
+    smoke_specs = (
+        (
+            "interface/streamwise_cell_width",
+            generate_test_values(CONTROL_REGISTRY["interface/streamwise_cell_width"])[0],
+            "row:#1/interface:outlet",
+            "outlet_interface",
+        ),
+        (
+            "stagnation-point/constant_cells_percent",
+            generate_test_values(CONTROL_REGISTRY["stagnation-point/constant_cells_percent"])[0],
+            "row:#1/blade:#1/stagnation-point:trailing",
+            "trailing_stagnation",
+        ),
+    )
+    for key, value, target, suffix in smoke_specs:
+        cases.append(
+            make_case(
+                campaign_dir,
+                phase="cases",
+                category="TARGET_SMOKE",
+                variable_key=key,
+                variable_value=value,
+                dependencies=build_dependency_controls(key, value),
+                topology="default",
+                target=target,
+                case_suffix=suffix,
+            )
+        )
+    return cases, blocked
+
+
+def build_context_baselines(
+    campaign_dir: Path,
+    cases: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    unique: dict[str, list[tuple[str, Any]]] = {}
+    topology_by_context: dict[str, str | None] = {}
+    for case in cases:
+        dependencies = [
+            (item["key"], item["value"])
+            for item in case.get("dependency_controls", [])
+        ]
+        context_id = case["context_id"]
+        unique.setdefault(context_id, dependencies)
+        topology_by_context.setdefault(context_id, case.get("topology"))
+    baselines: list[dict[str, Any]] = []
+    for context_id, dependencies in sorted(unique.items()):
+        baselines.append(
+            make_case(
+                campaign_dir,
+                phase="context_baseline",
+                category="context",
+                variable_key=None,
+                variable_value=None,
+                dependencies=dependencies,
+                topology=topology_by_context[context_id],
+                case_suffix=context_id,
+                subroot="context_baselines",
+            )
+        )
+    return baselines
+
+
+def _mesh_command(
     case: dict[str, Any],
     *,
-    dry_run: bool = False,
-    igg_exe: str | None = None,
-) -> dict[str, Any]:
-    """执行单个 mesh.py 调用并收集结果。"""
-    out_dir = Path(case["out_dir"])
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    cmd = [
-        sys.executable, "-B", str(MESH_PY),
+    timeout_seconds: int,
+    igg_executable: str | None,
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-B",
+        str(MESH_PY),
         str(GEOMETRY_PATH),
-        "--out", str(out_dir),
-        "--timeout", str(TIMEOUT_SECONDS),
+        "--out",
+        case["out_dir"],
+        "--timeout",
+        str(timeout_seconds),
+        "--mesh-fingerprint",
     ]
-    if igg_exe:
-        cmd.extend(["--igg", igg_exe])
-    for arg in case["set_args"]:
-        cmd.extend(["--set", arg])
+    if igg_executable:
+        command.extend(["--igg", igg_executable])
+    for assignment in case.get("set_args", []):
+        command.extend(["--set", assignment])
+    return command
 
-    if dry_run:
-        cmd.append("--dry-run")
 
-    result: dict[str, Any] = {
-        "case_id": case["case_id"],
-        "category": case.get("category"),
-        "topology": case.get("topology"),
-        "variable_key": case.get("variable_key"),
-        "variable_value": case.get("variable_value"),
-        "command": " ".join(cmd),
-        "out_dir": str(out_dir),
-        "status": "dry_run" if dry_run else "pending",
-        "returncode": None,
-        "error": None,
-        "run_summary": None,
-        "quality": None,
-        "mesh_outputs": {},
-        "duration_seconds": None,
+def _extract_result_facts(summary: dict[str, Any] | None) -> dict[str, Any]:
+    if not summary:
+        return {
+            "generation_success": False,
+            "structurally_valid": False,
+            "quality_pass": False,
+            "fingerprint": None,
+            "negative_cells": None,
+            "overlapping_status": None,
+            "quality_status": None,
+            "number_of_points": None,
+        }
+    autogrid = summary.get("autogrid", {}) or {}
+    outputs = set((autogrid.get("outputs") or {}).keys())
+    fingerprint = summary.get("mesh_fingerprint") or autogrid.get("mesh_fingerprint")
+    quality = summary.get("quality") or {}
+    metrics = quality.get("metrics", {}) or {}
+    metadata = quality.get("metadata", {}) or {}
+    quality_result = quality.get("result", {}) or {}
+    negative_cells = metrics.get("negative_cells")
+    overlap = metadata.get("overlapping_status")
+    validity = str(metadata.get("mesh_validity") or "").upper()
+    generation_success = (
+        autogrid.get("returncode") == 0
+        and REQUIRED_OUTPUTS.issubset(outputs)
+        and isinstance(fingerprint, dict)
+        and bool(fingerprint.get("comparison_sha256"))
+    )
+    validity_ok = (
+        validity in {"OK", "VALID"}
+        or ("VALID" in validity and "INVALID" not in validity)
+    )
+    structurally_valid = (
+        generation_success
+        and negative_cells == 0
+        and overlap == "NO_OVERLAP"
+        and validity_ok
+    )
+    return {
+        "generation_success": generation_success,
+        "structurally_valid": structurally_valid,
+        "quality_pass": quality_result.get("status") == "PASS",
+        "fingerprint": (fingerprint or {}).get("comparison_sha256"),
+        "coordinate_fingerprint": (fingerprint or {}).get("aggregate_sha256"),
+        "negative_cells": negative_cells,
+        "overlapping_status": overlap,
+        "mesh_validity": metadata.get("mesh_validity"),
+        "quality_status": quality_result.get("status"),
+        "number_of_points": metrics.get("number_of_points"),
+        "grid_levels": metrics.get("grid_levels"),
     }
 
-    if dry_run:
-        try:
-            completed = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=60,
-                cwd=str(PROJECT_ROOT),
-            )
-            result["returncode"] = completed.returncode
-            if completed.returncode == 0:
-                result["status"] = "dry_run_ok"
-            else:
-                result["status"] = "dry_run_failed"
-                result["error"] = completed.stderr[:2000]
-        except Exception as exc:
-            result["status"] = "dry_run_error"
-            result["error"] = f"{type(exc).__name__}: {exc}"
-        return result
 
-    start = time.monotonic()
+def execute_case(
+    case: dict[str, Any],
+    *,
+    timeout_seconds: int,
+    igg_executable: str | None,
+) -> dict[str, Any]:
+    started = time.time()
+    out_dir = Path(case["out_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    command = _mesh_command(
+        case,
+        timeout_seconds=timeout_seconds,
+        igg_executable=igg_executable,
+    )
     try:
         completed = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=TIMEOUT_SECONDS + 60,
-            cwd=str(PROJECT_ROOT),
+            command,
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=False,
+            check=False,
+            timeout=timeout_seconds + 120,
         )
-        result["returncode"] = completed.returncode
-        result["duration_seconds"] = round(time.monotonic() - start, 1)
-
-        # 解析 run_summary.json
-        summary_path = out_dir / "run_summary.json"
-        if summary_path.exists():
-            try:
-                result["run_summary"] = json.loads(summary_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                result["run_summary"] = None
-
-        if result["run_summary"]:
-            result["quality"] = result["run_summary"].get("quality")
-            autogrid = result["run_summary"].get("autogrid", {})
-            result["mesh_outputs"] = autogrid.get("outputs", {})
-
-        # 判定状态
-        if completed.returncode == 0 and result["mesh_outputs"]:
-            result["status"] = "success"
-        elif completed.returncode == 0:
-            result["status"] = "no_output"
-        else:
-            result["status"] = "failed"
-            # 提取错误信息
-            if result["run_summary"]:
-                autogrid = result["run_summary"].get("autogrid", {})
-                result["error"] = autogrid.get("error", "")
-            if not result["error"]:
-                result["error"] = completed.stderr[-2000:] if completed.stderr else f"returncode={completed.returncode}"
-
+        stdout = completed.stdout.decode("utf-8", errors="replace")
+        stderr = completed.stderr.decode("utf-8", errors="replace")
+        returncode = completed.returncode
+        outer_error = None
     except subprocess.TimeoutExpired as exc:
-        result["status"] = "timeout"
-        result["error"] = f"超时（{TIMEOUT_SECONDS}s）"
-        result["duration_seconds"] = round(time.monotonic() - start, 1)
-    except Exception as exc:
-        result["status"] = "error"
-        result["error"] = f"{type(exc).__name__}: {exc}"
-        result["duration_seconds"] = round(time.monotonic() - start, 1)
-
+        stdout = (exc.stdout or b"").decode("utf-8", errors="replace")
+        stderr = (exc.stderr or b"").decode("utf-8", errors="replace")
+        returncode = 1
+        outer_error = f"mesh.py 外层超时（{timeout_seconds + 120} 秒）"
+    except OSError as exc:
+        stdout = ""
+        stderr = f"{type(exc).__name__}: {exc}"
+        returncode = 1
+        outer_error = stderr
+    (out_dir / "runner_stdout.log").write_text(stdout, encoding="utf-8")
+    (out_dir / "runner_stderr.log").write_text(stderr, encoding="utf-8")
+    summary = _load_json(out_dir / "run_summary.json")
+    facts = _extract_result_facts(summary)
+    error = outer_error
+    if error is None and summary:
+        error = (summary.get("autogrid") or {}).get("error")
+    if error is None and returncode != 0:
+        error = stderr.strip().splitlines()[-1] if stderr.strip() else f"返回码 {returncode}"
+    result = {
+        **case,
+        "command": command,
+        "returncode": returncode,
+        "status": "success" if returncode == 0 and facts["generation_success"] else "failed",
+        "error": error,
+        "duration_seconds": round(time.time() - started, 3),
+        "run_summary": summary,
+        **facts,
+    }
+    _write_json(out_dir / "campaign_case_result.json", result)
     return result
+
+
+def _is_infrastructure_failure(result: dict[str, Any]) -> bool:
+    if result.get("status") != "failed":
+        return False
+    text = str(result.get("error") or "").lower()
+    markers = (
+        "license",
+        "许可证",
+        "timeout",
+        "超时",
+        "cannot start",
+        "无法启动",
+        "access is denied",
+        "no mesh outputs",
+    )
+    return any(marker in text for marker in markers)
 
 
 def execute_batch(
     cases: list[dict[str, Any]],
     *,
-    max_workers: int = DEFAULT_MAX_WORKERS,
-    dry_run: bool = False,
-    igg_exe: str | None = None,
-    results_file: Path | None = None,
+    results_file: Path,
+    max_workers: int,
+    timeout_seconds: int,
+    igg_executable: str | None,
+    resume: bool,
+    dry_run: bool,
 ) -> list[dict[str, Any]]:
-    """并发执行案例列表，实时保存结果。"""
-    results: list[dict[str, Any]] = []
-    total = len(cases)
-    completed_count = 0
-    success_count = 0
+    if dry_run:
+        for case in cases:
+            print(subprocess.list2cmdline(_mesh_command(
+                case,
+                timeout_seconds=timeout_seconds,
+                igg_executable=igg_executable,
+            )))
+        return []
 
-    print(f"\n{'[DRY-RUN] ' if dry_run else ''}执行 {total} 个案例，最大并发 {max_workers}")
-    print(f"超时：{TIMEOUT_SECONDS}s/例\n")
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_case = {
-            executor.submit(run_single_case, case, dry_run=dry_run, igg_exe=igg_exe): case
-            for case in cases
-        }
-
-        for future in concurrent.futures.as_completed(future_to_case):
-            case = future_to_case[future]
-            try:
-                result = future.result()
-            except Exception as exc:
-                result = {
-                    "case_id": case["case_id"],
-                    "status": "executor_error",
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            results.append(result)
-            completed_count += 1
-            if result.get("status") == "success":
-                success_count += 1
-
-            duration = result.get("duration_seconds", "?")
-            print(f"[{completed_count:4d}/{total}] {result['status']:16s} "
-                  f"({duration}s) {result['case_id']}")
-
-            # 增量保存
-            if results_file:
-                _save_json(results_file, {
-                    "total": total,
-                    "completed": completed_count,
-                    "success": success_count,
-                    "last_update": _timestamp(),
-                    "results": results,
-                })
-
-    print(f"\n完成：{success_count}/{total} 成功，{total - success_count} 失败/超时")
-    return results
-
-
-# ============================================================================
-# 结果收集与分类
-# ============================================================================
-
-def collect_quality_metrics(run_summary: dict[str, Any] | None) -> dict[str, Any]:
-    """从 run_summary 中提取 .qualityReport 的全部可比对数值指标。
-
-    与旧版相比：不再只取少数 hand-picked 指标，而是抽取 metrics 下的所有
-    标量数值字段（number_of_points / min/max/avg_* 等），确保任意指标的
-    变化都能被检测到。
-    """
-    if not run_summary:
-        return {}
-    quality = run_summary.get("quality", {}) or {}
-    metrics = quality.get("metrics", {}) or {}
-    result_info = quality.get("result", {}) or {}
-
-    collected: dict[str, Any] = {}
-    # 提取 metrics 下所有标量数值（跳过字符串 block 名、嵌套 dict critical_location 等）
-    for field, value in metrics.items():
-        if isinstance(value, (int, float)):
-            collected[field] = value
-
-    # 质量判定与元数据（用于 EFFECT_OK → QUALITY_SENSITIVE 升级）
-    collected["_quality_status"] = result_info.get("status")
-    collected["_quality_accepted"] = result_info.get("accepted")
-
-    return collected
-
-
-def hash_file(path: str | None) -> str | None:
-    """计算文件的 SHA-256 哈希。"""
-    if not path:
-        return None
-    file_path = Path(path)
-    if not file_path.exists():
-        return None
-    try:
-        hasher = hashlib.sha256()
-        with open(file_path, "rb") as fh:
-            for chunk in iter(lambda: fh.read(65536), b""):
-                hasher.update(chunk)
-        return hasher.hexdigest()
-    except OSError:
-        return None
-
-
-def classify_control_result(
-    key: str,
-    case_results: list[dict[str, Any]],
-    baseline_metrics: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
-    """根据 OFAT 测试结果对单个控制参数进行分类。
-
-    分类体系：
-    - EFFECT_OK: 至少一个测试值成功生成网格且产生可检测的网格变化
-    - CALL_ONLY: setter/getter 成功但网格无变化
-    - FAILED_ALL: 所有测试值均失败
-    - NOT_TESTED: 未执行测试
-    """
-    spec = CONTROL_REGISTRY.get(key)
-    successes = [r for r in case_results if r.get("status") == "success"]
-    failures = [r for r in case_results if r.get("status") in ("failed", "timeout", "error")]
-
-    classification = {
-        "key": key,
-        "description": spec.description if spec else "",
-        "value_type": spec.value_type if spec else "",
-        "topologies": list(spec.topologies) if spec else [],
-        "total_tests": len(case_results),
-        "success_count": len(successes),
-        "failure_count": len(failures),
-        "level": "NOT_TESTED",
-        "notes": [],
-    }
-
-    if not case_results:
-        return classification
-
-    if not successes:
-        classification["level"] = "FAILED_ALL"
-        classification["notes"].append(f"全部 {len(failures)} 个测试值均失败")
-        if failures:
-            classification["sample_error"] = failures[0].get("error", "")[:500]
-        return classification
-
-    # 全量指标比对：遍历 .qualityReport 中所有标量数值字段，
-    # 任意一项与基线不同即认为控制产生了可检测效果。
-    has_effect = False
-    quality_changed = False
-    for result in successes:
-        metrics = collect_quality_metrics(result.get("run_summary"))
-        baseline = baseline_metrics.get(result.get("topology", "default"), {})
-
-        for field, value in metrics.items():
-            if field.startswith("_"):
-                continue  # 跳过 _quality_status / _quality_accepted
-            baseline_value = baseline.get(field)
-            if baseline_value is not None and value != baseline_value:
-                has_effect = True
-                # 不再 break——遍历完以便记录所有差异指标数量
-        # 任一成功案例的 quality_status 或 accepted 与基线不同 → 质量敏感性
-        if (metrics.get("_quality_status") != baseline.get("_quality_status")
-                or metrics.get("_quality_accepted") != baseline.get("_quality_accepted")):
-            quality_changed = True
-
-    if has_effect:
-        if quality_changed:
-            classification["level"] = "QUALITY_SENSITIVE"
-        else:
-            classification["level"] = "EFFECT_OK"
-    else:
-        classification["level"] = "CALL_ONLY"
-        classification["notes"].append("全部标量质量指标与基线一致——控制未产生可检测效果")
-
-    return classification
-
-
-def build_final_classification(
-    all_results: list[dict[str, Any]],
-    baseline_metrics: dict[str, dict[str, Any]],
-) -> dict[str, list[dict[str, Any]]]:
-    """构建最终分类报告。"""
-    by_category: dict[str, list[dict[str, Any]]] = {
-        "COMMON_CORE": [],
-        "COMMON_TOPOLOGY": [],
-        "CONDITIONAL_DEFAULT": [],
-        "CONDITIONAL_HOH": [],
-        "CONDITIONAL_HI": [],
-        "SUPPORTED_ADVANCED": [],
-        "REJECTED": [],
-    }
-
-    # 按被测变量键分组
-    by_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for result in all_results:
-        key = result.get("variable_key")
-        if key:
-            by_key[key].append(result)
-
-    for key, case_results in sorted(by_key.items()):
-        classification = classify_control_result(key, case_results, baseline_metrics)
-        spec = CONTROL_REGISTRY.get(key)
-
-        if not spec:
-            by_category["REJECTED"].append(classification)
-        elif key in COMMON_CORE_KEYS:
-            by_category["COMMON_CORE"].append(classification)
-        elif key in COMMON_TOPOLOGY_KEYS:
-            by_category["COMMON_TOPOLOGY"].append(classification)
-        elif key in TOPOLOGY_DEFAULT_KEYS:
-            by_category["CONDITIONAL_DEFAULT"].append(classification)
-        elif key in TOPOLOGY_HOH_KEYS:
-            by_category["CONDITIONAL_HOH"].append(classification)
-        elif key in TOPOLOGY_HI_KEYS:
-            by_category["CONDITIONAL_HI"].append(classification)
-        elif spec.topologies and spec.target_kind in ("gap", "partial-gap", "fillet",
-                                                       "snubber", "blade-sheet",
-                                                       "holes-line", "basin-hole",
-                                                       "pin-fins-line", "endwall",
-                                                       "endwall-holes-line"):
-            by_category["SUPPORTED_ADVANCED"].append(classification)
-        else:
-            by_category["REJECTED"].append(classification)
-
-    return by_category
-
-
-# ============================================================================
-# 报告生成
-# ============================================================================
-
-def generate_summary_report(
-    campaign_dir: Path,
-    baselines: list[dict[str, Any]],
-    all_results: list[dict[str, Any]],
-    classification: dict[str, list[dict[str, Any]]],
-) -> str:
-    """生成中文 Markdown 结果报告。"""
-    lines = [
-        "# Rotor37 B2B 拓扑控制验证报告",
-        "",
-        f"**执行时间**：{_timestamp()}",
-        f"**几何**：Rotor37.geomTurbo",
-        f"**总案例数**：{len(all_results)}",
-        f"**基线数**：{len(baselines)}",
-        "",
-        "## 1. 基线结果",
-        "",
-        "| 拓扑 | 重复 | 总点数 | 质量 | 耗时 | 输出文件 |",
-        "|---|---|---:|---|---|---|",
-    ]
-    for bl in baselines:
-        metrics = collect_quality_metrics(bl.get("run_summary"))
-        outputs = bl.get("mesh_outputs", {})
-        lines.append(
-            f"| {bl.get('topology', '?')} | {bl.get('run_index', '?')} | "
-            f"{metrics.get('total_points', '?')} | {metrics.get('quality_status', '?')} | "
-            f"{bl.get('duration_seconds', '?')}s | "
-            f"{','.join(outputs.keys()) or '无'} |"
-        )
-
-    lines.extend([
-        "",
-        "## 2. 执行统计",
-        "",
-        f"| 状态 | 数量 |",
-        f"|---|---|",
-    ])
-    status_counts = defaultdict(int)
-    for r in all_results:
-        status_counts[r.get("status", "unknown")] += 1
-    for status, count in sorted(status_counts.items()):
-        lines.append(f"| {status} | {count} |")
-
-    lines.extend([
-        "",
-        "## 3. 控制参数分类",
-        "",
-        "| 分类 | EFFECT_OK | QUALITY_SENSITIVE | CALL_ONLY | FAILED_ALL | NOT_TESTED | 合计 |",
-        "|---|---|---|---:|---:|---:|---:|",
-    ])
-    for cat, items in classification.items():
-        counts = defaultdict(int)
-        for item in items:
-            counts[item.get("level", "NOT_TESTED")] += 1
-        lines.append(
-            f"| {cat} | {counts.get('EFFECT_OK', 0)} | {counts.get('QUALITY_SENSITIVE', 0)} | "
-            f"{counts.get('CALL_ONLY', 0)} | {counts.get('FAILED_ALL', 0)} | "
-            f"{counts.get('NOT_TESTED', 0)} | {len(items)} |"
-        )
-
-    lines.extend([
-        "",
-        "## 4. 详细结果",
-        "",
-    ])
-    for cat, items in classification.items():
-        if not items:
-            continue
-        lines.extend([
-            f"### 4.{list(classification.keys()).index(cat) + 1} {cat}（{len(items)} 项）",
-            "",
-            "| 控制键 | 类型 | 说明 | 等级 | 成功/总数 | 备注 |",
-            "|---|---|---|---:|---|",
-        ])
-        for item in items:
-            lines.append(
-                f"| `{item['key']}` | {item.get('value_type', '?')} | "
-                f"{item.get('description', '')} | {item.get('level', '?')} | "
-                f"{item.get('success_count', 0)}/{item.get('total_tests', 0)} | "
-                f"{'; '.join(item.get('notes', []))} |"
+    previous = _load_json(results_file, [])
+    if not isinstance(previous, list):
+        previous = []
+    reusable = {
+        item.get("case_id"): item
+        for item in previous
+        if (
+            resume
+            and item.get("status") == "success"
+            and item.get("signature")
+            and item.get("signature") == next(
+                (
+                    case.get("signature")
+                    for case in cases
+                    if case.get("case_id") == item.get("case_id")
+                ),
+                None,
             )
-
-    return "\n".join(lines) + "\n"
-
-
-# ============================================================================
-# 工具函数
-# ============================================================================
-
-def _save_json(path: Path, data: Any) -> None:
-    """原子写入 JSON 文件。"""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
-    tmp.replace(path)
-
-
-def _load_json(path: Path) -> Any:
-    """安全加载 JSON 文件。"""
-    if not path.exists():
-        return None
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-# ============================================================================
-# 主入口
-# ============================================================================
-
-def _print_matrix(campaign_dir: Path) -> None:
-    """打印完整测试矩阵概况。"""
-    baseline_cases = build_baseline_cases(campaign_dir)
-    topology_cases = build_topology_switch_cases(campaign_dir)
-    ofat_cases = build_ofat_cases(campaign_dir)
-
-    print(f"基线案例：{len(baseline_cases)}（{len(TOPOLOGY_VALUES)} 拓扑 × {BASELINE_REPEATS} 重复）")
-    for c in baseline_cases:
-        print(f"  [{c['case_id']}]")
-        print(f"    --set {' --set '.join(c['set_args'])}")
-
-    print(f"\n拓扑切换案例：{len(topology_cases)}")
-    for c in topology_cases:
-        print(f"  [{c['case_id']}]")
-        print(f"    --set {' --set '.join(c['set_args'])}")
-
-    print(f"\nOFAT 测试案例：{len(ofat_cases)}")
-
-    # 按分类统计
-    by_category: dict[str, int] = defaultdict(int)
-    by_key: dict[str, int] = defaultdict(int)
-    for c in ofat_cases:
-        cat = c.get("category", "other")
-        by_category[cat] += 1
-        if c.get("variable_key"):
-            by_key[c["variable_key"]] += 1
-
-    print(f"\n按分类统计：")
-    for cat, count in sorted(by_category.items()):
-        print(f"  {cat}: {count}")
-    print(f"\n被测参数数：{len(by_key)}")
-    print(f"总计（含基线 + 拓扑切换）：{len(baseline_cases) + len(topology_cases) + len(ofat_cases)}")
-
-    # 打印 OFAT 案例前 20 个示例
-    print(f"\nOFAT 案例示例（前 20 个）：")
-    for c in ofat_cases[:20]:
-        print(f"  [{c['case_id']}]")
-        print(f"    拓扑={c.get('topology')} 变量={c.get('variable_key')}={c.get('variable_value')}")
-        print(f"    --set {' --set '.join(c['set_args'])}")
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Rotor37 B2B 拓扑控制验证活动执行器（PLAN.md 方案）"
+        )
+    }
+    results_by_id: dict[str, dict[str, Any]] = dict(reusable)
+    pending = [case for case in cases if case["case_id"] not in reusable]
+    print(
+        f"执行 {len(cases)} 例：复用 {len(reusable)}，待运行 {len(pending)}，"
+        f"并发 {max_workers}"
     )
-    parser.add_argument("--phase", type=int, choices=(1, 2, 3), default=0,
-                        help="只执行指定阶段（1=基线 2=测试矩阵 3=报告）；默认全部")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="只生成测试矩阵和脚本，不实际启动 IGG")
-    parser.add_argument("--workers", type=int, default=DEFAULT_MAX_WORKERS,
-                        help=f"最大并发数（默认 {DEFAULT_MAX_WORKERS}）")
-    parser.add_argument("--igg", default=None,
-                        help="IGG 可执行文件路径；覆盖 .env 和自动检测")
-    parser.add_argument("--campaign-dir", default=None,
-                        help="活动根目录；默认 runs/rotor37-control-validation/<时间戳>")
-    parser.add_argument("--resume", default=None,
-                        help="从指定活动目录恢复执行")
-    parser.add_argument("--list-matrix", action="store_true",
-                        help="只打印测试矩阵，不执行")
-    args = parser.parse_args()
+    completed_count = 0
+    if pending:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    execute_case,
+                    case,
+                    timeout_seconds=timeout_seconds,
+                    igg_executable=igg_executable,
+                ): case
+                for case in pending
+            }
+            for future in concurrent.futures.as_completed(futures):
+                case = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {
+                        **case,
+                        "status": "failed",
+                        "returncode": 1,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "run_summary": None,
+                        **_extract_result_facts(None),
+                    }
+                results_by_id[case["case_id"]] = result
+                completed_count += 1
+                ordered = [results_by_id[c["case_id"]] for c in cases if c["case_id"] in results_by_id]
+                _write_json(results_file, ordered)
+                if (
+                    completed_count <= 5
+                    or completed_count % 10 == 0
+                    or completed_count == len(pending)
+                ):
+                    successes = sum(item.get("status") == "success" for item in results_by_id.values())
+                    print(
+                        f"[{completed_count}/{len(pending)}] {case['case_id']} -> "
+                        f"{result.get('status')}；累计成功 {successes}"
+                    )
 
-    # 确定活动目录
-    if args.resume:
-        campaign_dir = Path(args.resume)
-        if not campaign_dir.exists():
-            print(f"错误：活动目录不存在：{campaign_dir}", file=sys.stderr)
-            return 2
-    elif args.campaign_dir:
-        campaign_dir = Path(args.campaign_dir)
-    else:
-        campaign_dir = PROJECT_ROOT / "runs" / "rotor37-control-validation" / _timestamp()
+    # 只对许可证、超时、启动失败等基础设施问题进行一次串行重试。
+    retry_cases = [
+        case
+        for case in cases
+        if _is_infrastructure_failure(results_by_id.get(case["case_id"], {}))
+    ]
+    for case in retry_cases:
+        print(f"串行重试基础设施失败：{case['case_id']}")
+        retry_result = execute_case(
+            case,
+            timeout_seconds=timeout_seconds,
+            igg_executable=igg_executable,
+        )
+        retry_result["retried_serially"] = True
+        results_by_id[case["case_id"]] = retry_result
+        _write_json(
+            results_file,
+            [results_by_id[c["case_id"]] for c in cases if c["case_id"] in results_by_id],
+        )
+    return [results_by_id[c["case_id"]] for c in cases if c["case_id"] in results_by_id]
 
-    campaign_dir.mkdir(parents=True, exist_ok=True)
-    state_file = campaign_dir / "campaign_state.json"
 
-    # --list-matrix：打印完整测试矩阵后退出
+def validate_pilot(results: list[dict[str, Any]]) -> dict[str, Any]:
+    by_category: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for result in results:
+        by_category[result["category"]].append(result)
+    failures: list[str] = []
+    for result in results:
+        if result.get("status") != "success":
+            failures.append(f"{result['case_id']} 未成功：{result.get('error')}")
+
+    aa_hashes = {item.get("fingerprint") for item in by_category["default_aa"]}
+    if len(aa_hashes) != 1 or None in aa_hashes:
+        failures.append("Default A/A 完整网格指纹不稳定")
+    effect_hashes = {item.get("fingerprint") for item in by_category["known_effect"]}
+    if len(effect_hashes) < 2:
+        failures.append("已知有效 spanwise_paths 未产生不同网格指纹")
+    topology_hashes = {item.get("fingerprint") for item in by_category["topology_switch"]}
+    if len(topology_hashes) < 2:
+        failures.append("Default 与 H&I 拓扑未产生不同网格指纹")
+    negative_hashes = {item.get("fingerprint") for item in by_category["negative_control"]}
+    if len(negative_hashes) != 1 or None in negative_hashes:
+        failures.append("low_memory_usage 负对照改变了网格指纹或指纹缺失")
+
+    conclusion = {
+        "accepted": not failures,
+        "failures": failures,
+        "default_aa_fingerprints": sorted(str(item) for item in aa_hashes),
+        "known_effect_fingerprints": sorted(str(item) for item in effect_hashes),
+        "topology_fingerprints": sorted(str(item) for item in topology_hashes),
+        "negative_control_fingerprints": sorted(str(item) for item in negative_hashes),
+    }
+    if failures:
+        raise RuntimeError("pilot 门控失败：" + "；".join(failures))
+    return conclusion
+
+
+def _quality_score(result: dict[str, Any]) -> tuple[int, int, int, float]:
+    summary = result.get("run_summary") or {}
+    metrics = ((summary.get("quality") or {}).get("metrics") or {})
+    negative = result.get("negative_cells")
+    min_skewness = metrics.get("min_skewness_angle")
+    return (
+        0 if result.get("structurally_valid") else 1,
+        int(negative) if isinstance(negative, (int, float)) else 10**12,
+        0 if result.get("quality_pass") else 1,
+        -float(min_skewness) if isinstance(min_skewness, (int, float)) else 0.0,
+    )
+
+
+def determine_hoh_anchor(
+    campaign_dir: Path,
+    baseline_results: list[dict[str, Any]],
+    *,
+    max_workers: int,
+    timeout_seconds: int,
+    igg_executable: str | None,
+    resume: bool,
+    dry_run: bool,
+) -> tuple[list[tuple[str, Any]] | None, dict[str, Any]]:
+    hoh_baselines = [
+        result for result in baseline_results if result.get("topology") == "hoh"
+    ]
+    valid_baselines = [
+        result for result in hoh_baselines if result.get("structurally_valid")
+    ]
+    if valid_baselines:
+        gate = {
+            "status": "valid_default_anchor",
+            "anchor_controls": [],
+            "baseline_case": min(valid_baselines, key=_quality_score)["case_id"],
+        }
+        _write_json(campaign_dir / "topology_rescue" / "topology_gate.json", gate)
+        return [], gate
+    if dry_run:
+        return [], {"status": "dry_run"}
+
+    single_cases: list[dict[str, Any]] = []
+    for key in HOH_RESCUE_KEYS:
+        for value in generate_test_values(CONTROL_REGISTRY[key])[:2]:
+            dependencies = force_topology_dependency(
+                build_dependency_controls(key, value),
+                "hoh",
+            )
+            single_cases.append(
+                make_case(
+                    campaign_dir,
+                    phase="topology_rescue",
+                    category="single",
+                    variable_key=key,
+                    variable_value=value,
+                    dependencies=dependencies,
+                    topology="hoh",
+                    subroot="topology_rescue",
+                )
+            )
+    single_results = execute_batch(
+        single_cases,
+        results_file=campaign_dir / "topology_rescue" / "single_results.json",
+        max_workers=max_workers,
+        timeout_seconds=timeout_seconds,
+        igg_executable=igg_executable,
+        resume=resume,
+        dry_run=False,
+    )
+    valid_singles = [
+        result for result in single_results if result.get("structurally_valid")
+    ]
+    all_results = list(single_results)
+    if not valid_singles:
+        ranked = sorted(
+            [result for result in single_results if result.get("status") == "success"],
+            key=_quality_score,
+        )
+        distinct_keys: list[str] = []
+        value_options: dict[str, list[Any]] = defaultdict(list)
+        for result in ranked:
+            key = result.get("variable_key")
+            if key and key not in distinct_keys:
+                distinct_keys.append(key)
+            if key and result.get("variable_value") not in value_options[key]:
+                value_options[key].append(result.get("variable_value"))
+        distinct_keys = distinct_keys[:2]
+        combination_cases: list[dict[str, Any]] = []
+        if len(distinct_keys) == 2:
+            first_key, second_key = distinct_keys
+            for first_value in value_options[first_key][:2]:
+                for second_value in value_options[second_key][:2]:
+                    dependencies = [(TOPOLOGY_SELECTOR_KEY, "hoh")]
+                    dependencies.extend(
+                        [(first_key, first_value), (second_key, second_value)]
+                    )
+                    suffix = (
+                        f"{_safe_name(first_key)}_{_safe_name(first_value)}__"
+                        f"{_safe_name(second_key)}_{_safe_name(second_value)}"
+                    )
+                    combination_cases.append(
+                        make_case(
+                            campaign_dir,
+                            phase="topology_rescue",
+                            category="combination",
+                            variable_key=None,
+                            variable_value=None,
+                            dependencies=dependencies,
+                            topology="hoh",
+                            case_suffix=suffix,
+                            subroot="topology_rescue",
+                        )
+                    )
+        if combination_cases:
+            combination_results = execute_batch(
+                combination_cases,
+                results_file=campaign_dir / "topology_rescue" / "combination_results.json",
+                max_workers=min(max_workers, 4),
+                timeout_seconds=timeout_seconds,
+                igg_executable=igg_executable,
+                resume=resume,
+                dry_run=False,
+            )
+            all_results.extend(combination_results)
+
+    valid = [result for result in all_results if result.get("structurally_valid")]
+    if not valid:
+        gate = {
+            "status": "blocked",
+            "anchor_controls": None,
+            "reason": "通用参数有限修复后仍无结构有效 HOH 网格",
+            "tested_cases": len(all_results),
+            "best_case": min(all_results, key=_quality_score)["case_id"] if all_results else None,
+        }
+        _write_json(campaign_dir / "topology_rescue" / "topology_gate.json", gate)
+        return None, gate
+
+    best = min(valid, key=_quality_score)
+    anchor = [
+        (item["key"], item["value"])
+        for item in best.get("dependency_controls", [])
+        if item["key"] != TOPOLOGY_SELECTOR_KEY
+    ]
+    if best.get("variable_key"):
+        anchor.append((best["variable_key"], best["variable_value"]))
+    deduplicated = list(dict(anchor).items())
+    gate = {
+        "status": "repaired_anchor",
+        "anchor_controls": [
+            {"key": key, "value": value} for key, value in deduplicated
+        ],
+        "anchor_case": best["case_id"],
+        "tested_cases": len(all_results),
+    }
+    _write_json(campaign_dir / "topology_rescue" / "topology_gate.json", gate)
+    return deduplicated, gate
+
+
+def build_adaptive_cases(
+    campaign_dir: Path,
+    cases: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """对两值均成功但指纹相同的数值控制追加一个更宽安全值。"""
+
+    cases_by_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    results_by_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for case in cases:
+        if case.get("variable_key") in GENERAL_CONTROL_KEYS:
+            cases_by_key[case["variable_key"]].append(case)
+    for result in results:
+        if result.get("variable_key") in GENERAL_CONTROL_KEYS:
+            results_by_key[result["variable_key"]].append(result)
+
+    adaptive: list[dict[str, Any]] = []
+    for key, key_results in sorted(results_by_key.items()):
+        spec = CONTROL_REGISTRY[key]
+        successful = [item for item in key_results if item.get("status") == "success"]
+        fingerprints = {item.get("fingerprint") for item in successful}
+        if (
+            len(successful) < 2
+            or len(fingerprints) != 1
+            or None in fingerprints
+            or spec.value_type in {"bool", "enum"}
+        ):
+            continue
+        existing_values = [item.get("variable_value") for item in successful]
+        if spec.value_type == "int":
+            largest = max(int(value) for value in existing_values)
+            candidate: Any = max(largest + 4, largest * 2)
+            if "points" in key or "index" in key:
+                candidate = 4 * ((int(candidate) - 1 + 3) // 4) + 1
+            if spec.maximum is not None:
+                candidate = min(int(spec.maximum), int(candidate))
+        elif spec.value_type == "float":
+            largest = max(float(value) for value in existing_values)
+            candidate = largest * 2.0 if largest else 1.0
+            if spec.maximum is not None:
+                candidate = min(float(spec.maximum), candidate)
+        else:
+            first = list(existing_values[-1])
+            first[-1] = first[-1] * 1.5 if first[-1] else 1.0
+            candidate = tuple(first)
+        if candidate in existing_values:
+            continue
+        template = cases_by_key[key][0]
+        dependencies = [
+            (item["key"], item["value"])
+            for item in template.get("dependency_controls", [])
+        ]
+        adaptive.append(
+            make_case(
+                campaign_dir,
+                phase="adaptive",
+                category=_control_group(key),
+                variable_key=key,
+                variable_value=candidate,
+                dependencies=dependencies,
+                topology=template.get("topology"),
+                case_suffix=f"adaptive_{_format_value(candidate)}",
+                subroot="cases",
+            )
+        )
+    return adaptive
+
+
+def _directory_size(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return 0
+    for item in path.rglob("*"):
+        try:
+            if item.is_file():
+                total += item.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def check_disk_capacity(
+    campaign_dir: Path,
+    pilot_results: list[dict[str, Any]],
+    estimated_case_count: int,
+) -> dict[str, Any]:
+    successful_dirs = [
+        Path(item["out_dir"])
+        for item in pilot_results
+        if item.get("status") == "success" and item.get("out_dir")
+    ]
+    sizes = [_directory_size(path) for path in successful_dirs]
+    average = int(sum(sizes) / len(sizes)) if sizes else 0
+    estimated = int(average * estimated_case_count * 1.2)
+    free = shutil.disk_usage(campaign_dir.parent).free
+    result = {
+        "pilot_average_bytes": average,
+        "estimated_case_count": estimated_case_count,
+        "estimated_total_bytes_with_margin": estimated,
+        "free_bytes": free,
+        "sufficient": estimated == 0 or estimated < free * 0.9,
+    }
+    _write_json(campaign_dir / "disk_estimate.json", result)
+    if not result["sufficient"]:
+        raise RuntimeError(
+            f"预计需要 {estimated / 1024**3:.1f} GiB，但仅剩 {free / 1024**3:.1f} GiB"
+        )
+    return result
+
+
+def _run_analysis(campaign_dir: Path) -> int:
+    analyzer = PROJECT_ROOT / "tests" / "test_analyze_results.py"
+    completed = subprocess.run(
+        [sys.executable, "-B", str(analyzer), str(campaign_dir)],
+        cwd=PROJECT_ROOT,
+        check=False,
+    )
+    return completed.returncode
+
+
+def _phase_alias(value: str) -> str:
+    aliases = {
+        "0": "all",
+        "1": "baseline",
+        "2": "cases",
+        "3": "analyze",
+    }
+    return aliases.get(value, value)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--phase",
+        default="all",
+        choices=(
+            "audit",
+            "pilot",
+            "baseline",
+            "cases",
+            "analyze",
+            "all",
+            "0",
+            "1",
+            "2",
+            "3",
+        ),
+    )
+    parser.add_argument("--campaign-dir", type=Path)
+    parser.add_argument("--workers", type=int, default=DEFAULT_MAX_WORKERS)
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument("--igg")
+    parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--list-matrix",
+        action="store_true",
+        help="只打印案例与命令，不创建目录、不执行。",
+    )
+    args = parser.parse_args(argv)
+    phase = _phase_alias(args.phase)
+    if args.workers < 1 or args.workers > 32:
+        parser.error("--workers 必须位于 1..32")
+    if not GEOMETRY_PATH.exists():
+        parser.error(f"找不到 Rotor37 几何：{GEOMETRY_PATH}")
+
     if args.list_matrix:
-        _print_matrix(campaign_dir)
+        virtual_root = Path("<campaign>")
+        main_cases, _ = build_control_cases(virtual_root, hoh_anchor=[])
+        context_cases = build_context_baselines(virtual_root, main_cases)
+        all_cases = (
+            build_pilot_cases(virtual_root)
+            + build_baseline_cases(virtual_root)
+            + context_cases
+            + main_cases
+        )
+        counts = Counter(case["phase"] for case in all_cases)
+        print(
+            json.dumps(
+                {
+                    "registered": len(CONTROL_REGISTRY),
+                    "general": len(GENERAL_CONTROL_KEYS),
+                    "cases": len(all_cases),
+                    "by_phase": dict(counts),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        for case in all_cases:
+            print(case["case_id"])
+            print(
+                "  "
+                + subprocess.list2cmdline(
+                    _mesh_command(
+                        case,
+                        timeout_seconds=args.timeout,
+                        igg_executable=args.igg,
+                    )
+                )
+            )
         return 0
 
-    # 加载或初始化状态
-    state = _load_json(state_file) or {"phase": 0, "baselines": [], "results": []}
+    campaign_dir = (
+        args.campaign_dir.resolve()
+        if args.campaign_dir
+        else (RUNS_ROOT / _timestamp()).resolve()
+    )
+    campaign_dir.mkdir(parents=True, exist_ok=True)
+    state_file = campaign_dir / "campaign_state.json"
+    state = _load_json(
+        state_file,
+        {
+            "schema_version": 2,
+            "campaign_dir": str(campaign_dir),
+            "geometry": str(GEOMETRY_PATH),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "completed_phases": [],
+        },
+    )
+    resume = not args.no_resume
 
-    do_phase = lambda p: args.phase in (0, p)
+    def should_run(name: str) -> bool:
+        return phase in {"all", name}
 
-    # ---- Phase 1: 基线 ----
-    if do_phase(1) and state.get("phase", 0) < 1:
-        print("=" * 60)
-        print("Phase 1: 生成 A/A 基线")
-        print("=" * 60)
+    if should_run("audit"):
+        print("Phase audit：输出控制/API 清单")
+        state["inventory"] = write_inventory(campaign_dir)
+        if "audit" not in state["completed_phases"]:
+            state["completed_phases"].append("audit")
+        _write_json(state_file, state)
+
+    pilot_results: list[dict[str, Any]] = _load_json(
+        campaign_dir / "pilot_results.json", []
+    )
+    if should_run("pilot"):
+        print("Phase pilot：验证指纹、已知效果和负对照")
+        pilot_cases = build_pilot_cases(campaign_dir)
+        pilot_results = execute_batch(
+            pilot_cases,
+            results_file=campaign_dir / "pilot_results.json",
+            max_workers=min(args.workers, len(pilot_cases)),
+            timeout_seconds=args.timeout,
+            igg_executable=args.igg,
+            resume=resume,
+            dry_run=args.dry_run,
+        )
+        if not args.dry_run:
+            state["pilot_gate"] = validate_pilot(pilot_results)
+            if "pilot" not in state["completed_phases"]:
+                state["completed_phases"].append("pilot")
+            _write_json(state_file, state)
+
+    baseline_results: list[dict[str, Any]] = _load_json(
+        campaign_dir / "baseline_results.json", []
+    )
+    if should_run("baseline"):
+        print("Phase baseline：三拓扑各 4 次 A/A")
         baseline_cases = build_baseline_cases(campaign_dir)
-        print(f"基线案例数：{len(baseline_cases)}（{len(TOPOLOGY_VALUES)} 拓扑 × {BASELINE_REPEATS} 重复）")
-
         baseline_results = execute_batch(
             baseline_cases,
-            max_workers=args.workers,
+            results_file=campaign_dir / "baseline_results.json",
+            max_workers=min(args.workers, len(baseline_cases)),
+            timeout_seconds=args.timeout,
+            igg_executable=args.igg,
+            resume=resume,
             dry_run=args.dry_run,
-            igg_exe=args.igg,
-            results_file=campaign_dir / "baselines_results.json",
         )
-        state["baselines"] = baseline_results
-        state["phase"] = 1
-        _save_json(state_file, state)
+        if not args.dry_run:
+            state["baseline_count"] = len(baseline_results)
+            if "baseline" not in state["completed_phases"]:
+                state["completed_phases"].append("baseline")
+            _write_json(state_file, state)
 
-        if args.dry_run:
-            print("\nDry-run 完成。使用 --phase 2 继续测试矩阵。")
-            return 0
-
-    # ---- Phase 2: 测试矩阵 ----
-    if do_phase(2) and state.get("phase", 0) < 2:
-        print("\n" + "=" * 60)
-        print("Phase 2: 构建并执行测试矩阵")
-        print("=" * 60)
-
-        # 构建测试矩阵
-        topology_cases = build_topology_switch_cases(campaign_dir)
-        ofat_cases = build_ofat_cases(campaign_dir)
-        all_test_cases = topology_cases + ofat_cases
-        print(f"测试案例总数：{len(all_test_cases)}（拓扑切换 {len(topology_cases)} + OFAT {len(ofat_cases)}）")
-
-        # 按拓扑和被测键统计
-        by_key: dict[str, int] = defaultdict(int)
-        for c in ofat_cases:
-            if c.get("variable_key"):
-                by_key[c["variable_key"]] += 1
-        print(f"被测参数数：{len(by_key)}")
-
-        all_results = execute_batch(
-            all_test_cases,
+    if should_run("cases"):
+        if not baseline_results and not args.dry_run:
+            raise RuntimeError("执行 cases 前必须先完成 baseline")
+        print("Phase cases：拓扑门控、上下文基线和 156 项参数")
+        hoh_anchor, topology_gate = determine_hoh_anchor(
+            campaign_dir,
+            baseline_results,
             max_workers=args.workers,
+            timeout_seconds=args.timeout,
+            igg_executable=args.igg,
+            resume=resume,
             dry_run=args.dry_run,
-            igg_exe=args.igg,
-            results_file=campaign_dir / "test_results.json",
         )
-        state["results"] = all_results
-        state["phase"] = 2
-        _save_json(state_file, state)
+        control_cases, blocked = build_control_cases(
+            campaign_dir,
+            hoh_anchor=hoh_anchor,
+        )
+        context_cases = build_context_baselines(campaign_dir, control_cases)
+        if pilot_results:
+            check_disk_capacity(
+                campaign_dir,
+                pilot_results,
+                len(context_cases) + len(control_cases),
+            )
+        context_results = execute_batch(
+            context_cases,
+            results_file=campaign_dir / "context_baseline_results.json",
+            max_workers=args.workers,
+            timeout_seconds=args.timeout,
+            igg_executable=args.igg,
+            resume=resume,
+            dry_run=args.dry_run,
+        )
+        case_results = execute_batch(
+            control_cases,
+            results_file=campaign_dir / "case_results.json",
+            max_workers=args.workers,
+            timeout_seconds=args.timeout,
+            igg_executable=args.igg,
+            resume=resume,
+            dry_run=args.dry_run,
+        )
+        adaptive_cases = (
+            []
+            if args.dry_run
+            else build_adaptive_cases(campaign_dir, control_cases, case_results)
+        )
+        adaptive_results = execute_batch(
+            adaptive_cases,
+            results_file=campaign_dir / "adaptive_results.json",
+            max_workers=args.workers,
+            timeout_seconds=args.timeout,
+            igg_executable=args.igg,
+            resume=resume,
+            dry_run=args.dry_run,
+        ) if adaptive_cases else []
+        all_case_results = case_results + adaptive_results + blocked
+        _write_json(campaign_dir / "all_case_results.json", all_case_results)
+        state.update(
+            {
+                "topology_gate": topology_gate,
+                "context_baseline_count": len(context_results),
+                "case_count": len(all_case_results),
+                "adaptive_case_count": len(adaptive_results),
+            }
+        )
+        if not args.dry_run and "cases" not in state["completed_phases"]:
+            state["completed_phases"].append("cases")
+        _write_json(state_file, state)
 
-        if args.dry_run:
-            print("\nDry-run 完成。使用 --phase 3 生成报告。")
-            return 0
+    if should_run("analyze"):
+        print("Phase analyze：生成数据驱动汇总")
+        returncode = _run_analysis(campaign_dir)
+        if returncode != 0:
+            return returncode
+        if "analyze" not in state["completed_phases"]:
+            state["completed_phases"].append("analyze")
+        _write_json(state_file, state)
 
-    # ---- Phase 3: 报告 ----
-    if do_phase(3) and state.get("phase", 0) < 3:
-        print("\n" + "=" * 60)
-        print("Phase 3: 收集结果并生成报告")
-        print("=" * 60)
-
-        baselines = state.get("baselines", [])
-        all_results = state.get("results", [])
-
-        if not all_results and not baselines:
-            print("无可用结果。请先执行 Phase 1 和 Phase 2。", file=sys.stderr)
-            return 2
-
-        # 提取基线指标
-        baseline_metrics: dict[str, dict[str, Any]] = {}
-        for bl in baselines:
-            topo = bl.get("topology", "default")
-            if topo not in baseline_metrics:
-                baseline_metrics[topo] = collect_quality_metrics(bl.get("run_summary"))
-
-        # 分类
-        classification = build_final_classification(all_results, baseline_metrics)
-
-        # 生成报告
-        report = generate_summary_report(campaign_dir, baselines, all_results, classification)
-        report_path = campaign_dir / "validation_report.md"
-        report_path.write_text(report, encoding="utf-8")
-        print(f"报告已保存：{report_path}")
-
-        # 保存分类 JSON
-        classification_path = campaign_dir / "classification.json"
-        _save_json(classification_path, classification)
-        print(f"分类数据已保存：{classification_path}")
-
-        # 统计
-        total_tested = sum(len(items) for items in classification.values())
-        print(f"\n分类统计：")
-        for cat, items in classification.items():
-            if items:
-                print(f"  {cat}: {len(items)} 项")
-
-        state["phase"] = 3
-        _save_json(state_file, state)
-
-    print(f"\n活动目录：{campaign_dir}")
-    print("完成。")
+    print(f"活动目录：{campaign_dir}")
     return 0
+
+
+class CampaignRunnerUnitTests(unittest.TestCase):
+    def test_full_matrix_covers_156_controls_with_comparable_variants(self) -> None:
+        cases, blocked = build_control_cases(Path("<unit>"), hoh_anchor=[])
+        self.assertFalse(blocked)
+        by_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for case in cases:
+            if case.get("variable_key") in GENERAL_CONTROL_KEYS:
+                by_key[case["variable_key"]].append(case)
+        self.assertEqual(set(by_key), set(GENERAL_CONTROL_KEYS))
+        for key, key_cases in by_key.items():
+            contexts: dict[str, set[str]] = defaultdict(set)
+            for case in key_cases:
+                contexts[case["context_id"]].add(
+                    json.dumps(case["variable_value"], sort_keys=True)
+                )
+            self.assertGreaterEqual(
+                max(len(values) for values in contexts.values()),
+                2,
+                key,
+            )
+
+    def test_dependency_order_and_command_are_explicit(self) -> None:
+        dependencies = build_dependency_controls(
+            "stagnation-point/distribution_absolute_distance",
+            1.0e-4,
+        )
+        keys = [key for key, _ in dependencies]
+        self.assertLess(
+            keys.index("stagnation-point/distribution_from_expansion_ratio"),
+            keys.index("stagnation-point/distribution_type"),
+        )
+        case = make_case(
+            Path("<unit>"),
+            phase="cases",
+            category="GENERAL_DEFAULT",
+            variable_key="blade/b2b.default.streamwise_inlet_points",
+            variable_value=17,
+            dependencies=build_dependency_controls(
+                "blade/b2b.default.streamwise_inlet_points", 17
+            ),
+            topology="default",
+        )
+        command = _mesh_command(case, timeout_seconds=1800, igg_executable=None)
+        self.assertIn("--mesh-fingerprint", command)
+        self.assertEqual(command.count("--set"), len(case["set_args"]))
+        self.assertIn(
+            "row:#1/blade:#1/b2b.default.streamwise_inlet_points=17",
+            command,
+        )
+
+    def test_hoh_rescue_overrides_core_controls_default_topology(self) -> None:
+        dependencies = force_topology_dependency(
+            build_dependency_controls("row/flow_path.number", 65),
+            "hoh",
+        )
+        self.assertIn((TOPOLOGY_SELECTOR_KEY, "hoh"), dependencies)
+        self.assertNotIn((TOPOLOGY_SELECTOR_KEY, "default"), dependencies)
+
+    def test_resume_reuses_matching_successful_case(self) -> None:
+        case = {
+            "case_id": "cases/unit",
+            "signature": "same",
+            "out_dir": "unused",
+        }
+        previous = [{**case, "status": "success", "generation_success": True}]
+        with tempfile.TemporaryDirectory() as tmp:
+            result_file = Path(tmp) / "results.json"
+            _write_json(result_file, previous)
+            with patch(__name__ + ".execute_case") as execute_mock:
+                results = execute_batch(
+                    [case],
+                    results_file=result_file,
+                    max_workers=1,
+                    timeout_seconds=1,
+                    igg_executable=None,
+                    resume=True,
+                    dry_run=False,
+                )
+        execute_mock.assert_not_called()
+        self.assertEqual(results, previous)
+
+    def test_pilot_rejects_unstable_aa_fingerprint(self) -> None:
+        results = []
+        for category, fingerprints in (
+            ("default_aa", ("A", "B")),
+            ("known_effect", ("C", "D")),
+            ("topology_switch", ("E", "F")),
+            ("negative_control", ("G", "G")),
+        ):
+            for index, fingerprint in enumerate(fingerprints):
+                results.append(
+                    {
+                        "case_id": f"{category}/{index}",
+                        "category": category,
+                        "status": "success",
+                        "fingerprint": fingerprint,
+                    }
+                )
+        with self.assertRaisesRegex(RuntimeError, "A/A"):
+            validate_pilot(results)
 
 
 if __name__ == "__main__":

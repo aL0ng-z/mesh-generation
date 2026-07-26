@@ -158,7 +158,7 @@ NI_END niRow
 ```text
 项目根目录/
 ├── mesh.py          ← CLI 入口：解析参数、编排全流程、写摘要和报告
-├── controls.py      ← 核心：341 项控制规格的静态注册表 + 选择器 + 解析 + 校验 + 审计
+├── controls.py      ← 核心：344 项控制规格的静态注册表 + 选择器 + 解析 + 校验 + 审计
 ├── geomturbo.py     ← 输入：解析 .geomTurbo 文件的几何与拓扑信息
 ├── autogrid.py      ← 输出：生成 AutoGrid Python 脚本并调用 IGG 执行
 ├── quality.py       ← 输出后：解析 .qualityReport 并判定 PASS/FAIL/UNKNOWN
@@ -655,7 +655,7 @@ def _direct(key, method, description, *, target_kind, hierarchy, ...):
 
 ### 3.4 控制注册表内容概览
 
-注册表共有 **341 个控制键**：P0 10 个、P1 59 个、P2 272 个。下面按作用域逐一说明。
+注册表共有 **344 个控制键**：P0 10 个、P1 59 个、P2 275 个。下面按作用域逐一说明。
 
 #### 3.4.1 全局配置（configuration）
 
@@ -1433,26 +1433,32 @@ def _load_env_file(path):
 
 这用于在项目根目录配置 IGG 路径（不纳入版本管理）。
 
-### 6.6 `run_summary.json`（Schema v2）
+### 6.6 `run_summary.json`（Schema v3）
 
 （`mesh.py:153-165`）
 
 ```json
 {
-    "schema_version": 2,
+    "schema_version": 3,
     "run_dir": "runs/Rotor37_20260723_143052",
     "geometry": { /* GeomTurboSummary.to_dict() */ },
     "controls": {
         "requested":  [ /* ControlRequest.to_dict() */ ],
         "resolved":   [ /* ResolvedControl.to_dict() */ ],
-        "applied":    [ /* control_results from AutoGridRun */ ]
+        "applied":    [ /* setter 前后回读 */ ],
+        "post_generation": [ /* 3D 网格生成后回读 */ ]
     },
     "autogrid": { /* AutoGridRun.to_dict() */ },
+    "mesh_fingerprint": { /* 可选：block 尺寸、完整坐标 SHA 和探针 */ },
     "quality": { /* summarize_quality() 返回值 */ }
 }
 ```
 
-`controls.resolved` 中的状态为 `"planned"`（dry-run 时）或实际执行后的状态。`controls.applied` 只在真实执行时填充。所有字段使用 `sort_keys=True` 序列化，确保稳定输出。
+`controls.resolved` 中的状态为 `"planned"`（dry-run 时）或实际执行后的状态。
+`controls.applied` 和 `controls.post_generation` 只在真实执行时填充。指定
+`--mesh-fingerprint` 时，程序从导出的 CGNS 读取每个结构化 block 的全部
+Float64 坐标，记录 I/J/K、点数/单元数、逐 block SHA-256、固定坐标探针和
+聚合网格指纹。所有字段使用 `sort_keys=True` 序列化，确保稳定输出。
 
 ### 6.7 `report.md`（中文报告）
 
@@ -1499,4 +1505,6 @@ def _load_env_file(path):
 
 > **文档版本**：2026-07-23，基于 AutoGrid 17.1 实现
 > 
-> 本文档对应的代码版本是 `controls.py` 341 项控制注册表、`autogrid.py` 721 项 setter 审计、`quality.py` Schema v2 质量模型。
+> 本文档对应的代码版本是 `controls.py` 344 项控制注册表、`autogrid.py`
+> 721 项 setter 审计、`run_summary.json` Schema v3，以及保持兼容的
+> `quality.py` Schema v2 质量模型。

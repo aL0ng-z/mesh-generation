@@ -914,8 +914,10 @@ for _edge in ("leading", "trailing"):
         topologies=("hoh",),
     )
     for _kind, _si, _minimum in (("absolute_distance", True, 0), ("relative_distance", False, 0), ("cell_length", True, 0)):
-        # cell_length 的 API setter 期望 int 而非 float。
-        _value_type = "int" if _kind == "cell_length" else "float"
+        # 17.1 的 trailing cell_length C 绑定只接受 int，且 getter 返回 None；
+        # leading cell_length 则是正常的 SI float。显式保留这一厂商 API 差异。
+        _trailing_integer_cell_length = _edge == "trailing" and _kind == "cell_length"
+        _value_type = "int" if _trailing_integer_cell_length else "float"
         _direct(
             f"blade/b2b.hoh.{_edge}_edge_{_kind}",
             f"set_b2b_hoh_{_edge}_edge_control_{_kind}",
@@ -926,7 +928,7 @@ for _edge in ("leading", "trailing"):
             priority="P2",
             stage="distribution",
             minimum=_minimum,
-            si_length=_si,
+            si_length=_si and not _trailing_integer_cell_length,
             topologies=("hoh",),
         )
 for _key, _method, _kind, _minimum, _maximum, _si in (
@@ -1606,6 +1608,434 @@ for _topo, _keys in TOPOLOGY_KEY_MAP.items():
         CONDITIONAL_KEY_TOPOLOGY[_key] = _topo
 
 
+# 通用控制策展集合。
+#
+# 注意：
+# - 上面的 TOPOLOGY_*_KEYS / ALL_CONDITIONAL_KEYS 是完整运行时集合，负责拓扑
+#   自动注入与冲突检测，绝不能因验证活动的筛选而缩减。
+# - GENERAL_* 只回答“哪些控制适合作为常规叶轮机械网格控制进行 Rotor37
+#   实机验证”，因此使用显式白名单，避免未来新增几何专用控制时被自动纳入。
+GENERAL_CONFIGURATION_KEYS: frozenset[str] = frozenset(
+    {
+        "configuration/grid_levels",
+        "configuration/support_curve_control_points",
+    }
+)
+GENERAL_WIZARD_KEYS: frozenset[str] = frozenset(
+    {
+        "wizard/first_cell_width",
+        "wizard/full_matching",
+        "wizard/grid_level",
+        "wizard/spanwise_paths",
+    }
+)
+GENERAL_ROW_KEYS: frozenset[str] = frozenset(
+    {
+        "row/clustering",
+        "row/downstream.relaxation",
+        "row/downstream.untwist",
+        "row/downstream.untwist_location",
+        "row/enforce_blade_wall_cell_width",
+        "row/flow_path.constant_cells",
+        "row/flow_path.control_points",
+        "row/flow_path.distribution_smoothing_steps",
+        "row/flow_path.hub_clustering",
+        "row/flow_path.intermediate_points",
+        "row/flow_path.number",
+        "row/flow_path.shroud_clustering",
+        "row/flow_path.smoothing_steps",
+        "row/mesh_level",
+        "row/optimization.boundary_steps",
+        "row/optimization.freeze_skin",
+        "row/optimization.full_multigrid_steps",
+        "row/optimization.multigrid",
+        "row/optimization.nmb",
+        "row/optimization.orthogonality",
+        "row/optimization.skewness",
+        "row/optimization.steps",
+        "row/optimization.straight_boundary",
+        "row/optimization.wake",
+        "row/span_interpolation",
+        "row/streamwise_weight",
+        "row/target_points",
+        "row/upstream.relaxation",
+        "row/upstream.untwist",
+        "row/upstream.untwist_location",
+    }
+)
+GENERAL_EDGE_TREATMENT_KEYS: frozenset[str] = frozenset(
+    {
+        "blade/edge_treatment.leading_blend",
+        "blade/edge_treatment.leading_blunt",
+        "blade/edge_treatment.leading_sharp",
+        "blade/edge_treatment.trailing_blend",
+        "blade/edge_treatment.trailing_blunt",
+        "blade/edge_treatment.trailing_rounded",
+        "blade/edge_treatment.trailing_sharp",
+    }
+)
+GENERAL_INTERFACE_KEYS: frozenset[str] = frozenset(
+    {
+        "interface/streamwise_cell_width",
+    }
+)
+GENERAL_STAGNATION_POINT_KEYS: frozenset[str] = frozenset(
+    {
+        "stagnation-point/constant_cells_percent",
+        "stagnation-point/desired_expansion_ratio",
+        "stagnation-point/distribution_absolute_distance",
+        "stagnation-point/distribution_cell_length",
+        "stagnation-point/distribution_from_expansion_ratio",
+        "stagnation-point/distribution_relative_distance",
+        "stagnation-point/distribution_type",
+        "stagnation-point/parametric_location",
+    }
+)
+
+GENERAL_CORE_KEYS: frozenset[str] = (
+    GENERAL_CONFIGURATION_KEYS
+    | GENERAL_WIZARD_KEYS
+    | GENERAL_ROW_KEYS
+    | GENERAL_EDGE_TREATMENT_KEYS
+    | GENERAL_INTERFACE_KEYS
+    | GENERAL_STAGNATION_POINT_KEYS
+)
+GENERAL_TOPOLOGY_KEYS: frozenset[str] = frozenset({TOPOLOGY_SELECTOR_KEY})
+GENERAL_DEFAULT_KEYS: frozenset[str] = TOPOLOGY_DEFAULT_KEYS - frozenset(
+    {
+        "blade/b2b.default.boundary_layer_gap_points",
+    }
+)
+GENERAL_HOH_KEYS: frozenset[str] = TOPOLOGY_HOH_KEYS - frozenset(
+    {
+        "blade/b2b.hoh.gap_azimuthal_h_points",
+        "blade/b2b.hoh.gap_azimuthal_o_points",
+        "blade/b2b.hoh.gap_leading_addition",
+        "blade/b2b.hoh.gap_leading_ratio",
+        "blade/b2b.hoh.gap_matching",
+        "blade/b2b.hoh.gap_streamwise_h_points",
+        "blade/b2b.hoh.gap_trailing_addition",
+        "blade/b2b.hoh.gap_trailing_ratio",
+    }
+)
+GENERAL_HI_KEYS: frozenset[str] = TOPOLOGY_HI_KEYS
+GENERAL_CONTROL_KEYS: frozenset[str] = (
+    GENERAL_CORE_KEYS
+    | GENERAL_TOPOLOGY_KEYS
+    | GENERAL_DEFAULT_KEYS
+    | GENERAL_HOH_KEYS
+    | GENERAL_HI_KEYS
+)
+
+
+def _general_control_exclusion_reason(key: str, spec: ControlSpec) -> str:
+    """返回未进入通用验证集合的逐键排除理由。"""
+
+    if key == "row/low_memory_usage":
+        return "运行资源策略，不应改变最终网格"
+    if key == "row/bladeless_mesh":
+        return "仅适用于无叶片通道，会改变物理计算域"
+    if key == "row/downstream.before_nozzle_relaxation":
+        return "依赖 nozzle 几何结构"
+    if key.startswith("row/gap.") or key.startswith("row/optimization.gap_"):
+        return "依赖实际 gap 几何结构"
+    if key.startswith("configuration/bypass."):
+        return "依赖 bypass/nozzle 项目结构"
+    if key.startswith("configuration/inlet_bulb.") or key.startswith("configuration/outlet_bulb."):
+        return "依赖 inlet/outlet bulb 几何结构"
+    if key.startswith("wizard/far_field_"):
+        return "依赖远场几何结构"
+    if key == "wizard/blade_tip_rounded_topology":
+        return "依赖圆钝叶尖几何结构"
+    if key == "blade/b2b.default.boundary_layer_gap_points" or key.startswith("blade/b2b.hoh.gap_"):
+        return "依赖实际 gap 几何结构"
+    if spec.target_kind == "interface":
+        return "依赖内部转静接口或会改变接口物理几何；Rotor37 通用入口/出口仅保留流向单元宽度"
+
+    target_reasons = {
+        "acoustic-wizard": "依赖声学行与远场结构",
+        "basin-hole": "依赖既有 basin-hole 实体",
+        "blade-sheet": "依赖既有 blade-sheet 实体",
+        "endwall": "依赖既有端壁技术效果实体及显式生成动作",
+        "endwall-holes-line": "依赖既有端壁孔列实体",
+        "existing-effect": "依赖既有 ZR/3D 技术效果实体及激活动作",
+        "fillet": "依赖实际 fillet 几何结构",
+        "gap": "依赖实际 gap 几何结构",
+        "holes-line": "依赖既有叶片孔列实体",
+        "lete-wizard": "依赖 LETE wizard 的显式 generate 激活动作",
+        "partial-gap": "依赖实际 partial-gap 几何结构",
+        "pin-fins-line": "依赖既有冷却通道与 pin-fins 实体",
+        "snubber": "依赖实际 snubber 几何结构",
+        "solid-body": "依赖既有叶片固体域",
+    }
+    if spec.target_kind in target_reasons:
+        return target_reasons[spec.target_kind]
+    return "不满足 Rotor37 通用控制筛选条件"
+
+
+GENERAL_CONTROL_EXCLUSIONS: dict[str, str] = {
+    key: _general_control_exclusion_reason(key, spec)
+    for key, spec in CONTROL_REGISTRY.items()
+    if key not in GENERAL_CONTROL_KEYS
+}
+
+# 已确认存在于 17.1 API、但因依赖特定几何实体而不纳入 Rotor37 通用
+# campaign 的纯网格 API。该清单用于扩展 API 审计报告，不参与运行时调用。
+GENERAL_API_ONLY_EXCLUSIONS: dict[str, str] = {
+    "EndWall.enable_multigrid_optimization": "依赖既有端壁技术效果实体",
+    "EndWall.disable_multigrid_optimization": "依赖既有端壁技术效果实体",
+    "HolesLine.enable_skewness_control_inside_holes": "依赖既有叶片孔列实体",
+    "HolesLine.disable_skewness_control_inside_holes": "依赖既有叶片孔列实体",
+    "HolesLine.enable_skewness_control_arround_holes": "依赖既有叶片孔列实体",
+    "HolesLine.disable_skewness_control_arround_holes": "依赖既有叶片孔列实体",
+    "EndWallHolesLine.enable_skewness_control_inside_holes": "依赖既有端壁孔列实体",
+    "EndWallHolesLine.disable_skewness_control_inside_holes": "依赖既有端壁孔列实体",
+    "EndWallHolesLine.enable_skewness_control_arround_holes": "依赖既有端壁孔列实体",
+    "EndWallHolesLine.disable_skewness_control_arround_holes": "依赖既有端壁孔列实体",
+    "PinFinsLine.enable_skewness_control_inside_holes": "依赖既有冷却通道与 pin-fins 实体",
+    "PinFinsLine.disable_skewness_control_inside_holes": "依赖既有冷却通道与 pin-fins 实体",
+    "PinFinsLine.enable_skewness_control_arround_holes": "依赖既有冷却通道与 pin-fins 实体",
+    "PinFinsLine.disable_skewness_control_arround_holes": "依赖既有冷却通道与 pin-fins 实体",
+}
+
+# 仅描述“已显式提供多个控制时”的依赖和值要求；除 B2B topology 外，
+# 普通 CLI 不会据此自动注入控制。campaign runner 使用该映射构造匹配上下文，
+# resolve_control_requests() 则使用键依赖保证同阶段调用顺序正确。
+CONTROL_PREREQUISITES: dict[str, tuple[tuple[str, Any], ...]] = {
+    "blade/edge_treatment.leading_blend": (
+        ("blade/edge_treatment.leading_blunt", True),
+    ),
+    "blade/edge_treatment.trailing_blend": (
+        ("blade/edge_treatment.trailing_blunt", True),
+    ),
+    "row/downstream.untwist_location": (("row/downstream.untwist", True),),
+    "row/upstream.untwist_location": (("row/upstream.untwist", True),),
+    "row/target_points": (("row/mesh_level", "user"),),
+    "row/optimization.freeze_skin": (("row/optimization.steps", 200),),
+    "row/optimization.full_multigrid_steps": (("row/optimization.multigrid", True),),
+    "row/optimization.nmb": (
+        ("blade/b2b.default.periodicity", "non_matching"),
+        ("row/optimization.steps", 200),
+    ),
+    "row/optimization.orthogonality": (("row/optimization.steps", 200),),
+    "row/optimization.skewness": (("row/optimization.steps", 200),),
+    "row/optimization.wake": (
+        ("blade/b2b.default.wake_control", True),
+        ("row/optimization.steps", 200),
+    ),
+    "blade/b2b.default.azimuthal_inlet_down_points": (
+        ("blade/b2b.default.type", "rounded_azimuthal"),
+    ),
+    "blade/b2b.default.azimuthal_inlet_points": (
+        ("blade/b2b.default.type", "rounded_azimuthal"),
+    ),
+    "blade/b2b.default.azimuthal_inlet_up_points": (
+        ("blade/b2b.default.type", "rounded_azimuthal"),
+    ),
+    "blade/b2b.default.azimuthal_outlet_down_points": (
+        ("blade/b2b.default.type", "rounded_azimuthal"),
+    ),
+    "blade/b2b.default.azimuthal_outlet_points": (
+        ("blade/b2b.default.type", "rounded_azimuthal"),
+    ),
+    "blade/b2b.default.azimuthal_outlet_up_points": (
+        ("blade/b2b.default.type", "rounded_azimuthal"),
+    ),
+    "blade/b2b.default.fix_inlet_angle": (("blade/b2b.default.type", "streamwise"),),
+    "blade/b2b.default.fix_inlet_mesh": (
+        ("blade/b2b.default.type", "streamwise"),
+        ("blade/b2b.default.free_inlet_angle", False),
+    ),
+    "blade/b2b.default.fix_outlet_angle": (("blade/b2b.default.type", "streamwise"),),
+    "blade/b2b.default.fix_outlet_mesh": (
+        ("blade/b2b.default.type", "streamwise"),
+        ("blade/b2b.default.free_outlet_angle", False),
+    ),
+    "blade/b2b.default.free_inlet_angle": (("blade/b2b.default.type", "streamwise"),),
+    "blade/b2b.default.free_outlet_angle": (("blade/b2b.default.type", "streamwise"),),
+    "blade/b2b.default.high_stagger_detection": (
+        ("blade/b2b.default.type", "streamwise"),
+        ("blade/b2b.default.high_stagger_optimization", True),
+    ),
+    "blade/b2b.default.high_stagger_optimization": (
+        ("blade/b2b.default.type", "streamwise"),
+    ),
+    "blade/b2b.default.inlet_angle": (
+        ("blade/b2b.default.type", "streamwise"),
+        ("blade/b2b.default.free_inlet_angle", False),
+    ),
+    "blade/b2b.default.inlet_stagger": (
+        ("blade/b2b.default.type", "streamwise"),
+        ("blade/b2b.default.high_stagger_optimization", True),
+        ("blade/b2b.default.high_stagger_detection", False),
+    ),
+    "blade/b2b.default.outlet_angle": (
+        ("blade/b2b.default.type", "streamwise"),
+        ("blade/b2b.default.free_outlet_angle", False),
+    ),
+    "blade/b2b.default.outlet_stagger": (
+        ("blade/b2b.default.type", "streamwise"),
+        ("blade/b2b.default.high_stagger_optimization", True),
+        ("blade/b2b.default.high_stagger_detection", False),
+    ),
+    "blade/b2b.default.periodicity": (("blade/b2b.default.type", "streamwise"),),
+    "blade/b2b.default.streamwise_inlet_points": (
+        ("blade/b2b.default.type", "streamwise"),
+    ),
+    "blade/b2b.default.streamwise_outlet_points": (
+        ("blade/b2b.default.type", "streamwise"),
+    ),
+    "blade/b2b.default.streamwise_pressure_points": (
+        ("blade/b2b.default.type", "streamwise"),
+    ),
+    "blade/b2b.default.streamwise_suction_points": (
+        ("blade/b2b.default.type", "streamwise"),
+    ),
+    "blade/b2b.default.throat_points": (("blade/b2b.default.type", "streamwise"),),
+    "blade/b2b.default.throat_projection_type": (
+        ("blade/b2b.default.type", "streamwise"),
+        ("blade/b2b.default.throat_points", 9),
+    ),
+    "blade/b2b.default.throat_inlet_relaxation": (
+        ("blade/b2b.default.type", "streamwise"),
+        ("blade/b2b.default.throat_points", 9),
+    ),
+    "blade/b2b.default.throat_outlet_relaxation": (
+        ("blade/b2b.default.type", "streamwise"),
+        ("blade/b2b.default.throat_points", 9),
+    ),
+    "blade/b2b.default.wake_control": (("blade/b2b.default.type", "streamwise"),),
+    "blade/b2b.default.wake_deviation_angle": (
+        ("blade/b2b.default.type", "streamwise"),
+        ("blade/b2b.default.wake_control", True),
+    ),
+    "blade/b2b.default.wake_prolongation": (
+        ("blade/b2b.default.type", "streamwise"),
+        ("blade/b2b.default.wake_control", True),
+    ),
+    "blade/b2b.hoh.inlet_extension_location": (
+        ("blade/b2b.hoh.inlet_extension", True),
+    ),
+    "blade/b2b.hoh.inlet_extension_streamwise_points": (
+        ("blade/b2b.hoh.inlet_extension", True),
+    ),
+    "blade/b2b.hoh.inlet_extension_type": (
+        ("blade/b2b.hoh.inlet_extension", True),
+    ),
+    "blade/b2b.hoh.outlet_extension_location": (
+        ("blade/b2b.hoh.outlet_extension", True),
+    ),
+    "blade/b2b.hoh.outlet_extension_streamwise_points": (
+        ("blade/b2b.hoh.outlet_extension", True),
+    ),
+    "blade/b2b.hoh.outlet_extension_type": (
+        ("blade/b2b.hoh.outlet_extension", True),
+    ),
+    "blade/b2b.hoh.leading_edge_absolute_distance": (
+        ("blade/b2b.hoh.leading_edge_control_type", "absolute_distance"),
+    ),
+    "blade/b2b.hoh.leading_edge_cell_length": (
+        ("blade/b2b.hoh.leading_edge_control_type", "cell_length"),
+    ),
+    "blade/b2b.hoh.leading_edge_relative_distance": (
+        ("blade/b2b.hoh.leading_edge_control_type", "relative_distance"),
+    ),
+    "blade/b2b.hoh.trailing_edge_absolute_distance": (
+        ("blade/b2b.hoh.trailing_edge_control_type", "absolute_distance"),
+    ),
+    "blade/b2b.hoh.trailing_edge_cell_length": (
+        ("blade/b2b.hoh.trailing_edge_control_type", "cell_length"),
+    ),
+    "blade/b2b.hoh.trailing_edge_relative_distance": (
+        ("blade/b2b.hoh.trailing_edge_control_type", "relative_distance"),
+    ),
+    "blade/b2b.hi.clustering_relaxation": (
+        ("blade/b2b.hi.automatic_clustering_relaxation", False),
+    ),
+    "blade/b2b.hi.h_inlet": (("blade/b2b.hi.h_full", False),),
+    "blade/b2b.hi.h_outlet": (("blade/b2b.hi.h_full", False),),
+    "blade/b2b.hi.streamwise_blade_inlet_pressure_points": (
+        ("blade/b2b.hi.h_inlet", True),
+    ),
+    "blade/b2b.hi.streamwise_blade_inlet_suction_points": (
+        ("blade/b2b.hi.h_inlet", True),
+    ),
+    "blade/b2b.hi.streamwise_blade_outlet_pressure_points": (
+        ("blade/b2b.hi.h_outlet", True),
+    ),
+    "blade/b2b.hi.streamwise_blade_outlet_suction_points": (
+        ("blade/b2b.hi.h_outlet", True),
+    ),
+    "blade/b2b.hi.streamwise_blade_pressure_points": (
+        ("blade/b2b.hi.h_full", True),
+    ),
+    "blade/b2b.hi.streamwise_blade_suction_points": (
+        ("blade/b2b.hi.h_full", True),
+    ),
+    "blade/b2b.hi.streamwise_previous_blade_suction_points": (
+        ("blade/b2b.hi.h_full", True),
+    ),
+    "stagnation-point/desired_expansion_ratio": (
+        ("stagnation-point/distribution_from_expansion_ratio", True),
+    ),
+    "stagnation-point/distribution_absolute_distance": (
+        ("stagnation-point/distribution_from_expansion_ratio", False),
+        ("stagnation-point/distribution_type", "absolute_distance"),
+    ),
+    "stagnation-point/distribution_cell_length": (
+        ("stagnation-point/distribution_from_expansion_ratio", False),
+        ("stagnation-point/distribution_type", "cell_length"),
+    ),
+    "stagnation-point/distribution_relative_distance": (
+        ("stagnation-point/distribution_from_expansion_ratio", False),
+        ("stagnation-point/distribution_type", "relative_distance"),
+    ),
+    "stagnation-point/distribution_type": (
+        ("stagnation-point/distribution_from_expansion_ratio", False),
+    ),
+}
+
+
+def _control_dependency_depth(key: str, trail: tuple[str, ...] = ()) -> int:
+    """计算控制键在同阶段调用中的依赖深度，并检测循环依赖。"""
+
+    if key in trail:
+        cycle = " -> ".join(trail + (key,))
+        raise RuntimeError(f"控制前置条件存在循环：{cycle}")
+    prerequisites = CONTROL_PREREQUISITES.get(key, ())
+    if not prerequisites:
+        return 0
+    same_stage_depths = [
+        _control_dependency_depth(prerequisite_key, trail + (key,))
+        for prerequisite_key, _ in prerequisites
+        if (
+            prerequisite_key in CONTROL_REGISTRY
+            and CONTROL_REGISTRY[prerequisite_key].stage == CONTROL_REGISTRY[key].stage
+        )
+    ]
+    return 1 + max(same_stage_depths, default=-1)
+
+
+CONTROL_DEPENDENCY_DEPTH: dict[str, int] = {
+    key: _control_dependency_depth(key) for key in CONTROL_REGISTRY
+}
+
+if GENERAL_CONTROL_KEYS | frozenset(GENERAL_CONTROL_EXCLUSIONS) != frozenset(CONTROL_REGISTRY):
+    raise RuntimeError("通用控制集合与排除集合未完整覆盖注册表")
+if GENERAL_CONTROL_KEYS & frozenset(GENERAL_CONTROL_EXCLUSIONS):
+    raise RuntimeError("通用控制集合与排除集合存在重叠")
+for _dependent_key, _prerequisites in CONTROL_PREREQUISITES.items():
+    if _dependent_key not in CONTROL_REGISTRY:
+        raise RuntimeError(f"未知依赖控制键：{_dependent_key}")
+    for _prerequisite_key, _required_value in _prerequisites:
+        if _prerequisite_key not in CONTROL_REGISTRY:
+            raise RuntimeError(f"未知前置控制键：{_prerequisite_key}")
+        if STAGE_ORDER[CONTROL_REGISTRY[_prerequisite_key].stage] > STAGE_ORDER[CONTROL_REGISTRY[_dependent_key].stage]:
+            raise RuntimeError(
+                f"前置控制 {_prerequisite_key} 的阶段晚于 {_dependent_key}"
+            )
+
+
 # setter 审计：映射项来自注册表，排除规则只用于审计，绝不参与运行时调用。
 CONTROL_TARGET_OWNERS: dict[str, tuple[str, ...]] = {
     "configuration": ("",),
@@ -2069,18 +2499,20 @@ def resolve_control_requests(
 
 def _topology_sort_key(
     item: tuple[ControlRequest, tuple[TargetEntity, ...]],
-) -> tuple[int, str, int, str]:
-    """排序键：阶段 → 目标 → 拓扑选择器优先 → 键名。
+) -> tuple[int, int, int, str, str]:
+    """排序键：阶段 → 拓扑选择器 → 依赖深度 → 目标 → 键名。
 
     确保 blade/b2b.topology 在同一阶段、同一目标内永远先于
-    b2b.default.* / b2b.hoh.* / b2b.hi.* 等条件子参数。
+    b2b.default.* / b2b.hoh.* / b2b.hi.* 等条件子参数，同时保证
+    type/mode/enable 等已显式提供的前置控制先于依赖值。
     """
     request, target = item
     stage_order = STAGE_ORDER[request.spec.stage]
     target_path = "/".join(part.name for part in target)
     # 拓扑选择器优先级最高（0），其他控制为 1。
     is_topo_selector = 0 if request.key == TOPOLOGY_SELECTOR_KEY else 1
-    return (stage_order, target_path, is_topo_selector, request.key)
+    dependency_depth = CONTROL_DEPENDENCY_DEPTH.get(request.key, 0)
+    return (stage_order, is_topo_selector, dependency_depth, target_path, request.key)
 
 
 def _ensure_topology_selectors(
@@ -2299,9 +2731,25 @@ __all__ = [
     "COMMON_KEYS",
     "COMMON_TOPOLOGY_KEYS",
     "CONDITIONAL_KEY_TOPOLOGY",
+    "CONTROL_DEPENDENCY_DEPTH",
+    "CONTROL_PREREQUISITES",
     "CONTROL_REGISTRY",
     "CONTROL_TARGET_OWNERS",
     "EXCLUDED_SETTERS",
+    "GENERAL_API_ONLY_EXCLUSIONS",
+    "GENERAL_CONFIGURATION_KEYS",
+    "GENERAL_CONTROL_EXCLUSIONS",
+    "GENERAL_CONTROL_KEYS",
+    "GENERAL_CORE_KEYS",
+    "GENERAL_DEFAULT_KEYS",
+    "GENERAL_EDGE_TREATMENT_KEYS",
+    "GENERAL_HI_KEYS",
+    "GENERAL_HOH_KEYS",
+    "GENERAL_INTERFACE_KEYS",
+    "GENERAL_ROW_KEYS",
+    "GENERAL_STAGNATION_POINT_KEYS",
+    "GENERAL_TOPOLOGY_KEYS",
+    "GENERAL_WIZARD_KEYS",
     "MAPPED_SETTERS",
     "MAPPED_SETTERS_BY_OWNER",
     "PRIORITIES",

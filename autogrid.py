@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import ctypes
+import hashlib
 import os
 import json
 import shutil
+import struct
 import subprocess
 import sys
 import re
@@ -16,6 +19,8 @@ from controls import CONTROL_REGISTRY, MAPPED_SETTERS, _ALL_KNOWN_SETTERS, Resol
 
 
 CONTROL_RESULT_MARKER = "AGMESH_CONTROL_RESULT:"
+CONTROL_POST_RESULT_MARKER = "AGMESH_CONTROL_POST_RESULT:"
+MESH_FINGERPRINT_FILE = "mesh_fingerprint.json"
 
 
 @dataclass(frozen=True)
@@ -29,6 +34,8 @@ class AutoGridRun:
     outputs: dict[str, str]
     control_results: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
+    post_control_results: list[dict[str, Any]] = field(default_factory=list)
+    mesh_fingerprint: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """将运行记录转换为可序列化字典。"""
@@ -46,6 +53,7 @@ def run_autogrid_init(
     dry_run: bool = False,
     timeout_seconds: int | None = None,
     controls: Sequence[ResolvedControl] = (),
+    mesh_fingerprint: bool = False,
 ) -> AutoGridRun:
     """生成 AutoGrid 脚本并按配置执行或仅进行 dry-run。"""
 
@@ -64,6 +72,7 @@ def run_autogrid_init(
             output_prefix=output_prefix,
             use_row_wizard=use_row_wizard,
             controls=controls,
+            mesh_fingerprint=mesh_fingerprint,
         ),
         encoding="utf-8",
     )
@@ -85,6 +94,8 @@ def run_autogrid_init(
             outputs={},
             control_results=[control.to_dict() for control in controls],
             error=None,
+            post_control_results=[],
+            mesh_fingerprint=None,
         )
 
     try:
@@ -115,12 +126,42 @@ def run_autogrid_init(
     (run_path / "stderr.log").write_text(stderr, encoding="utf-8")
     outputs = collect_outputs(run_path, output_prefix)
     parsed_events = parse_control_results(stdout)
+    parsed_post_events = parse_control_results(stdout, marker=CONTROL_POST_RESULT_MARKER)
     control_results = merge_control_results(controls, parsed_events)
+    post_control_results = merge_post_control_results(controls, parsed_post_events)
+    fingerprint_data = None
+    if (
+        mesh_fingerprint
+        and process_returncode == 0
+        and "cgns" in outputs
+    ):
+        try:
+            fingerprint_data = fingerprint_cgns_coordinates(
+                outputs["cgns"],
+                hdf5_dll=Path(command[0]).resolve().parent / "hdf5dll.dll",
+            )
+            (run_path / MESH_FINGERPRINT_FILE).write_text(
+                json.dumps(
+                    fingerprint_data,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            runner_error = (
+                f"完整 CGNS 坐标指纹生成失败：{type(exc).__name__}: {exc}"
+            )
     failed_control = next((event for event in parsed_events if event.get("status") == "failed"), None)
     script_error = _script_error(stderr)
     effective_returncode = process_returncode
     if effective_returncode == 0 and (failed_control is not None or script_error is not None):
         effective_returncode = 1
+    if effective_returncode == 0 and mesh_fingerprint and fingerprint_data is None:
+        effective_returncode = 1
+        if runner_error is None:
+            runner_error = runner_error or "已请求网格指纹，但未生成 mesh_fingerprint.json"
     if runner_error is None and failed_control is not None:
         runner_error = failed_control.get("error") or "AutoGrid 控制应用失败"
     if runner_error is None and script_error is not None:
@@ -133,6 +174,8 @@ def run_autogrid_init(
         outputs={key: str(value) for key, value in outputs.items()},
         control_results=control_results,
         error=runner_error,
+        post_control_results=post_control_results,
+        mesh_fingerprint=fingerprint_data,
     )
 
 
@@ -142,6 +185,7 @@ def render_autogrid_script(
     output_prefix: str = "mesh",
     use_row_wizard: bool = True,
     controls: Sequence[ResolvedControl | dict[str, Any]] = (),
+    mesh_fingerprint: bool = False,
 ) -> str:
     """渲染可由 IGG 执行的 AutoGrid Python 脚本文本。"""
 
@@ -158,6 +202,7 @@ GEOMTURBO_FILE = r"{Path(geomturbo_path)}"
 OUTPUT_PREFIX = r"{output_prefix}"
 USE_ROW_WIZARD = {bool(use_row_wizard)!r}
 CONTROL_RESULT_MARKER = {CONTROL_RESULT_MARKER!r}
+CONTROL_POST_RESULT_MARKER = {CONTROL_POST_RESULT_MARKER!r}
 CONTROL_PLAN = json.loads({control_plan_json!r})
 
 
@@ -404,7 +449,14 @@ def _readback(control, target):
     return getter()
 
 
-def _emit_control(control, status, readback=None, error=None):
+def _emit_control(
+    control,
+    status,
+    readback=None,
+    error=None,
+    readback_before=None,
+    readback_before_error=None,
+):
     event = {{
         "id": control.get("id"),
         "key": control.get("key"),
@@ -414,6 +466,8 @@ def _emit_control(control, status, readback=None, error=None):
         "status": status,
         "readback": readback,
         "error": error,
+        "readback_before": readback_before,
+        "readback_before_error": readback_before_error,
     }}
     print(CONTROL_RESULT_MARKER + json.dumps(event, sort_keys=True))
 
@@ -422,6 +476,15 @@ def _apply_control(control):
     try:
         target = _resolve_target(control)
         _check_topology(control, target)
+        readback_before = None
+        readback_before_error = None
+        if control.get("getter"):
+            try:
+                readback_before = _readback(control, target)
+            except Exception as getter_exc:
+                readback_before_error = (
+                    _safe_text(getter_exc.__class__.__name__) + u": " + _safe_text(getter_exc)
+                )
         _invoke_control(control, target)
         readback_error = None
         try:
@@ -429,7 +492,14 @@ def _apply_control(control):
         except Exception as getter_exc:
             readback = None
             readback_error = _safe_text(getter_exc.__class__.__name__) + u": " + _safe_text(getter_exc)
-        _emit_control(control, "applied", readback, readback_error)
+        _emit_control(
+            control,
+            "applied",
+            readback,
+            readback_error,
+            readback_before,
+            readback_before_error,
+        )
     except Exception as exc:
         message = _safe_text(exc.__class__.__name__) + u": " + _safe_text(exc)
         _emit_control(control, "failed", None, message)
@@ -452,6 +522,29 @@ def _generate_row_wizards():
         if not callable(generate):
             raise RuntimeError(u"缺少 AutoGrid 17.1 RowWizard.generate")
         generate()
+
+
+def _emit_post_generation_readbacks():
+    for control in CONTROL_PLAN:
+        event = {{
+            "id": control.get("id"),
+            "key": control.get("key"),
+            "target_path": control.get("target_path"),
+            "requested": control.get("requested"),
+            "project_value": control.get("project_value"),
+            "status": "no_getter",
+            "readback": None,
+            "error": None,
+        }}
+        try:
+            if control.get("getter"):
+                target = _resolve_target(control)
+                event["readback"] = _readback(control, target)
+                event["status"] = "readback"
+        except Exception as exc:
+            event["status"] = "failed"
+            event["error"] = _safe_text(exc.__class__.__name__) + u": " + _safe_text(exc)
+        print(CONTROL_POST_RESULT_MARKER + json.dumps(event, sort_keys=True))
 
 
 _require_global("a5_new_project")(1)
@@ -484,6 +577,8 @@ _require_global("a5_save_project")(_TRB_OUT)
 _require_global("a5_generate_flow_paths")()
 _require_global("a5_generate_b2b")()
 _require_global("a5_generate_3d")()
+
+_emit_post_generation_readbacks()
 
 _require_global("a5_save_project")(_TRB_OUT)
 _require_global("a5_save_mesh")(_IGG_OUT)
@@ -519,15 +614,19 @@ def _serialize_control_plan(
     return serialized
 
 
-def parse_control_results(stdout: str) -> list[dict[str, Any]]:
+def parse_control_results(
+    stdout: str,
+    *,
+    marker: str = CONTROL_RESULT_MARKER,
+) -> list[dict[str, Any]]:
     """从 IGG 标准输出中解析网格控制应用结果。"""
 
     results: list[dict[str, Any]] = []
     for line in stdout.splitlines():
-        marker_index = line.find(CONTROL_RESULT_MARKER)
+        marker_index = line.find(marker)
         if marker_index < 0:
             continue
-        payload = line[marker_index + len(CONTROL_RESULT_MARKER) :].strip()
+        payload = line[marker_index + len(marker) :].strip()
         try:
             value = json.loads(payload)
         except json.JSONDecodeError:
@@ -535,6 +634,32 @@ def parse_control_results(stdout: str) -> list[dict[str, Any]]:
         if isinstance(value, dict) and value.get("id"):
             results.append(value)
     return results
+
+
+def merge_post_control_results(
+    controls: Sequence[ResolvedControl],
+    events: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """将生成后的 getter 回读与原控制计划合并。"""
+
+    event_by_id = {str(event.get("id")): dict(event) for event in events}
+    merged: list[dict[str, Any]] = []
+    for control in controls:
+        event = event_by_id.get(control.control_id)
+        if event is None:
+            merged.append(
+                {
+                    "id": control.control_id,
+                    "key": control.key,
+                    "target_path": control.target_path,
+                    "status": "not_observed",
+                    "readback": None,
+                    "error": "未收到生成后控制回读标记",
+                }
+            )
+        else:
+            merged.append(event)
+    return merged
 
 
 def merge_control_results(
@@ -552,14 +677,379 @@ def merge_control_results(
             data.update(
                 {
                     "status": event.get("status", "failed"),
+                    "readback_before": event.get("readback_before"),
+                    "readback_before_error": event.get("readback_before_error"),
                     "readback": event.get("readback"),
                     "error": event.get("error"),
                 }
             )
         else:
-            data.update({"status": "not_applied", "readback": None, "error": "未收到 AutoGrid 控制结果标记"})
+            data.update(
+                {
+                    "status": "not_applied",
+                    "readback_before": None,
+                    "readback_before_error": None,
+                    "readback": None,
+                    "error": "未收到 AutoGrid 控制结果标记",
+                }
+            )
         merged.append(data)
     return merged
+
+
+def fingerprint_cgns_coordinates(
+    cgns_path: str | Path,
+    *,
+    hdf5_dll: str | Path,
+) -> dict[str, Any]:
+    """用厂商 HDF5 DLL 元数据定位并哈希 CGNS 中全部 block 坐标。
+
+    AutoGrid 17.1 的 CGNS 坐标数据集是未压缩、连续存储的 Float64 数组。
+    本函数只使用标准库 ``ctypes`` 和 AutoGrid 随附的 ``hdf5dll.dll``；
+    DLL 仅用于可靠取得数据集维度和文件偏移，坐标字节由 Python 流式读取。
+    """
+
+    mesh_path = Path(cgns_path).resolve()
+    dll_path = Path(hdf5_dll).resolve()
+    if not mesh_path.exists():
+        raise OSError(f"CGNS 文件不存在：{mesh_path}")
+    if not dll_path.exists():
+        raise OSError(f"找不到 AutoGrid HDF5 DLL：{dll_path}")
+
+    dll_directory = None
+    add_dll_directory = getattr(os, "add_dll_directory", None)
+    if callable(add_dll_directory):
+        dll_directory = add_dll_directory(str(dll_path.parent))
+    try:
+        library = ctypes.CDLL(str(dll_path))
+        _configure_hdf5_api(library)
+        library.H5open()
+        # 禁止“尝试打开普通数据集为 group”时向 stderr 打印 HDF5 error stack。
+        if hasattr(library, "H5Eset_auto2"):
+            library.H5Eset_auto2(0, None, None)
+        file_id = library.H5Fopen(os.fsencode(str(mesh_path)), 0, 0)
+        if file_id < 0:
+            raise RuntimeError(f"H5Fopen 失败：{mesh_path}")
+        try:
+            blocks = _discover_cgns_coordinate_blocks(library, file_id, mesh_path)
+        finally:
+            library.H5Fclose(file_id)
+    finally:
+        if dll_directory is not None:
+            dll_directory.close()
+
+    if not blocks:
+        raise RuntimeError("CGNS 中未找到 GridCoordinates/CoordinateX,Y,Z")
+    normalized = json.dumps(
+        blocks,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "schema_version": 1,
+        "algorithm": "sha256",
+        "coordinate_capture": "CGNS/HDF5 contiguous CoordinateX,Y,Z",
+        "metadata_reader": str(dll_path),
+        "number_of_blocks": len(blocks),
+        "total_block_points": sum(block["point_count"] for block in blocks),
+        "total_block_cells": sum(block["cell_count"] for block in blocks),
+        "aggregate_sha256": hashlib.sha256(normalized).hexdigest(),
+        "blocks": blocks,
+    }
+
+
+def _configure_hdf5_api(library: Any) -> None:
+    """声明本任务用到的最小 HDF5 1.8 C API。"""
+
+    hid_t = ctypes.c_longlong
+    hsize_t = ctypes.c_ulonglong
+    library.H5open.argtypes = []
+    library.H5open.restype = ctypes.c_int
+    library.H5Fopen.argtypes = [ctypes.c_char_p, ctypes.c_uint, hid_t]
+    library.H5Fopen.restype = hid_t
+    library.H5Fclose.argtypes = [hid_t]
+    library.H5Fclose.restype = ctypes.c_int
+    library.H5Gopen2.argtypes = [hid_t, ctypes.c_char_p, hid_t]
+    library.H5Gopen2.restype = hid_t
+    library.H5Gclose.argtypes = [hid_t]
+    library.H5Gclose.restype = ctypes.c_int
+    library.H5Gget_num_objs.argtypes = [hid_t, ctypes.POINTER(hsize_t)]
+    library.H5Gget_num_objs.restype = ctypes.c_int
+    library.H5Gget_objname_by_idx.argtypes = [
+        hid_t,
+        hsize_t,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    library.H5Gget_objname_by_idx.restype = ctypes.c_ssize_t
+    library.H5Dopen2.argtypes = [hid_t, ctypes.c_char_p, hid_t]
+    library.H5Dopen2.restype = hid_t
+    library.H5Dclose.argtypes = [hid_t]
+    library.H5Dclose.restype = ctypes.c_int
+    library.H5Dget_space.argtypes = [hid_t]
+    library.H5Dget_space.restype = hid_t
+    library.H5Dget_offset.argtypes = [hid_t]
+    library.H5Dget_offset.restype = ctypes.c_ulonglong
+    library.H5Dget_storage_size.argtypes = [hid_t]
+    library.H5Dget_storage_size.restype = hsize_t
+    library.H5Sget_simple_extent_ndims.argtypes = [hid_t]
+    library.H5Sget_simple_extent_ndims.restype = ctypes.c_int
+    library.H5Sget_simple_extent_dims.argtypes = [
+        hid_t,
+        ctypes.POINTER(hsize_t),
+        ctypes.POINTER(hsize_t),
+    ]
+    library.H5Sget_simple_extent_dims.restype = ctypes.c_int
+    library.H5Sclose.argtypes = [hid_t]
+    library.H5Sclose.restype = ctypes.c_int
+    if hasattr(library, "H5Eset_auto2"):
+        library.H5Eset_auto2.argtypes = [hid_t, ctypes.c_void_p, ctypes.c_void_p]
+        library.H5Eset_auto2.restype = ctypes.c_int
+
+
+def _hdf_group_names(library: Any, group_id: int) -> list[str]:
+    count = ctypes.c_ulonglong()
+    if library.H5Gget_num_objs(group_id, ctypes.byref(count)) < 0:
+        return []
+    names: list[str] = []
+    for index in range(int(count.value)):
+        buffer = ctypes.create_string_buffer(8192)
+        length = library.H5Gget_objname_by_idx(
+            group_id,
+            ctypes.c_ulonglong(index),
+            buffer,
+            ctypes.sizeof(buffer),
+        )
+        if length >= 0:
+            names.append(buffer.value.decode("utf-8", errors="replace"))
+    return names
+
+
+def _open_hdf_group(library: Any, location_id: int, path: str) -> int | None:
+    group_id = library.H5Gopen2(location_id, path.encode("utf-8"), 0)
+    return int(group_id) if group_id >= 0 else None
+
+
+def _hdf_dataset_info(
+    library: Any,
+    file_id: int,
+    path: str,
+) -> dict[str, Any] | None:
+    dataset_id = library.H5Dopen2(file_id, path.encode("utf-8"), 0)
+    if dataset_id < 0:
+        return None
+    try:
+        space_id = library.H5Dget_space(dataset_id)
+        if space_id < 0:
+            return None
+        try:
+            rank = int(library.H5Sget_simple_extent_ndims(space_id))
+            if rank < 1:
+                return None
+            dimensions = (ctypes.c_ulonglong * rank)()
+            if library.H5Sget_simple_extent_dims(space_id, dimensions, None) < 0:
+                return None
+            shape = [int(dimensions[index]) for index in range(rank)]
+        finally:
+            library.H5Sclose(space_id)
+        offset = int(library.H5Dget_offset(dataset_id))
+        storage_bytes = int(library.H5Dget_storage_size(dataset_id))
+    finally:
+        library.H5Dclose(dataset_id)
+    if offset == (1 << 64) - 1 or storage_bytes <= 0:
+        return None
+    return {
+        "shape": shape,
+        "offset": offset,
+        "storage_bytes": storage_bytes,
+    }
+
+
+def _discover_cgns_coordinate_blocks(
+    library: Any,
+    file_id: int,
+    mesh_path: Path,
+) -> list[dict[str, Any]]:
+    root_id = _open_hdf_group(library, file_id, "/")
+    if root_id is None:
+        raise RuntimeError("无法打开 CGNS HDF5 根 group")
+    coordinate_blocks: list[dict[str, Any]] = []
+    try:
+        for base_name in _hdf_group_names(library, root_id):
+            base_path = "/" + base_name
+            base_id = _open_hdf_group(library, file_id, base_path)
+            if base_id is None:
+                continue
+            try:
+                for zone_name in _hdf_group_names(library, base_id):
+                    zone_path = base_path + "/" + zone_name
+                    zone_id = _open_hdf_group(library, file_id, zone_path)
+                    if zone_id is None:
+                        continue
+                    try:
+                        if "GridCoordinates" not in _hdf_group_names(library, zone_id):
+                            continue
+                    finally:
+                        library.H5Gclose(zone_id)
+                    axes: list[dict[str, Any]] = []
+                    for axis in ("CoordinateX", "CoordinateY", "CoordinateZ"):
+                        dataset_path = (
+                            zone_path
+                            + "/GridCoordinates/"
+                            + axis
+                            + "/ data"
+                        )
+                        info = _hdf_dataset_info(library, file_id, dataset_path)
+                        if info is None:
+                            axes = []
+                            break
+                        axes.append({"axis": axis, **info})
+                    if axes:
+                        coordinate_blocks.append(
+                            _fingerprint_coordinate_block(
+                                mesh_path,
+                                index=len(coordinate_blocks) + 1,
+                                base_name=base_name,
+                                zone_name=zone_name,
+                                axes=axes,
+                            )
+                        )
+            finally:
+                library.H5Gclose(base_id)
+    finally:
+        library.H5Gclose(root_id)
+    coordinate_blocks.sort(key=lambda block: (block["base"], block["name"]))
+    for index, block in enumerate(coordinate_blocks, start=1):
+        block["index"] = index
+    return coordinate_blocks
+
+
+def _fingerprint_coordinate_block(
+    mesh_path: Path,
+    *,
+    index: int,
+    base_name: str,
+    zone_name: str,
+    axes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    shapes = {tuple(axis["shape"]) for axis in axes}
+    if len(shapes) != 1:
+        raise RuntimeError(f"{zone_name} 的 X/Y/Z 坐标维度不一致")
+    storage_shape = list(shapes.pop())
+    if len(storage_shape) != 3:
+        raise RuntimeError(f"{zone_name} 不是三维结构化 block：{storage_shape}")
+    point_count = math_product(storage_shape)
+    for axis in axes:
+        if axis["storage_bytes"] != point_count * 8:
+            raise RuntimeError(
+                f"{zone_name}/{axis['axis']} 不是连续未压缩 Float64 数据集"
+            )
+
+    digest = hashlib.sha256()
+    with mesh_path.open("rb") as stream:
+        for axis in axes:
+            digest.update(axis["axis"].encode("ascii"))
+            stream.seek(axis["offset"])
+            remaining = axis["storage_bytes"]
+            while remaining:
+                chunk = stream.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise OSError(f"读取 {zone_name}/{axis['axis']} 坐标时提前结束")
+                digest.update(chunk)
+                remaining -= len(chunk)
+        probes = _read_coordinate_probes(stream, storage_shape, axes)
+
+    # CGNS/HDF5 以 K,J,I 顺序报告 shape；对外统一记录 I,J,K。
+    size = list(reversed(storage_shape))
+    cell_count = math_product([max(value - 1, 0) for value in size])
+    return {
+        "index": index,
+        "base": base_name,
+        "name": zone_name,
+        "size": size,
+        "storage_shape": storage_shape,
+        "point_count": point_count,
+        "cell_count": cell_count,
+        "coordinate_sha256": digest.hexdigest(),
+        "coordinate_bytes": sum(axis["storage_bytes"] for axis in axes),
+        "coordinate_capture": "CGNS/HDF5 contiguous CoordinateX,Y,Z",
+        "samples": probes,
+    }
+
+
+def _read_coordinate_probes(
+    stream: Any,
+    storage_shape: list[int],
+    axes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    size_i, size_j, size_k = reversed(storage_shape)
+    center = (
+        1 + (size_i - 1) // 2,
+        1 + (size_j - 1) // 2,
+        1 + (size_k - 1) // 2,
+    )
+    indices = {
+        (i_value, j_value, k_value)
+        for i_value in (1, size_i)
+        for j_value in (1, size_j)
+        for k_value in (1, size_k)
+    }
+    indices.add(center)
+    for i_value in _fixed_probe_indices(size_i):
+        indices.add((i_value, center[1], center[2]))
+    for j_value in _fixed_probe_indices(size_j):
+        indices.add((center[0], j_value, center[2]))
+    for k_value in _fixed_probe_indices(size_k):
+        indices.add((center[0], center[1], k_value))
+
+    probes = []
+    for i_value, j_value, k_value in sorted(indices):
+        flat_index = (
+            (k_value - 1) * size_j * size_i
+            + (j_value - 1) * size_i
+            + (i_value - 1)
+        )
+        xyz = []
+        for axis in axes:
+            stream.seek(axis["offset"] + flat_index * 8)
+            raw = stream.read(8)
+            if len(raw) != 8:
+                raise OSError("读取固定位置坐标探针时提前结束")
+            xyz.append(struct.unpack("<d", raw)[0])
+        probes.append({"ijk": [i_value, j_value, k_value], "xyz": xyz})
+    return probes
+
+
+def _fixed_probe_indices(size: int) -> list[int]:
+    return sorted(
+        {
+            1,
+            size,
+            1 + (size - 1) // 4,
+            1 + (size - 1) // 2,
+            1 + 3 * (size - 1) // 4,
+        }
+    )
+
+
+def math_product(values: Sequence[int]) -> int:
+    result = 1
+    for value in values:
+        result *= int(value)
+    return result
+
+
+def _read_json_dict(path: Path) -> dict[str, Any] | None:
+    """读取由 IGG 诊断脚本写出的 JSON 字典。"""
+
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def _completed_text(value: str | bytes | None) -> str:
