@@ -1,0 +1,79 @@
+.note {
+  border-top: 1px solid var(--line);
+  background: #fff;
+}
+
+.note > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 11px 14px 8px;
+}
+
+.note header p {
+  margin: 0;
+  color: var(--teal);
+  font-size: 0.55rem;
+  font-weight: 850;
+  letter-spacing: 0.14em;
+}
+
+.note h2 {
+  margin: 1px 0 0;
+  font-size: 0.82rem;
+}
+
+.note header span,
+.note footer small {
+  color: #87949d;
+  font-size: 0.58rem;
+}
+
+.note textarea {
+  display: block;
+  width: calc(100% - 24px);
+  min-height: 98px;
+  margin: 0 12px;
+  padding: 9px;
+  resize: vertical;
+  border: 1px solid #d4dce0;
+  border-radius: 3px;
+  color: #2a3944;
+  background: #fcfdfd;
+  font-size: 0.68rem;
+  line-height: 1.55;
+}
+
+.note > p {
+  margin: 6px 12px 0;
+  color: var(--red);
+  font-size: 0.62rem;
+}
+
+.note > footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px 12px;
+}
+
+.note footer div {
+  display: flex;
+  gap: 5px;
+}
+
+.note footer button {
+  padding: 5px 7px;
+  border: 1px solid #d1d9dd;
+  border-radius: 3px;
+  color: #566670;
+  background: #fff;
+  font-size: 0.59rem;
+  cursor: pointer;
+}
+
+.note footer .save {
+  border-color: var(--teal);
+  color: #fff;
+  background: var(--teal);
+}

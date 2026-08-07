@@ -1,0 +1,154 @@
+.viewer {
+  display: grid;
+  height: 100%;
+  min-height: 0;
+  grid-template-rows: auto auto minmax(260px, 1fr);
+  color: #d9e3e8;
+  background: #09131c;
+}
+
+.viewer[data-compact="true"] {
+  grid-template-rows: auto minmax(230px, 1fr);
+}
+
+.tools {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  padding: 8px 11px;
+  border-bottom: 1px solid #263746;
+  background: #101e2a;
+}
+
+.tools > span {
+  margin-left: auto;
+  color: #8093a1;
+  font-family: Consolas, monospace;
+  font-size: 0.6rem;
+}
+
+.segmented {
+  display: flex;
+  padding: 2px;
+  border: 1px solid #344958;
+  border-radius: 3px;
+}
+
+.segmented button {
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 2px;
+  color: #94a5b1;
+  background: transparent;
+  font-size: 0.62rem;
+  cursor: pointer;
+}
+
+.segmented button[aria-pressed="true"] {
+  color: #e9f5f3;
+  background: #176a66;
+}
+
+.sliceToggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: #9aabb5;
+  font-size: 0.62rem;
+}
+
+.manifestControls {
+  padding: 7px 10px;
+  border-bottom: 1px solid #263746;
+  background: #0d1924;
+}
+
+.blocks {
+  display: flex;
+  overflow-x: auto;
+  gap: 12px;
+}
+
+.blocks label {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  color: #b7c4cc;
+  font-size: 0.6rem;
+}
+
+.blocks small { color: #657a88; }
+
+.sliceControls {
+  display: grid;
+  grid-template-columns: minmax(90px, 150px) 55px minmax(100px, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  margin-top: 7px;
+}
+
+.sliceControls select {
+  min-width: 0;
+  padding: 4px;
+  border: 1px solid #344958;
+  border-radius: 2px;
+  color: #c3d0d7;
+  background: #142430;
+  font-size: 0.6rem;
+}
+
+.sliceControls output {
+  color: #90a1ac;
+  font-size: 0.59rem;
+}
+
+.canvasWrap {
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.canvas,
+.canvas > div,
+.canvas canvas {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.canvasMessage,
+.unavailable {
+  display: grid;
+  min-height: 220px;
+  place-content: center;
+  gap: 7px;
+  padding: 28px;
+  color: #899aa6;
+  background:
+    linear-gradient(rgb(42 68 83 / 18%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(42 68 83 / 18%) 1px, transparent 1px),
+    #09131c;
+  background-size: 24px 24px;
+  font-size: 0.72rem;
+  text-align: center;
+}
+
+.canvasMessage {
+  position: absolute;
+  inset: 0;
+}
+
+.canvasMessage[data-error="true"] { color: #e5a6a6; }
+
+.unavailable strong {
+  color: #cfdae0;
+  font-size: 0.9rem;
+}
+
+.unavailable span { color: #a4b3bc; }
+
+.unavailable small {
+  max-width: 440px;
+  color: #71838e;
+  line-height: 1.5;
+}

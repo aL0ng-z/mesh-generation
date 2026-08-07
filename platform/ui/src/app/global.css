@@ -1,0 +1,75 @@
+:root {
+  color: #17212b;
+  background: #eef2f4;
+  font-family:
+    Inter, "Segoe UI", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  --ink: #17212b;
+  --muted: #62717d;
+  --line: #d6dde1;
+  --surface: #ffffff;
+  --surface-muted: #f5f7f8;
+  --navy: #0f1c2a;
+  --teal: #087b77;
+  --teal-dark: #05615e;
+  --blue: #246ba0;
+  --red: #b83c3c;
+  --amber: #a56608;
+  --green: #347554;
+  --shadow: 0 10px 36px rgb(21 35 47 / 8%);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-width: 320px;
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  min-height: 100vh;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button,
+a {
+  -webkit-tap-highlight-color: transparent;
+}
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 3px solid rgb(8 123 119 / 25%);
+  outline-offset: 2px;
+}
+
+button:disabled,
+input:disabled,
+select:disabled,
+textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+a {
+  color: inherit;
+}
+
+::selection {
+  color: #fff;
+  background: #087b77;
+}

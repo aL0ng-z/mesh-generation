@@ -20,7 +20,7 @@ from controls import (
     resolve_control_requests,
     validate_wizard_compatibility,
 )
-from geomturbo import parse_geomturbo
+from geomturbo import GeomTurboParseError, parse_geomturbo
 from quality import summarize_quality
 
 
@@ -98,7 +98,7 @@ def main() -> int:
         requests = _build_control_requests(args)
         validate_wizard_compatibility(requests, use_row_wizard=not args.no_row_wizard)
         resolved_controls = resolve_control_requests(requests, geometry)
-    except (ControlValidationError, OSError, UnicodeError) as exc:
+    except (ControlValidationError, GeomTurboParseError, OSError, UnicodeError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
 

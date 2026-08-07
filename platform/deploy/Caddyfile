@@ -1,0 +1,33 @@
+# 通过环境变量 MESH_HOST 覆盖内网域名，例如 mesh.lab.example.com。
+{$MESH_HOST:mesh.internal} {
+	encode zstd gzip
+
+	# 示例使用 Caddy 内部 CA。生产内网也可替换为组织签发的证书。
+	tls internal
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "same-origin"
+		-Server
+	}
+
+	# 默认略高于 API 的 512 MiB 文件上限，为 multipart 边界和表单字段留余量。
+	# 调整 MESH_MAX_UPLOAD_BYTES 时应同步设置 Caddy 进程的 MESH_MAX_REQUEST_BODY。
+	@geometry_upload {
+		method POST
+		path /api/v1/sessions
+	}
+	request_body @geometry_upload {
+		max_size {$MESH_MAX_REQUEST_BODY:540MB}
+	}
+
+	# FastAPI 同时提供 /api 与 React SPA；上传及 Range 下载均由反向代理透传。
+	reverse_proxy 127.0.0.1:8000 {
+		transport http {
+			read_timeout 35m
+			write_timeout 35m
+		}
+	}
+}

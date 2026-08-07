@@ -4,8 +4,17 @@ __pycache__/
 .env
 archive/
 geometries/
-tests/
-runs/
+/runs/
 .claude/
 
 PLAN.md
+
+# 内网平台本地依赖、构建和运行数据
+platform/.venv/
+platform/*.egg-info/
+platform/ui/node_modules/
+platform/ui/dist/
+platform/.pytest_cache/
+platform/**/*.sqlite
+platform/**/*.sqlite-shm
+platform/**/*.sqlite-wal

@@ -1,5 +1,39 @@
 # 开发日志
 
+## 2026-08-06：轻量可扩展内网网格经验平台 MVP
+
+### 分支与内核兼容
+
+- 从最新 `main` 创建 `feat/intranet-platform-mvp`，按 `docs/PLAN.md` 从零实现内网平台；未迁移旧在线数据，也未改变根目录 CLI 的既有调用方式。
+- `controls.py` 新增公开的 `enumerate_control_targets()`，网页端复用 CLI 对叶排、叶片、间隙、端壁等几何目标的适用性与精确 `#N` 选择器规则，默认排除无法从几何确认数量的静态占位目标。
+- `geomturbo.py` 改为单遍逐行解析元数据和叶排拓扑，避免合法大文件的 `read_text()` 与 `splitlines()` 内存峰值；同时限制单行、token/名称、嵌套深度、叶排/叶片实体数量，校验显式块配对，并让重复 gap/fillet 侧别保持 O(1) 状态；非有限数值降级为空值，越界输入稳定返回 `INVALID_GEOMTURBO`。Rotor37、WP100_comp、ori1 的结构化结果与旧实现逐项一致。
+- Web 依赖完全隔离在 `platform/`，根目录仍保持 Python >=3.7、仅标准库的运行边界；`.gitignore` 继续忽略可丢弃的 `runs/`，并取消对根目录 `tests/` 的历史忽略，使根回归、`platform/tests/` 和前端 `features/runs/` 均可随分支交付。
+
+### 后端、持久队列与安全边界
+
+- 新增 FastAPI API、Pydantic Schema、统一中文错误 envelope、React SPA 托管和显式 SQLite 迁移；SQLite 启用 WAL、外键、忙等待和在线备份。
+- 会话、baseline 与上传几何产物在同一事务中原子创建；运行树支持幂等分支、失败重试、乐观并发经验文本和满意运行冻结。数据库触发器限制状态跃迁，禁止修改或删除终态运行。
+- 独立 Worker 实现最多 20 个任务的持久调度、内存/磁盘门控、许可证失败退避、心跳、超时与僵尸修正；Windows 优先使用 Job Object 管理 IGG 进程树并保留 `taskkill /T` 降级。子进程启动后的数据库故障会立即终止进程树并回收流与任务槽。
+- 网格成功与预览后处理分离：`SUCCEEDED + PENDING` 可在 Worker 重启后恢复，manifest 请求不会并发触发第二次转换，会话冻结会拒绝仍在后处理的运行。
+- 上传入口在 ASGI `receive` 层按实际请求字节提前返回 413，Caddy 示例同步限制 multipart 请求体；空文件、解析失败或数据库失败会同时清理临时文件、未登记源文件和本次空会话目录。产物访问使用数据库登记与安全相对路径，支持规范的 Range/206/416，禁止目录穿越和 `/api` SPA 回退。
+- 备份使用 SQLite 在线快照、唯一目录和产物清单，排除活动数据库及 WAL/SHM；并发备份不会互相覆盖。
+
+### 真实网格预览与前端工作台
+
+- 使用 `h5py + numpy` 直接读取 HDF5 CGNS，预生成每个结构化 block 的真实表面与线框 VTP，并按 block、I/J/K、0 基索引原子生成和复用切片缓存；ADF 或转换失败只降级 Viewer，不改变网格任务状态。
+- 新增共享会话列表和专家工作台两个路由，覆盖上传、状态筛选、不可变运行树、P0/P1/P2 控制搜索与预检、质量、活动、产物、经验文本、冻结和 URL 状态恢复。
+- vtk.js Viewer 支持 block 显隐、表面/线框、I/J/K 切片和双轮同步对比；质量差值在浏览器端计算。修复 Vite 8 下 `xmlbuilder2` Node 入口导致的 vtk.js 运行时异常，生产构建显式使用其浏览器 UMD 入口。
+- 前端将 `SUCCEEDED + preview_status=PENDING` 视为活动后处理状态，持续轮询会话、运行与 manifest，直到 `READY/UNAVAILABLE` 终态。
+
+### 部署与验证
+
+- 提供锁定的 Python/Node 依赖、`.env.example`、Caddy 2.10+ HTTPS 示例、API/Worker 启动脚本和默认只预览的 Windows 启动任务安装脚本；同一数据库明确只部署一个 Worker。
+- Python 回归：根目录 17 项、平台 37 项全部通过；`pip check` 与 Python 编译检查通过。
+- 前端回归：Vitest 15 项、TypeScript、ESLint、Vite 生产构建全部通过。
+- 真实 baseline：Rotor37 为 9 block、1,464,289 点、质量 PASS；WP100_comp 为 4,239,316 点、质量 FAIL；ori1 为 2,744,343 点、质量 FAIL。三次网格命令均成功退出，验证质量 FAIL 与任务 FAILED 保持独立。
+- 使用 Playwright CLI 完成 Rotor37 浏览器闭环：上传、baseline、将 `row/optimization.steps` 设为 40 的控制分支、经验文本 v1、表面/线框/IJK 切片、双轮 Viewer 与 22 项质量差值、冻结及刷新恢复；所有网格预览请求返回 200，浏览器控制台 0 错误。
+- 未实际注册 Windows 启动任务、修改防火墙或启动 Caddy；这些外部系统变更继续由部署运维在确认主机、证书、许可证和账户权限后执行。
+
 ## 2026-07-25：网格控制验证结果文档完善
 
 - 将 156 项通用候选控制参数的完整分类写入

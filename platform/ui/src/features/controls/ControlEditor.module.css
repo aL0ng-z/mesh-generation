@@ -1,0 +1,262 @@
+.editor {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  background: #fff;
+}
+
+.editor > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.editor > header p {
+  margin: 0 0 2px;
+  color: var(--teal);
+  font-size: 0.57rem;
+  font-weight: 850;
+  letter-spacing: 0.14em;
+}
+
+.editor > header h2 {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.editor > header > span {
+  padding: 3px 7px;
+  border-radius: 99px;
+  color: #8d5b08;
+  background: #fff3d7;
+  font-size: 0.65rem;
+  font-weight: 700;
+}
+
+.frozen {
+  margin: 10px 12px 0;
+  padding: 8px 10px;
+  border-left: 3px solid #86949e;
+  color: #52616b;
+  background: #f0f3f4;
+  font-size: 0.7rem;
+}
+
+.filters {
+  display: grid;
+  gap: 7px;
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.filters > input,
+.filters select,
+.valueRow input,
+.valueRow select {
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid #cfd8dd;
+  border-radius: 3px;
+  color: #22323e;
+  background: #fff;
+  font-size: 0.7rem;
+}
+
+.filters > div {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.controlList {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  padding: 7px 10px 15px;
+}
+
+.controlList section > h3,
+.controlList summary {
+  margin: 0;
+  padding: 10px 3px 7px;
+  color: #4b5b66;
+  font-size: 0.68rem;
+  letter-spacing: 0.03em;
+}
+
+.controlList summary {
+  cursor: pointer;
+  font-weight: 750;
+}
+
+.controlList h3 span,
+.controlList summary span {
+  color: #96a1a8;
+  font-weight: 500;
+}
+
+.control {
+  margin-bottom: 6px;
+  padding: 9px;
+  border: 1px solid #dce2e5;
+  border-left: 3px solid #25867f;
+  border-radius: 3px;
+  background: #fff;
+}
+
+.control[data-availability="LOCKED"] {
+  border-left-color: #b2843d;
+  background: #fcfaf6;
+}
+
+.control[data-availability="NOT_APPLICABLE"] {
+  border-left-color: #adb6bc;
+  background: #f6f7f8;
+}
+
+.controlHead {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.controlHead > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.controlHead strong {
+  font-size: 0.73rem;
+}
+
+.controlHead code {
+  overflow: hidden;
+  color: #71808a;
+  font-size: 0.58rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.controlHead > span {
+  flex: 0 0 auto;
+  padding: 2px 5px;
+  border-radius: 2px;
+  color: #2e736f;
+  background: #e6f3f1;
+  font-size: 0.55rem;
+  font-weight: 750;
+}
+
+.control[data-availability="LOCKED"] .controlHead > span {
+  color: #825b18;
+  background: #f5ead6;
+}
+
+.control[data-availability="NOT_APPLICABLE"] .controlHead > span {
+  color: #697781;
+  background: #e7ebed;
+}
+
+.control > p {
+  margin: 6px 0;
+  color: #66757f;
+  font-size: 0.64rem;
+  line-height: 1.45;
+}
+
+.control .reason {
+  color: #8b641e;
+}
+
+.valueRow {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 7px;
+}
+
+.valueRow input,
+.valueRow select {
+  min-width: 80px;
+  flex: 1;
+}
+
+.valueRow button {
+  padding: 6px;
+  border: 1px solid #d3dade;
+  border-radius: 3px;
+  color: #596973;
+  background: #fff;
+  font-size: 0.6rem;
+  cursor: pointer;
+}
+
+.switch {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  color: #52616c;
+  font-size: 0.68rem;
+}
+
+.defaultText {
+  display: block;
+  margin-top: 5px;
+  color: #89959d;
+  font-size: 0.59rem;
+  font-style: italic;
+}
+
+.loading,
+.error,
+.placeholder {
+  padding: 17px;
+  color: #71808a;
+  font-size: 0.7rem;
+  text-align: center;
+}
+
+.error {
+  color: var(--red);
+}
+
+.editor > footer {
+  padding: 10px 12px;
+  border-top: 1px solid var(--line);
+  background: #f7f9fa;
+}
+
+.preview {
+  min-height: 30px;
+  color: #677680;
+  font-size: 0.63rem;
+  line-height: 1.45;
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.actions button {
+  padding: 7px 9px;
+  border: 1px solid #ced7db;
+  border-radius: 3px;
+  background: #fff;
+  font-size: 0.66rem;
+  cursor: pointer;
+}
+
+.actions .submit {
+  border-color: var(--teal);
+  color: #fff;
+  background: var(--teal);
+  font-weight: 700;
+}

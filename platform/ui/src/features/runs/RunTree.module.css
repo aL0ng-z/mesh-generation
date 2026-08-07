@@ -1,0 +1,143 @@
+.tree {
+  min-width: 0;
+}
+
+.heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 14px 15px 11px;
+  border-bottom: 1px solid #d8dfe3;
+  color: #30404b;
+  font-size: 0.73rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.heading small {
+  color: #87949d;
+  font-size: 0.66rem;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+.roots,
+.roots ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.roots {
+  padding: 9px 7px 18px;
+}
+
+.roots ul {
+  position: relative;
+  margin-left: 18px;
+}
+
+.roots ul::before {
+  position: absolute;
+  top: -4px;
+  bottom: 13px;
+  left: 6px;
+  width: 1px;
+  background: #cad4da;
+  content: "";
+}
+
+.row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  border-radius: 4px;
+}
+
+.row[data-selected="true"] {
+  background: #e5f2f1;
+}
+
+.select {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 7px;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.branchMark {
+  z-index: 1;
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: #98a6af;
+  box-shadow: 0 0 0 1px #aab6bd;
+}
+
+.branchMark[data-status="RUNNING"],
+.branchMark[data-status="QUEUED"] {
+  background: #c7851b;
+  box-shadow: 0 0 0 1px #c7851b;
+}
+
+.branchMark[data-status="SUCCEEDED"] {
+  background: #2f8a65;
+  box-shadow: 0 0 0 1px #2f8a65;
+}
+
+.branchMark[data-status="FAILED"] {
+  background: #c14949;
+  box-shadow: 0 0 0 1px #c14949;
+}
+
+.nodeText {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.nodeText strong {
+  overflow: hidden;
+  font-size: 0.76rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nodeText small {
+  color: #75838c;
+  font-size: 0.65rem;
+}
+
+.immutable {
+  margin-left: auto;
+  color: #8a989f;
+  font-size: 0.68rem;
+}
+
+.retry {
+  margin-right: 5px;
+  padding: 3px 6px;
+  border: 1px solid #ddb0b0;
+  border-radius: 3px;
+  color: #aa3e3e;
+  background: #fff;
+  font-size: 0.62rem;
+  cursor: pointer;
+}
+
+.empty {
+  padding: 20px;
+  color: #7d8b94;
+  font-size: 0.75rem;
+  text-align: center;
+}

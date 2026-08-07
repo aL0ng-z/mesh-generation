@@ -1,0 +1,261 @@
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+import pytest
+
+from controls import ControlValidationError, enumerate_control_targets
+from geomturbo import BladeInfo, GeomTurboSummary, RowInfo, parse_geomturbo
+from mesh_app.config import Settings
+from mesh_app.control_service import ControlService, target_to_selector
+from mesh_app.db import Database
+from mesh_app.sessions import SessionService, dump_json, utc_now
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+GEOMETRY_TEXT = """\
+GEOMETRY TURBO
+VERSION 5.6
+UNITS METER
+UNITS-FACTOR 1.0
+NI_BEGIN nirow
+NAME Rotor
+PERIODICITY 36
+NI_BEGIN niblade
+NAME MainBlade
+NUMBER_OF_BLADES 36
+NI_BEGIN nitipgap
+NI_END nitipgap
+NI_END niblade
+NI_END nirow
+NI_BEGIN nirow
+NAME Stator
+PERIODICITY 50
+NI_BEGIN niblade
+NAME StatorBlade
+NUMBER_OF_BLADES 50
+NI_END niblade
+NI_END nirow
+"""
+
+
+def make_services(tmp_path: Path) -> tuple[Settings, Database, SessionService, ControlService]:
+    settings = Settings.from_env({"MESH_DATA_DIR": str(tmp_path / "data")}, project_root=PROJECT_ROOT)
+    settings.ensure_directories()
+    database = Database(settings.database_path, settings.migrations_dir)
+    database.migrate()
+    return settings, database, SessionService(database), ControlService(database, settings.data_dir)
+
+
+def create_ready_baseline(
+    settings: Settings,
+    database: Database,
+    sessions: SessionService,
+) -> tuple[dict[str, object], str]:
+    provisional = "case-a"
+    geometry_path = settings.geometry_dir / provisional / "source.geomTurbo"
+    geometry_path.parent.mkdir(parents=True, exist_ok=True)
+    geometry_path.write_text(GEOMETRY_TEXT, encoding="utf-8")
+    relative = geometry_path.relative_to(settings.data_dir).as_posix()
+    summary = parse_geomturbo(geometry_path).to_dict()
+    summary["path"] = relative
+    detail = sessions.create_session(
+        title="两级压气机控制测试",
+        expert_name=None,
+        source_filename="case.geomTurbo",
+        geometry_sha256=hashlib.sha256(GEOMETRY_TEXT.encode()).hexdigest(),
+        geometry_relative_path=relative,
+        geometry_summary=summary,
+    )
+    baseline_id = str(detail["runs"][0]["id"])
+    with database.transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE runs SET status = 'RUNNING', updated_at = ? WHERE id = ?",
+            (utc_now(), baseline_id),
+        )
+    with database.transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE runs SET status = 'SUCCEEDED', updated_at = ?, finished_at = ? WHERE id = ?",
+            (utc_now(), utc_now(), baseline_id),
+        )
+    return detail, baseline_id
+
+
+def test_public_target_enumeration_uses_precise_geometry_entities() -> None:
+    geometry = GeomTurboSummary(
+        path="synthetic.geomTurbo",
+        version="5.6",
+        units="METER",
+        units_factor=1.0,
+        row_count=2,
+        rows=[
+            RowInfo(
+                name="Rotor",
+                periodicity=36,
+                blades=[
+                    BladeInfo(
+                        name="MainBlade",
+                        number_of_blades=36,
+                        has_tip_gap=True,
+                        gap_sides=("shroud",),
+                    ),
+                    BladeInfo(name="Splitter", number_of_blades=36),
+                ],
+                has_tip_gap=True,
+            ),
+            RowInfo(
+                name="Stator",
+                periodicity=50,
+                blades=[BladeInfo(name="StatorBlade", number_of_blades=50)],
+            ),
+        ],
+    )
+
+    rows = enumerate_control_targets(geometry, target_kind="row")
+    assert [target_to_selector(target) for target in rows] == ["row:#1", "row:#2"]
+    blades = enumerate_control_targets(geometry, control_key="blade/b2b.topology")
+    assert [target_to_selector(target) for target in blades] == [
+        "row:#1/blade:#1",
+        "row:#1/blade:#2",
+        "row:#2/blade:#1",
+    ]
+    gaps = enumerate_control_targets(geometry, control_key="gap/spanwise_points")
+    assert [target_to_selector(target) for target in gaps] == ["row:#1/blade:#1/gap:#1"]
+
+
+def test_unresolved_effects_are_excluded_by_default_and_opt_in_is_explicit() -> None:
+    geometry = GeomTurboSummary(
+        path="synthetic.geomTurbo",
+        version=None,
+        units=None,
+        units_factor=None,
+        row_count=0,
+        rows=[],
+    )
+    assert enumerate_control_targets(
+        geometry, control_key="existing-effect/maximum_expansion"
+    ) == []
+    unresolved = enumerate_control_targets(
+        geometry,
+        control_key="existing-effect/maximum_expansion",
+        include_unresolved=True,
+    )
+    assert len(unresolved) == 99
+    assert target_to_selector(unresolved[0]) == "existing-effect:#1"
+    assert target_to_selector(unresolved[-1]) == "existing-effect:#99"
+    with pytest.raises(ControlValidationError, match="未知控制目标类型"):
+        enumerate_control_targets(geometry, target_kind="不存在的目标")
+
+
+def test_control_state_and_preview_enforce_prerequisites_and_clear_dependencies(tmp_path: Path) -> None:
+    settings, database, sessions, controls = make_services(tmp_path)
+    detail, baseline_id = create_ready_baseline(settings, database, sessions)
+    session_id = str(detail["id"])
+
+    state = controls.get_control_state(session_id, parent_run_id=baseline_id)
+    target_points = next(
+        item
+        for item in state["controls"]
+        if item["key"] == "row/target_points" and item["selector"] == "row:#1"
+    )
+    assert target_points["availability"] == "LOCKED"
+    assert "row/mesh_level=user" in target_points["reason"]
+    skewness = next(
+        item
+        for item in state["controls"]
+        if item["key"] == "row/optimization.skewness" and item["selector"] == "row:#1"
+    )
+    assert skewness["availability"] == "LOCKED"
+    assert "row/optimization.steps=200" in skewness["reason"]
+
+    target_only = controls.preview(
+        session_id,
+        parent_run_id=baseline_id,
+        changes=[
+            {"key": "row/target_points", "selector": "row:#1", "op": "set", "value": 500000}
+        ],
+    )
+    assert target_only["valid"] is False
+    assert target_only["errors"][0]["code"] == "CONTROL_PREREQUISITE_NOT_MET"
+
+    target_valid = controls.preview(
+        session_id,
+        parent_run_id=baseline_id,
+        changes=[
+            {"key": "row/mesh_level", "selector": "row:#1", "op": "set", "value": "user"},
+            {"key": "row/target_points", "selector": "row:#1", "op": "set", "value": 500000},
+        ],
+    )
+    assert target_valid["valid"] is True
+
+    wrong_steps = controls.preview(
+        session_id,
+        parent_run_id=baseline_id,
+        changes=[
+            {"key": "row/optimization.steps", "selector": "row:#1", "op": "set", "value": 100},
+            {
+                "key": "row/optimization.skewness",
+                "selector": "row:#1",
+                "op": "set",
+                "value": "yes",
+            },
+        ],
+    )
+    assert wrong_steps["valid"] is False
+    assert "steps=200" in wrong_steps["errors"][0]["message"]
+
+    valid_optimization = controls.preview(
+        session_id,
+        parent_run_id=baseline_id,
+        changes=[
+            {"key": "row/optimization.steps", "selector": "row:#1", "op": "set", "value": 200},
+            {
+                "key": "row/optimization.skewness",
+                "selector": "row:#1",
+                "op": "set",
+                "value": "yes",
+            },
+        ],
+    )
+    assert valid_optimization["valid"] is True
+    child = sessions.create_child_run(
+        session_id=session_id,
+        parent_run_id=baseline_id,
+        request_id="optimization-child",
+        expected_version=1,
+        control_snapshot=valid_optimization["snapshot"],
+        control_delta=valid_optimization["delta"],
+    )
+    child_id = str(child["id"])
+    with database.transaction(immediate=True) as connection:
+        connection.execute("UPDATE runs SET status = 'RUNNING' WHERE id = ?", (child_id,))
+    with database.transaction(immediate=True) as connection:
+        connection.execute("UPDATE runs SET status = 'SUCCEEDED' WHERE id = ?", (child_id,))
+
+    clearing = controls.preview(
+        session_id,
+        parent_run_id=child_id,
+        changes=[
+            {"key": "row/optimization.steps", "selector": "row:#1", "op": "set", "value": 100}
+        ],
+    )
+    assert clearing["valid"] is True
+    assert clearing["required_clears"] == [
+        {"key": "row/optimization.skewness", "selector": "row:#1", "op": "clear"}
+    ]
+
+
+def test_preview_rejects_name_wildcard_and_non_applicable_target(tmp_path: Path) -> None:
+    settings, database, sessions, controls = make_services(tmp_path)
+    detail, baseline_id = create_ready_baseline(settings, database, sessions)
+    session_id = str(detail["id"])
+    result = controls.preview(
+        session_id,
+        parent_run_id=baseline_id,
+        changes=[
+            {"key": "row/mesh_level", "selector": "row:Rotor", "op": "set", "value": "fine"}
+        ],
+    )
+    assert result["valid"] is False
+    assert "#N" in result["errors"][0]["message"]

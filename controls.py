@@ -2601,6 +2601,60 @@ def describe_control(key: str) -> ControlSpec:
         raise ControlValidationError(f"未知控制键：{key}") from exc
 
 
+def enumerate_control_targets(
+    geometry: Any,
+    *,
+    control_key: str | None = None,
+    target_kind: str | None = None,
+    include_unresolved: bool = False,
+) -> list[tuple[TargetEntity, ...]]:
+    """枚举几何中可供控制项使用的稳定、精确目标。
+
+    网页和其他调用方可通过本接口复用 CLI 的几何适用性逻辑，而无需
+    复制 ``_candidate_targets`` 的叶排、叶片、间隙和端壁规则。默认不返回
+    geomTurbo 无法可靠计数的既有技术效果占位符；需要兼容 CLI 的 ``#1``～
+    ``#99`` 候选时可显式设置 ``include_unresolved=True``。
+    """
+
+    if control_key is not None:
+        specs = [describe_control(control_key)]
+    else:
+        specs = list_control_specs()
+
+    known_target_kinds = {spec.target_kind for spec in CONTROL_REGISTRY.values()}
+    if target_kind is not None and target_kind not in known_target_kinds:
+        raise ControlValidationError(f"未知控制目标类型：{target_kind}")
+
+    unique_targets: dict[tuple[TargetEntity, ...], None] = {}
+    for spec in specs:
+        if target_kind is not None and spec.target_kind != target_kind:
+            continue
+        for target in _candidate_targets(spec, geometry):
+            if not include_unresolved and _is_unresolved_target(target):
+                continue
+            unique_targets.setdefault(target, None)
+
+    def sort_key(target: tuple[TargetEntity, ...]) -> tuple[Any, ...]:
+        return (
+            len(target),
+            tuple(
+                (entity.kind, entity.index if entity.index is not None else 0, entity.name)
+                for entity in target
+            ),
+        )
+
+    return sorted(unique_targets, key=sort_key)
+
+
+def _is_unresolved_target(target: tuple[TargetEntity, ...]) -> bool:
+    """判断目标是否只是 geomTurbo 无法确认数量的静态索引占位符。"""
+
+    if not target:
+        return False
+    leaf = target[-1]
+    return leaf.index is not None and leaf.name == f"#{leaf.index}"
+
+
 def _parse_selector(raw: str) -> EntitySelector:
     """解析单个实体选择器表达式。"""
 
@@ -2773,6 +2827,7 @@ __all__ = [
     "audit_setter",
     "convert_si_length",
     "describe_control",
+    "enumerate_control_targets",
     "list_control_specs",
     "parse_control_assignment",
     "parse_control_assignments",

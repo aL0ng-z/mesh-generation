@@ -2,7 +2,7 @@
 
 本项目从 `.geomTurbo` 文件直接建立 NUMECA AutoGrid 17.1 项目，应用经过类型校验的纯网格控制，生成 B2B/3D 网格，并把原生 `.qualityReport` 标准化为 Schema v3 运行摘要。
 
-当前实现保持根目录扁平：不依赖 `.trb` 模板，不读取 JSON/YAML 配置，不对 `.trb` 做字符串修改。所有运行产物写入 `runs/`。
+当前网格内核保持根目录扁平：不依赖 `.trb` 模板，不读取 JSON/YAML 配置，不对 `.trb` 做字符串修改。`platform/` 额外提供独立的内网 Web 服务，且不改变根目录 CLI 的调用方式和标准库依赖边界。所有仓库内运行产物写入 `runs/`。
 
 ## 已实现能力
 
@@ -17,6 +17,8 @@
 - 输出 Schema v3 `run_summary.json` 和中文 `report.md`，同时保留旧版字段。
 - 可选 `--mesh-fingerprint`，记录完整 CGNS block 坐标 SHA-256、I/J/K 尺寸、固定坐标探针和聚合网格指纹。
 - 在缺少 `.qualityReport` 时降级读取 CGNS 内嵌 `NIGridQuality` 数据。
+- 通过 `enumerate_control_targets()` 向内网平台公开与 CLI 一致的几何目标枚举逻辑。
+- 提供 SQLite WAL 持久队列、不可变运行树、FastAPI API、React 工作台和 HDF5 CGNS 三维预览。
 
 本阶段不包含自动调参、DOE、优化循环、CFD 求解、`y+` 计算或网格无关性分析。
 
@@ -31,13 +33,16 @@ quality.py              .qualityReport/CGNS 质量解析与 PASS/FAIL/UNKNOWN �
 geometries/             .geomTurbo 输入样例
 tests/                  根目录实现的单元测试
 docs/                   设计、控制目录、质量准则和开发日志
+platform/               独立的 FastAPI、Worker、React UI、SQLite 迁移和部署脚本
 runs/                   可丢弃的运行产物
 archive/                v0～v6 历史快照；当前实现完全不读取
 ```
 
 ## 运行环境
 
-项目仅依赖 Python 标准库，无需安装第三方包，使用系统任意 Python ≥3.7 即可运行。
+根目录网格 CLI 仅依赖 Python 标准库，无需安装第三方包，使用系统任意 Python ≥3.7 即可运行。内网平台使用 Python ≥3.11，其第三方依赖和锁定版本完全隔离在 `platform/`。
+
+内网平台的安装、迁移、启动、HTTPS、备份与验收说明见 [`platform/README.md`](platform/README.md)。
 
 真实网格生成需要 NUMECA AutoGrid/IGG 17.1。IGG 路径按以下顺序解析：
 

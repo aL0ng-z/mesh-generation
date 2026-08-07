@@ -1,0 +1,155 @@
+.dialog {
+  width: min(590px, calc(100% - 30px));
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  color: var(--ink);
+  background: #fff;
+  box-shadow: 0 24px 80px rgb(2 13 22 / 35%);
+}
+
+.dialog::backdrop {
+  background: rgb(8 20 31 / 72%);
+  backdrop-filter: blur(2px);
+}
+
+.dialog form > header,
+.dialog form > footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 21px 24px;
+}
+
+.dialog form > header {
+  color: #fff;
+  background: var(--navy);
+}
+
+.dialog header p {
+  margin: 0 0 3px;
+  color: #62c7c0;
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+}
+
+.dialog h2 {
+  margin: 0;
+  font-size: 1.2rem;
+}
+
+.dialog header button {
+  padding: 3px 8px;
+  border: 0;
+  color: #bdc8cf;
+  background: transparent;
+  font-size: 1.65rem;
+  cursor: pointer;
+}
+
+.dropzone {
+  display: grid;
+  margin: 25px 24px 0;
+  padding: 27px;
+  place-items: center;
+  border: 1px dashed #9ab6b4;
+  border-radius: 5px;
+  background: #f5faf9;
+  cursor: pointer;
+}
+
+.dropzone input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  clip-path: inset(50%);
+}
+
+.uploadIcon {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  margin-bottom: 9px;
+  place-items: center;
+  border-radius: 50%;
+  color: #fff;
+  background: var(--teal);
+  font-size: 1.25rem;
+}
+
+.dropzone strong {
+  max-width: 100%;
+  overflow: hidden;
+  font-size: 0.93rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dropzone small {
+  margin-top: 4px;
+  color: var(--muted);
+}
+
+.fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  padding: 20px 24px 0;
+}
+
+.fields label {
+  display: grid;
+  gap: 7px;
+}
+
+.fields span {
+  color: #46545f;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.fields input {
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.error {
+  margin: 14px 24px 0;
+  padding: 9px 11px;
+  border-left: 3px solid var(--red);
+  color: var(--red);
+  background: #fff4f4;
+  font-size: 0.8rem;
+}
+
+.dialog form > footer {
+  justify-content: flex-end;
+  margin-top: 22px;
+  border-top: 1px solid var(--line);
+  background: #f8f9fa;
+}
+
+.dialog footer button {
+  padding: 9px 17px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+}
+
+.dialog footer .submit {
+  border-color: var(--teal);
+  color: #fff;
+  background: var(--teal);
+  font-weight: 700;
+}
+
+@media (max-width: 540px) {
+  .fields {
+    grid-template-columns: 1fr;
+  }
+}

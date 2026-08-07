@@ -2,10 +2,26 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Iterator, Mapping, TextIO
+
+
+MAX_PHYSICAL_LINE_CHARS = 1024 * 1024
+MAX_IDENTIFIER_CHARS = 512
+MAX_NESTING_DEPTH = 128
+MAX_ROWS = 256
+MAX_BLADES_PER_ROW = 64
+
+
+class GeomTurboParseError(ValueError):
+    """表示输入超出安全解析边界或无法按 geomTurbo 文本处理。"""
+
+    def __init__(self, message: str, *, details: Mapping[str, Any]) -> None:
+        self.details = dict(details)
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -90,35 +106,72 @@ def parse_geomturbo(path: str | Path) -> GeomTurboSummary:
     """读取 ``.geomTurbo`` 文件并返回结构化几何摘要。"""
 
     geom_path = Path(path)
-    text = geom_path.read_text(encoding="utf-8", errors="replace")
-    rows = _parse_rows(text)
+    with geom_path.open("r", encoding="utf-8", errors="replace") as stream:
+        version, units, units_factor, rows = _parse_lines(_iter_bounded_lines(stream))
     return GeomTurboSummary(
         path=str(geom_path),
-        version=_first_value(text, "VERSION"),
-        units=_first_value(text, "UNITS"),
-        units_factor=_first_float_value(text, "UNITS-FACTOR"),
+        version=version,
+        units=units,
+        units_factor=units_factor,
         row_count=len(rows),
         rows=rows,
     )
 
 
-def _parse_rows(text: str) -> list[RowInfo]:
-    """从几何文本中解析所有叶排及叶片拓扑。"""
+def _iter_bounded_lines(stream: TextIO) -> Iterator[str]:
+    """逐行读取并限制单条物理行，避免异常输入形成超大字符串。"""
 
+    line_number = 0
+    while True:
+        raw_line = stream.readline(MAX_PHYSICAL_LINE_CHARS + 1)
+        if raw_line == "":
+            return
+        line_number += 1
+        if len(raw_line) > MAX_PHYSICAL_LINE_CHARS:
+            raise GeomTurboParseError(
+                f"geomTurbo 第 {line_number} 行超过允许的 "
+                f"{MAX_PHYSICAL_LINE_CHARS} 字符",
+                details={"max_line_chars": MAX_PHYSICAL_LINE_CHARS},
+            )
+        yield raw_line
+
+
+def _parse_lines(lines: Iterable[str]) -> tuple[str | None, str | None, float | None, list[RowInfo]]:
+    """单遍解析几何文件的元数据、叶排及叶片拓扑。"""
+
+    version: str | None = None
+    units: str | None = None
+    units_factor_text: str | None = None
     rows: list[RowInfo] = []
     stack: list[str] = []
     current_row: dict[str, Any] | None = None
     current_blade: dict[str, Any] | None = None
 
-    for raw_line in text.splitlines():
+    for raw_line in lines:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
 
+        key, value = _split_key_value(line)
+        _validate_identifier(key, "键名")
+        key_upper = key.upper()
+        if value:
+            if key_upper == "VERSION" and version is None:
+                version = _validate_identifier(value, "VERSION")
+            elif key_upper == "UNITS" and units is None:
+                units = _validate_identifier(value, "UNITS")
+            elif key_upper == "UNITS-FACTOR" and units_factor_text is None:
+                units_factor_text = _validate_identifier(value, "UNITS-FACTOR")
+
         begin = re.match(r"NI_BEGIN\s+(\S+)(?:\s+(\S+))?", line, flags=re.IGNORECASE)
         if begin:
-            block = begin.group(1).lower()
-            block_arg = (begin.group(2) or "").lower()
+            block = _validate_identifier(begin.group(1), "块名").lower()
+            block_arg = _validate_identifier(begin.group(2) or "", "块参数").lower()
+            if len(stack) >= MAX_NESTING_DEPTH:
+                raise GeomTurboParseError(
+                    f"geomTurbo 嵌套深度超过允许的 {MAX_NESTING_DEPTH} 层",
+                    details={"max_nesting_depth": MAX_NESTING_DEPTH},
+                )
             stack.append(block)
             if block == "nirow":
                 current_row = {
@@ -139,26 +192,40 @@ def _parse_rows(text: str) -> list[RowInfo]:
             elif block in {"nitipgap", "nishroudgap", "nihubgap"}:
                 if current_blade is not None:
                     side = "hub" if block == "nihubgap" else "shroud"
-                    current_blade["gap_sides"].append(side)
+                    _append_unique(current_blade["gap_sides"], side)
                     current_blade["has_tip_gap"] = side == "shroud" or current_blade["has_tip_gap"]
                 if current_row is not None:
                     current_row["has_tip_gap"] = True
             elif block in {"nitippartialgap", "nishroudpartialgap", "nihubpartialgap"}:
                 if current_blade is not None:
                     side = "hub" if block == "nihubpartialgap" else "shroud"
-                    current_blade["partial_gap_sides"].append(side)
+                    _append_unique(current_blade["partial_gap_sides"], side)
             elif block in {"nitipfillet", "nishroudfillet", "nihubfillet"}:
                 if current_blade is not None:
                     side = "hub" if block == "nihubfillet" else "shroud"
-                    current_blade["fillet_sides"].append(side)
+                    _append_unique(current_blade["fillet_sides"], side)
             elif block == "ninonaxisurfaces" and block_arg == "tip_gap" and current_row is not None:
                 current_row["has_tip_gap"] = True
             continue
 
         end = re.match(r"NI_END\s+(\S+)", line, flags=re.IGNORECASE)
         if end:
-            block = end.group(1).lower()
+            block = _validate_identifier(end.group(1), "块名").lower()
+            # 部分厂商版本把首行 ``GEOMETRY TURBO`` 作为隐式根块，末尾却
+            # 使用显式 ``NI_END GEOMTURBO``；该唯一兼容形式不占用解析栈。
+            if block == "geomturbo" and not stack:
+                continue
+            if not stack or stack[-1] != block:
+                raise GeomTurboParseError(
+                    "geomTurbo 的 NI_BEGIN/NI_END 块结构不匹配",
+                    details={"reason": "mismatched_block"},
+                )
             if block == "niblade" and current_row is not None and current_blade is not None:
+                if len(current_row["blades"]) >= MAX_BLADES_PER_ROW:
+                    raise GeomTurboParseError(
+                        f"单个叶排的叶片实体超过允许的 {MAX_BLADES_PER_ROW} 个",
+                        details={"max_blades_per_row": MAX_BLADES_PER_ROW},
+                    )
                 current_row["blades"].append(
                     BladeInfo(
                         name=current_blade["name"],
@@ -171,6 +238,11 @@ def _parse_rows(text: str) -> list[RowInfo]:
                 )
                 current_blade = None
             elif block == "nirow" and current_row is not None:
+                if len(rows) >= MAX_ROWS:
+                    raise GeomTurboParseError(
+                        f"geomTurbo 叶排数量超过允许的 {MAX_ROWS} 个",
+                        details={"max_rows": MAX_ROWS},
+                    )
                 blade_tip_gap = any(blade.has_tip_gap for blade in current_row["blades"])
                 rows.append(
                     RowInfo(
@@ -189,20 +261,24 @@ def _parse_rows(text: str) -> list[RowInfo]:
         if current_row is None:
             continue
 
-        key, value = _split_key_value(line)
         key_lower = key.lower()
         if key_lower == "name":
             current_block = stack[-1] if stack else ""
             if current_blade is not None and current_block == "niblade":
-                current_blade["name"] = value
+                current_blade["name"] = _validate_identifier(value, "叶片名称")
             elif current_blade is None and current_block == "nirow":
-                current_row["name"] = value
+                current_row["name"] = _validate_identifier(value, "叶排名称")
         elif key_lower == "periodicity":
             current_row["periodicity"] = _to_int(value)
         elif key_lower == "number_of_blades" and current_blade is not None:
             current_blade["number_of_blades"] = _to_int(value)
 
-    return rows
+    if stack:
+        raise GeomTurboParseError(
+            "geomTurbo 存在未闭合的 NI_BEGIN 块",
+            details={"reason": "unclosed_block"},
+        )
+    return version, units, _to_float(units_factor_text), rows
 
 
 def _split_key_value(line: str) -> tuple[str, str]:
@@ -214,31 +290,43 @@ def _split_key_value(line: str) -> tuple[str, str]:
     return parts[0], parts[1].strip()
 
 
-def _first_value(text: str, key: str) -> str | None:
-    """返回指定键首次出现时的原始值。"""
+def _validate_identifier(value: str, label: str) -> str:
+    """限制会进入解析状态的 token 与名称长度。"""
 
-    match = re.search(rf"^\s*{re.escape(key)}\s+(.+?)\s*$", text, flags=re.IGNORECASE | re.MULTILINE)
-    return match.group(1).strip() if match else None
+    if len(value) > MAX_IDENTIFIER_CHARS:
+        raise GeomTurboParseError(
+            f"geomTurbo {label}超过允许的 {MAX_IDENTIFIER_CHARS} 字符",
+            details={"max_identifier_chars": MAX_IDENTIFIER_CHARS},
+        )
+    return value
 
 
-def _first_float_value(text: str, key: str) -> float | None:
-    """返回指定键首次出现时的浮点数值。"""
+def _append_unique(values: list[str], value: str) -> None:
+    """只保存首次出现的侧别，使重复技术块不扩张解析状态。"""
 
-    value = _first_value(text, key)
+    if value not in values:
+        values.append(value)
+
+
+def _to_float(value: str | None) -> float | None:
+    """尽可能将文本首项转换为浮点数，失败时返回空值。"""
+
     if value is None:
         return None
     try:
-        return float(value.split()[0])
-    except ValueError:
+        number = float(value.split()[0])
+    except (IndexError, ValueError):
         return None
+    return number if math.isfinite(number) else None
 
 
 def _to_int(value: str) -> int | None:
     """尽可能将文本转换为整数，失败时返回空值。"""
 
     try:
-        return int(float(value.split()[0]))
-    except (IndexError, ValueError):
+        number = float(value.split()[0])
+        return int(number) if math.isfinite(number) else None
+    except (IndexError, OverflowError, ValueError):
         return None
 
 

@@ -1,0 +1,78 @@
+.compare {
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+  background: #edf1f3;
+}
+
+.viewers {
+  display: grid;
+  min-height: 390px;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: #334451;
+}
+
+.viewers > article {
+  display: grid;
+  min-width: 0;
+  grid-template-rows: auto minmax(340px, 1fr);
+  background: #09131c;
+}
+
+.viewers article > header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  color: #d9e3e8;
+  background: #172632;
+}
+
+.viewers header span {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 50%;
+  color: #fff;
+  background: #207872;
+  font-size: 0.62rem;
+  font-weight: 850;
+}
+
+.viewers header strong { font-size: 0.68rem; }
+.viewers header small { margin-left: auto; color: #91a2ac; font-size: 0.57rem; }
+
+.deltas {
+  margin: 14px;
+  border: 1px solid #d6dee2;
+  border-radius: 4px;
+  background: #fff;
+}
+
+.deltas > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid #e0e5e7;
+}
+
+.deltas header p { margin: 0; color: var(--teal); font-size: 0.55rem; font-weight: 850; letter-spacing: 0.13em; }
+.deltas h2 { margin: 1px 0 0; font-size: 0.86rem; }
+.deltas header > span { color: #7a8891; font-size: 0.62rem; }
+
+.tableWrap { overflow-x: auto; }
+.deltas table { width: 100%; border-collapse: collapse; font-size: 0.67rem; }
+.deltas th, .deltas td { padding: 8px 12px; border-bottom: 1px solid #edf0f1; text-align: right; }
+.deltas th:first-child { text-align: left; }
+.deltas thead { color: #74828b; background: #fafbfb; }
+.deltas tbody th { color: #394954; font-weight: 600; }
+.deltas td[data-sign="positive"] { color: #2c7957; }
+.deltas td[data-sign="negative"] { color: #b14848; }
+.empty, .notice { padding: 35px; color: #71808a; font-size: 0.72rem; text-align: center; }
+
+@media (max-width: 900px) {
+  .viewers { grid-template-columns: 1fr; }
+}
