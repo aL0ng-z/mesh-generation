@@ -3,6 +3,7 @@ import type {
   ControlPreview,
   ControlState,
   EventsResponse,
+  HealthSnapshot,
   MeshManifest,
   RunDetail,
   SessionDetail,
@@ -82,6 +83,10 @@ export function newRequestId(): string {
 }
 
 export const api = {
+  getHealth(): Promise<HealthSnapshot> {
+    return request('/api/health');
+  },
+
   async listSessions(status?: string, cursor?: string): Promise<SessionListResponse> {
     const params = new URLSearchParams();
     if (status && status !== 'ALL') params.set('status', status);

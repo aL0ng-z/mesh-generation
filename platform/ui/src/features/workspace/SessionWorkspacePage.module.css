@@ -142,6 +142,10 @@
   font-size: 0.68rem;
 }
 
+.healthBanner {
+  border-width: 0 0 1px;
+}
+
 .columns {
   display: grid;
   min-height: 0;

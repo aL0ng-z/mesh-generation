@@ -667,7 +667,7 @@ def _event_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _artifact_dict(row: sqlite3.Row) -> dict[str, Any]:
-    return {
+    result = {
         "id": row["id"],
         "type": row["kind"],
         "display_name": row["display_name"],
@@ -676,6 +676,23 @@ def _artifact_dict(row: sqlite3.Row) -> dict[str, Any]:
         "sha256": row["sha256"],
         "created_at": row["created_at"],
     }
+    block_id = _preview_artifact_block_id(str(row["kind"]), str(row["relative_path"]))
+    if block_id is not None:
+        result["block_id"] = block_id
+    return result
+
+
+def _preview_artifact_block_id(kind: str, relative_path: str) -> str | None:
+    """从已登记的预览相对路径提取 block 标识，不向网页暴露存储路径。"""
+
+    if not kind.startswith("PREVIEW_"):
+        return None
+    parts = PurePosixPath(relative_path.replace("\\", "/")).parts
+    try:
+        marker = parts.index("blocks")
+    except ValueError:
+        return None
+    return parts[marker + 1] if marker + 1 < len(parts) else None
 
 
 def _encode_cursor(created_at: str, session_id: str) -> str:

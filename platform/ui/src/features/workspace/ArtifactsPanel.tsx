@@ -27,7 +27,7 @@ export function ArtifactsPanel({ run }: { run?: RunDetail }) {
             <article key={artifact.id}>
               <span>{artifact.type}</span>
               <div>
-                <strong>{artifact.display_name}</strong>
+                <strong>{artifact.block_id ? `${artifact.block_id} / ` : ''}{artifact.display_name}</strong>
                 <small>{bytes(artifact.size)}{artifact.sha256 ? ` · SHA-256 ${artifact.sha256.slice(0, 12)}…` : ''}</small>
               </div>
               <a href={api.artifactUrl(artifact.id)}>下载</a>

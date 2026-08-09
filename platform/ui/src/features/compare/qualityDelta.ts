@@ -19,6 +19,21 @@ const metricLabels: Record<string, string> = {
   max_aspect_ratio: '最大长宽比',
 };
 
+const decimalFormatter = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 3 });
+const scientificFormatter = new Intl.NumberFormat('zh-CN', {
+  notation: 'scientific',
+  maximumSignificantDigits: 4,
+});
+
+/** 保留极小的真实差值，并避免把 IEEE -0 显示为 “-0”。 */
+export function formatQualityNumber(value: number): string {
+  const normalized = Object.is(value, -0) ? 0 : value;
+  if (normalized !== 0 && Math.abs(normalized) < 0.001) {
+    return scientificFormatter.format(normalized);
+  }
+  return decimalFormatter.format(normalized);
+}
+
 export function normalizeQualityMetrics(report?: QualityReport | null): QualityMetric[] {
   if (!report?.metrics) return [];
   if (Array.isArray(report.metrics)) return report.metrics;

@@ -3,7 +3,7 @@ import { api } from '../../api/client';
 import type { RunSummary } from '../../api/types';
 import { MeshViewer } from '../mesh/MeshViewer';
 import { isActiveRun } from '../runs/runTreeModel';
-import { calculateQualityDeltas } from './qualityDelta';
+import { calculateQualityDeltas, formatQualityNumber } from './qualityDelta';
 import styles from './ComparePanel.module.css';
 
 interface Props {
@@ -54,16 +54,19 @@ export function ComparePanel({ runIds, runs }: Props) {
             <table>
               <thead><tr><th>指标</th><th>A</th><th>B</th><th>差值</th></tr></thead>
               <tbody>
-                {deltas.map((delta) => (
-                  <tr key={delta.key}>
-                    <th>{delta.label}</th>
-                    <td>{delta.left.toLocaleString('zh-CN')}{delta.unit}</td>
-                    <td>{delta.right.toLocaleString('zh-CN')}{delta.unit}</td>
-                    <td data-sign={delta.delta > 0 ? 'positive' : delta.delta < 0 ? 'negative' : 'zero'}>
-                      {delta.delta > 0 ? '+' : ''}{delta.delta.toLocaleString('zh-CN')}{delta.unit}
-                    </td>
-                  </tr>
-                ))}
+                {deltas.map((delta) => {
+                  const normalizedDelta = Object.is(delta.delta, -0) ? 0 : delta.delta;
+                  return (
+                    <tr key={delta.key}>
+                      <th>{delta.label}</th>
+                      <td>{formatQualityNumber(delta.left)}{delta.unit}</td>
+                      <td>{formatQualityNumber(delta.right)}{delta.unit}</td>
+                      <td data-sign={normalizedDelta > 0 ? 'positive' : normalizedDelta < 0 ? 'negative' : 'zero'}>
+                        {normalizedDelta > 0 ? '+' : ''}{formatQualityNumber(normalizedDelta)}{delta.unit}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

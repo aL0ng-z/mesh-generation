@@ -39,6 +39,7 @@ export interface Artifact {
   id: string;
   type: string;
   display_name: string;
+  block_id?: string | null;
   size: number;
   mime_type?: string | null;
   sha256?: string | null;
@@ -189,4 +190,28 @@ export interface SessionListResponse {
 export interface EventsResponse {
   items: RunEvent[];
   next_after?: number | null;
+}
+
+export interface HealthSnapshot {
+  status: 'ok' | 'degraded';
+  database: { status: string; version: number };
+  worker: {
+    online: boolean;
+    id: string | null;
+    last_heartbeat: string | null;
+    running_count: number;
+    max_concurrency: number;
+  };
+  igg: {
+    configured: boolean;
+    available: boolean;
+    path: string | null;
+  };
+  queue: {
+    queued: number;
+    running: number;
+    succeeded: number;
+    failed: number;
+  };
+  resource_gate: Record<string, unknown>;
 }

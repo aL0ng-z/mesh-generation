@@ -224,6 +224,38 @@ def test_state_machine_terminal_immutability_and_append_only_tables(tmp_path: Pa
             connection.execute("DELETE FROM artifacts WHERE id = ?", (artifact_id,))
 
 
+def test_preview_artifacts_expose_block_id_without_storage_path(tmp_path: Path) -> None:
+    _settings, database = make_database(tmp_path)
+    detail = create_session(database)
+    run_id = str(detail["runs"][0]["id"])
+    timestamp = utc_now()
+    records = [
+        ("preview-1", "PREVIEW_SURFACE", "surface.vtp", f"previews/{run_id}/blocks/b0001/surface.vtp"),
+        ("preview-2", "PREVIEW_SURFACE", "surface.vtp", f"previews/{run_id}/blocks/b0002/surface.vtp"),
+        ("report-1", "REPORT", "report.md", f"artifacts/{run_id}/report.md"),
+    ]
+    with database.transaction(immediate=True) as connection:
+        connection.executemany(
+            """
+            INSERT INTO artifacts (
+                id, session_id, run_id, kind, display_name, relative_path,
+                sha256, size_bytes, mime_type, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'application/octet-stream', ?)
+            """,
+            [
+                (artifact_id, detail["id"], run_id, kind, name, relative, "0" * 64, timestamp)
+                for artifact_id, kind, name, relative in records
+            ],
+        )
+
+    artifacts = SessionService(database).get_run(run_id)["artifacts"]
+    by_id = {item["id"]: item for item in artifacts}
+    assert by_id["preview-1"]["block_id"] == "b0001"
+    assert by_id["preview-2"]["block_id"] == "b0002"
+    assert "block_id" not in by_id["report-1"]
+    assert all("relative_path" not in item for item in artifacts)
+
+
 def test_idempotent_branch_version_conflict_retry_note_and_freeze(tmp_path: Path) -> None:
     _settings, database = make_database(tmp_path)
     service = SessionService(database)

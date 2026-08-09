@@ -3,6 +3,7 @@ import { useInfiniteQuery } from '@tanstack/react-query';
 import { Link, useSearchParams } from 'react-router-dom';
 import { api } from '../../api/client';
 import type { SessionStatus } from '../../api/types';
+import { SystemHealthBanner } from '../health/SystemHealthBanner';
 import { UploadDialog } from './UploadDialog';
 import styles from './SessionListPage.module.css';
 
@@ -59,6 +60,7 @@ export function SessionListPage() {
       </header>
 
       <section className={styles.workspace} aria-labelledby="sessions-heading">
+        <SystemHealthBanner className={styles.healthBanner} />
         <div className={styles.toolbar}>
           <div>
             <p className={styles.kicker}>共享工作区</p>

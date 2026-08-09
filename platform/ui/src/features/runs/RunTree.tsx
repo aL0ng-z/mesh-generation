@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
 import type { RunSummary } from '../../api/types';
+import { progressPercent } from './progress';
 import { buildRunForest, type RunTreeNode } from './runTreeModel';
 import styles from './RunTree.module.css';
 
@@ -41,7 +42,7 @@ function Node({
                 ? '成功 · 预览处理中'
                 : statuses[run.status]}
               {run.retry_of_run_id ? ' · 重试' : ''}
-              {run.progress != null && run.status === 'RUNNING' ? ` · ${Math.round(run.progress)}%` : ''}
+              {run.progress != null && run.status === 'RUNNING' ? ` · ${progressPercent(run.progress)}%` : ''}
             </small>
           </span>
           <span className={styles.immutable} title="运行节点不可变">◇</span>

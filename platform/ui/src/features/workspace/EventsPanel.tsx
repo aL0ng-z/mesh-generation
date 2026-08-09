@@ -2,6 +2,7 @@ import { useQuery } from '@tanstack/react-query';
 import { api } from '../../api/client';
 import type { RunDetail } from '../../api/types';
 import { isActiveRun } from '../runs/runTreeModel';
+import { progressPercent } from '../runs/progress';
 import styles from './Panels.module.css';
 
 export function EventsPanel({ run }: { run?: RunDetail }) {
@@ -32,7 +33,7 @@ export function EventsPanel({ run }: { run?: RunDetail }) {
                 <p>{event.message}</p>
                 <time>{new Date(event.created_at).toLocaleString('zh-CN')}</time>
               </div>
-              {event.progress != null ? <strong>{Math.round(event.progress)}%</strong> : null}
+              {event.progress != null ? <strong>{progressPercent(event.progress)}%</strong> : null}
             </li>
           ))}
         </ol>

@@ -5,6 +5,7 @@ import { api, newRequestId } from '../../api/client';
 import type { RunSummary } from '../../api/types';
 import { ComparePanel } from '../compare/ComparePanel';
 import { ControlEditor } from '../controls/ControlEditor';
+import { SystemHealthBanner } from '../health/SystemHealthBanner';
 import { MeshViewer } from '../mesh/MeshViewer';
 import { ExperienceNote } from '../runs/ExperienceNote';
 import { RunTree } from '../runs/RunTree';
@@ -223,6 +224,8 @@ export function SessionWorkspacePage() {
           {frozen ? '会话已冻结' : completeMutation.isPending ? '冻结中…' : '选为满意网格并冻结'}
         </button>
       </header>
+
+      <SystemHealthBanner className={styles.healthBanner} />
 
       {retryMutation.isError || completeMutation.isError ? (
         <div className={styles.banner} role="alert">{(retryMutation.error as Error | null)?.message ?? (completeMutation.error as Error).message}</div>

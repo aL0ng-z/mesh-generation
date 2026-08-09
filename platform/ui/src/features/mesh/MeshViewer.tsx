@@ -130,10 +130,10 @@ export function MeshViewer({ run, cameraGroup, compact = false }: Props) {
           </div>
           {sliceEnabled && manifest.capabilities?.slice !== false ? (
             <div className={styles.sliceControls}>
-              <select value={block?.id ?? ''} onChange={(event) => { setSliceBlock(event.target.value); setSliceIndex(0); }}>
+              <select aria-label="切片网格块" value={block?.id ?? ''} onChange={(event) => { setSliceBlock(event.target.value); setSliceIndex(0); }}>
                 {manifest.blocks.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
               </select>
-              <select value={sliceAxis} onChange={(event) => { setSliceAxis(event.target.value as 'I' | 'J' | 'K'); setSliceIndex(0); }}>
+              <select aria-label="切片轴向" value={sliceAxis} onChange={(event) => { setSliceAxis(event.target.value as 'I' | 'J' | 'K'); setSliceIndex(0); }}>
                 <option>I</option><option>J</option><option>K</option>
               </select>
               <input
