@@ -1,5 +1,25 @@
 # 开发日志
 
+## 2026-08-24：本地平台一键启动与 .env 配置
+
+### 启动流程
+
+- 新增 `platform/deploy/run-local.ps1`，从单个终端启动 API 和 Worker；API 作为受控子进程运行，Worker 保留在当前终端，按 `Ctrl+C` 时同步清理 API。
+- 启动前显式检查数据库版本和前端构建产物；首次安装或代码升级可通过 `-Migrate` 明确执行迁移，不在普通启动中隐式修改数据库结构。
+- API 启动后轮询健康接口，确认就绪再启动 Worker；API 标准输出与错误日志统一写入 `<MESH_DATA_DIR>/logs`。
+
+### 环境配置
+
+- 本地脚本只读取仓库根目录 `.env`，与网格 CLI 共用同一份本机配置；删除第二份 `platform/.env` 入口及 `-EnvFile` 分支。
+- 未配置平台专用 IGG 路径时，兼容复用根目录 `.env` 的 `IGG_EXE` 或 `IGG_PATH`；未配置数据目录时默认使用可丢弃的 `runs/platform-dev`。
+- 将配置模板从 `platform/.env.example` 移至根目录 `.env.example`，统一记录 CLI、平台数据目录和 Worker 资源参数；同步更新根 README 与平台部署说明。
+- 生产 API/Worker 脚本继续只读取进程或系统环境变量，不隐式加载仓库配置。
+
+### 验证
+
+- 使用 Windows PowerShell 5.1 完成脚本语法解析；脚本采用带 BOM 的 UTF-8 编码，避免中文内容被系统代码页误读。
+- 通过 `-Migrate -Port 8765` 完成迁移启动验证，并使用合并后的根目录 `.env` 在端口 8767 复验日常启动；数据库版本检查通过，`/api/health` 返回 `ok`，发送 `Ctrl+C` 后 Worker 退出且 API 监听端口释放。
+
 ## 2026-08-24：网格内核迁移至 src 目录
 
 ### 源码与调用路径

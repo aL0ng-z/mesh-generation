@@ -45,19 +45,33 @@ archive/                v0～v6 历史快照；当前实现完全不读取
 
 内网平台的安装、迁移、启动、HTTPS、备份与验收说明见 [`platform/README.md`](platform/README.md)。
 
+已完成首次安装和数据库迁移后，可从仓库根目录一键启动本地 API 与 Worker：
+
+```powershell
+.\platform\deploy\run-local.ps1
+```
+
+该脚本与网格 CLI 共用根目录唯一的 `.env`，本地页面地址为 `http://127.0.0.1:8000`。
+
 真实网格生成需要 NUMECA AutoGrid/IGG 17.1。IGG 路径按以下顺序解析：
 
 1. `--igg` 显式路径；
 2. 当前目录 `.env` 中的 `IGG_EXE` 或 `IGG_PATH`；
 3. `PATH` 和常见 NUMECA 安装环境。
 
-本地 `.env` 示例：
+首次配置可复制根目录模板：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+其中 IGG 配置示例为：
 
 ```text
 IGG_EXE=C:\ProgramData\NUMECA\fine171\bin64\iggx86_64.exe
 ```
 
-`.env` 不纳入版本管理。
+`.env` 不纳入版本管理；平台数据目录、数据库路径和 Worker 资源参数也统一在该文件中配置。
 
 ## 快速使用
 

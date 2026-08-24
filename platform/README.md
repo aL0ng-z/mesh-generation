@@ -14,7 +14,7 @@ platform/
 └── deploy/            Caddy 与 Windows 启动脚本示例
 ```
 
-生产数据默认位于 `C:\ProgramData\MeshExperience`，不会写入仓库。开发环境应显式设置 `MESH_DATA_DIR` 和 `MESH_DATABASE_PATH`，例如 `runs\platform-dev`。
+生产数据默认位于 `C:\ProgramData\MeshExperience`，不会写入仓库。本地一键启动脚本与网格 CLI 共用仓库根目录 `.env`，模板默认把开发数据写入 `runs\platform-dev`。
 
 ## 首次安装
 
@@ -29,19 +29,17 @@ npm ci
 npm run build
 Set-Location ..\..
 
-$env:PYTHONPATH = (Resolve-Path platform).Path
-$env:MESH_DATA_DIR = "C:\ProgramData\MeshExperience"
-$env:MESH_DATABASE_PATH = "C:\ProgramData\MeshExperience\mesh.sqlite3"
-platform\.venv\Scripts\python.exe -m mesh_app.db migrate
+Copy-Item .env.example .env
+.\platform\deploy\run-local.ps1 -Migrate
 ```
 
-迁移是显式运维动作。API 和 Worker 只检查数据库版本，不会在请求或启动时悄悄执行 DDL。升级代码后应先备份，再运行同一条 `mesh_app.db migrate` 命令。
+`-Migrate` 是显式迁移动作，迁移成功后会继续启动 API 和 Worker。日常启动不要添加该参数。API 和 Worker 只检查数据库版本，不会在请求或启动时悄悄执行 DDL。升级代码后应先备份，再显式执行一次 `run-local.ps1 -Migrate`；生产环境仍使用 `python -m mesh_app.db migrate`。
 
 后端锁文件固定直接与传递依赖版本；前端必须使用 `npm ci`，它严格使用已提交的 `package-lock.json`。
 
 ## 配置
 
-可复制 `.env.example` 中的值到进程或系统环境。PowerShell 脚本不会解析 `.env` 文件，避免把部署机密或许可证配置隐式带入进程。
+本地开发只使用仓库根目录 `.env`，网格 CLI 与 `run-local.ps1` 共用同一份 IGG 和平台配置。`run-local.ps1` 会把其中的 `IGG_EXE` 或 `IGG_PATH` 复用为平台 IGG 路径，因此无需再维护 `MESH_IGG_PATH`。两个独立的生产启动脚本仍只读取进程或系统环境变量，避免仓库内配置隐式进入计划任务。
 
 | 环境变量 | 默认值 | 含义 |
 |---|---:|---|
@@ -66,7 +64,15 @@ Windows 下 Worker 会把网格子进程加入带 `KILL_ON_JOB_CLOSE` 的 Job Ob
 
 ## 本机启动与开发
 
-先在一个终端启动 API，再在另一个终端启动 Worker：
+日常开发只需在仓库根目录执行一条命令：
+
+```powershell
+.\platform\deploy\run-local.ps1
+```
+
+脚本自动加载 `.env`、检查数据库版本、后台启动 API，并在当前终端运行 Worker；访问 `http://127.0.0.1:8000`。按 `Ctrl+C` 会停止 Worker，并由脚本清理 API 子进程。API 日志写入 `<MESH_DATA_DIR>\logs`。
+
+需要分别管理生产进程时，仍可先在一个终端启动 API，再在另一个终端启动 Worker：
 
 ```powershell
 $env:MESH_PYTHON = (Resolve-Path platform\.venv\Scripts\python.exe).Path
@@ -74,7 +80,7 @@ $env:MESH_PYTHON = (Resolve-Path platform\.venv\Scripts\python.exe).Path
 .\platform\deploy\run-worker.ps1
 ```
 
-脚本会解析仓库绝对路径，从仓库根运行，并把 `PYTHONPATH` 指向 `platform`。`mesh_app` 初始化时会定位 `src/` 网格内核，因此平台模块与 `src/mesh.py`、`src/controls.py` 均不依赖调用者当前目录。
+启动脚本会解析仓库绝对路径，并把 `PYTHONPATH` 指向 `platform`。`mesh_app` 初始化时会定位 `src/` 网格内核，因此平台模块与 `src/mesh.py`、`src/controls.py` 均不依赖调用者当前目录。
 
 前端热更新开发：
 
