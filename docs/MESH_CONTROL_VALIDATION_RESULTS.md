@@ -41,7 +41,7 @@ Schema 3 `run_summary.json`。判定分为：
 
 1. 生成成功：命令返回 0，四类主要产物完整；
 2. 结构有效：无负体积、无重叠，validity 正常；
-3. 质量通过：满足 `quality.py` 当前硬阈值。
+3. 质量通过：满足 `src/quality.py` 当前硬阈值。
 
 网格变化的主证据为 CGNS 全部结构化 block 的 I/J/K、点数/单元数、
 完整 `CoordinateX/Y/Z` 坐标 SHA-256、多重网格层级和聚合指纹。质量报告、
@@ -136,7 +136,7 @@ baseline。具有 gap、fillet、孔、针肋、snubber、bulb 或技术效果�
 
 ## 网格生成流程
 
-以下说明基于 `mesh.py` → `autogrid.py` 的实现，展示不使用控制参数与
+以下说明基于 `src/mesh.py` → `src/autogrid.py` 的实现，展示不使用控制参数与
 使用控制参数两种路径下的完整网格生成过程。
 
 ### 不使用控制参数的默认网格生成
@@ -145,11 +145,11 @@ baseline。具有 gap、fillet、孔、针肋、snubber、bulb 或技术效果�
 
 ```text
 ┌──────────────────────────────────────────────────────────────────┐
-│  1. 解析几何（mesh.py）                                          │
+│  1. 解析几何（src/mesh.py）                                      │
 │     parse_geomturbo("Rotor37.geomTurbo")                        │
 │     → 提取叶排名、叶片名、单位系统、已有技术效果数量等            │
 ├──────────────────────────────────────────────────────────────────┤
-│  2. 构建控制请求（mesh.py）                                      │
+│  2. 构建控制请求（src/mesh.py）                                  │
 │     _build_control_requests(args)                                │
 │     → 无 --set、无快捷参数 → 空列表 []                           │
 │     validate_wizard_compatibility([], use_row_wizard=True)       │
@@ -157,7 +157,7 @@ baseline。具有 gap、fillet、孔、针肋、snubber、bulb 或技术效果�
 │     resolve_control_requests([], geometry)                       │
 │     → 空列表 []                                                  │
 ├──────────────────────────────────────────────────────────────────┤
-│  3. 渲染 AutoGrid 脚本（autogrid.py）                             │
+│  3. 渲染 AutoGrid 脚本（src/autogrid.py）                         │
 │     render_autogrid_script(..., controls=[])                     │
 │     CONTROL_PLAN = []   ← 空控制计划                              │
 │     生成的 autogrid_init.py 结构：                                │
@@ -186,14 +186,14 @@ baseline。具有 gap、fillet、孔、针肋、snubber、bulb 或技术效果�
 │     ⑰ _emit_post_generation_readbacks() → 空                     │
 │     ⑱ a5_save_project / a5_save_mesh / a5_export_CGNS_project    │
 ├──────────────────────────────────────────────────────────────────┤
-│  4. 执行 IGG（autogrid.py）                                      │
+│  4. 执行 IGG（src/autogrid.py）                                  │
 │     subprocess.run(["igg", "-autogrid5", "-batch",                │
 │                      "-script", "autogrid_init.py"])              │
 │     → 解析 stdout 中的控制结果标记和生成后回读标记                │
 │     → 收集输出产物：.igg, .cgns, .trb, .geomTurbo, .config 等   │
 │     → 可选：从 CGNS 生成完整坐标 SHA-256 指纹                    │
 ├──────────────────────────────────────────────────────────────────┤
-│  5. 质量评估（mesh.py）                                           │
+│  5. 质量评估（src/mesh.py）                                      │
 │     summarize_quality(outputs, ...)                               │
 │     → 解析 qualityReport（若存在）                                │
 │     → 硬阈值判定：无负体积、skew≥15°、exp≤3、span skew 偏差≤40°  │
@@ -214,10 +214,10 @@ exp 1.7254、质量 PASS。
 
 ```text
 ┌──────────────────────────────────────────────────────────────────┐
-│  2'. 构建并解析控制请求（mesh.py）                                │
+│  2'. 构建并解析控制请求（src/mesh.py）                            │
 │                                                                    │
 │      命令行示例：                                                  │
-│      python mesh.py Rotor37.geomTurbo                             │
+│      python src/mesh.py Rotor37.geomTurbo                         │
 │        --set "configuration/grid_levels=4"                        │
 │        --set "row:*/flow_path.number=65"                          │
 │        --set "row:*/optimization.skewness=yes"                    │

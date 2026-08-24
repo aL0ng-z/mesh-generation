@@ -7,11 +7,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 
-# 根目录网格内核刻意不打包进 Web 依赖；无论服务从仓库根还是 platform/
+# src/ 网格内核刻意不打包进 Web 依赖；无论服务从仓库根还是 platform/
 # 启动，都通过本文件位置定位同机内核，避免依赖当前工作目录。
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
+_SOURCE_DIR = _PROJECT_ROOT / "src"
+if str(_SOURCE_DIR) not in sys.path:
+    sys.path.insert(0, str(_SOURCE_DIR))
 
 if TYPE_CHECKING:
     from .config import Settings

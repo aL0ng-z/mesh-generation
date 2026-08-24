@@ -176,7 +176,8 @@ def test_recover_stale_run_writes_failed_terminal_and_event(tmp_path: Path) -> N
 def test_control_snapshot_builds_stable_mesh_cli(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
-    (root / "mesh.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    (root / "src").mkdir()
+    (root / "src" / "mesh.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
     geometry = root / "case.geomTurbo"
     geometry.write_text("GEOMETRY", encoding="utf-8")
     snapshot = {
@@ -204,7 +205,7 @@ def test_control_snapshot_builds_stable_mesh_cli(tmp_path: Path) -> None:
         igg_path=root / "igg.exe",
         timeout_seconds=123,
     )
-    assert command[1] == str((root / "mesh.py").resolve())
+    assert command[1] == str((root / "src" / "mesh.py").resolve())
     assert command[2] == str(geometry.resolve())
     assert command.count("--set") == 5
     assert command[command.index("--timeout") + 1] == "123"
@@ -236,7 +237,8 @@ def test_worker_child_process_quality_fail_still_succeeds_and_heartbeats(tmp_pat
     geometry.write_text("GEOMETRY", encoding="utf-8")
     fake_root = tmp_path / "fake-project"
     fake_root.mkdir()
-    (fake_root / "mesh.py").write_text(
+    (fake_root / "src").mkdir()
+    (fake_root / "src" / "mesh.py").write_text(
         textwrap.dedent(
             """
             import argparse, json
@@ -342,7 +344,8 @@ def test_post_spawn_database_failure_terminates_process_tree_and_releases_task(
     geometry.write_text("GEOMETRY", encoding="utf-8")
     fake_root = tmp_path / "fake-project"
     fake_root.mkdir()
-    (fake_root / "mesh.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    (fake_root / "src").mkdir()
+    (fake_root / "src" / "mesh.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
     settings = Settings(
         project_root=fake_root,
         platform_dir=PROJECT_ROOT / "platform",

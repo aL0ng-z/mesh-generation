@@ -30,7 +30,7 @@ _PRECISE_SELECTOR = re.compile(r"^[a-z][a-z0-9-]*:#(?:[1-9][0-9]*)(?:/[a-z][a-z0
 
 
 class ControlService:
-    """把根目录控制注册表转换为网页可用的稳定契约。"""
+    """把 ``src/`` 控制注册表转换为网页可用的稳定契约。"""
 
     def __init__(self, database: Database, data_dir: str | Path) -> None:
         self.database = database
@@ -300,7 +300,7 @@ class ControlService:
 
 
 def target_to_selector(target: tuple[TargetEntity, ...]) -> str:
-    """将根目录目标实体转换为网页只读的精确 ``#N`` 选择器。"""
+    """将网格内核目标实体转换为网页只读的精确 ``#N`` 选择器。"""
 
     if not target:
         return "configuration"

@@ -2,12 +2,12 @@
 
 本项目从 `.geomTurbo` 文件直接建立 NUMECA AutoGrid 17.1 项目，应用经过类型校验的纯网格控制，生成 B2B/3D 网格，并把原生 `.qualityReport` 标准化为 Schema v3 运行摘要。
 
-当前网格内核保持根目录扁平：不依赖 `.trb` 模板，不读取 JSON/YAML 配置，不对 `.trb` 做字符串修改。`platform/` 额外提供独立的内网 Web 服务，且不改变根目录 CLI 的调用方式和标准库依赖边界。所有仓库内运行产物写入 `runs/`。
+当前网格内核在 `src/` 内保持扁平：不依赖 `.trb` 模板，不读取 JSON/YAML 配置，不对 `.trb` 做字符串修改。`platform/` 额外提供独立的内网 Web 服务，且不改变 CLI 的标准库依赖边界。所有仓库内运行产物写入 `runs/`。
 
 ## 已实现能力
 
 - 解析几何单位、叶排、主叶片、splitter、gap、partial-gap 和 fillet 等选择器信息。
-- 通过 `controls.py` 中唯一的静态 `ControlSpec` 注册表开放 AutoGrid 17.1 纯网格控制。
+- 通过 `src/controls.py` 中唯一的静态 `ControlSpec` 注册表开放 AutoGrid 17.1 纯网格控制。
 - 提供 P0/P1/P2 共 344 个控制键，以及 721 个官方 setter 的映射或明确排除审计。
 - 支持全局、wizard、row、blade、gap、partial-gap、fillet、interface、endwall 和已有技术效果等作用域。
 - 严格校验选择器、类型、枚举、范围、拓扑适用性和 AutoGrid API 能力。
@@ -25,13 +25,14 @@
 ## 项目结构
 
 ```text
-mesh.py                 命令行入口、Schema v3 摘要、网格指纹和中文报告
-controls.py             类型化控制注册表、选择器、校验、SI 换算和 17.1 API 审计
-geomturbo.py            .geomTurbo 元数据与实体选择信息解析
-autogrid.py             AutoGrid 17.1 脚本渲染、执行、回读和结果标记解析
-quality.py              .qualityReport/CGNS 质量解析与 PASS/FAIL/UNKNOWN 判定
+src/                    扁平的网格内核源码目录
+  mesh.py               命令行入口、Schema v3 摘要、网格指纹和中文报告
+  controls.py           类型化控制注册表、选择器、校验、SI 换算和 17.1 API 审计
+  geomturbo.py          .geomTurbo 元数据与实体选择信息解析
+  autogrid.py           AutoGrid 17.1 脚本渲染、执行、回读和结果标记解析
+  quality.py            .qualityReport/CGNS 质量解析与 PASS/FAIL/UNKNOWN 判定
 geometries/             .geomTurbo 输入样例
-tests/                  根目录实现的单元测试
+tests/                  src/ 实现的单元测试
 docs/                   设计、控制目录、质量准则和开发日志
 platform/               独立的 FastAPI、Worker、React UI、SQLite 迁移和部署脚本
 runs/                   可丢弃的运行产物
@@ -40,7 +41,7 @@ archive/                v0～v6 历史快照；当前实现完全不读取
 
 ## 运行环境
 
-根目录网格 CLI 仅依赖 Python 标准库，无需安装第三方包，使用系统任意 Python ≥3.7 即可运行。内网平台使用 Python ≥3.11，其第三方依赖和锁定版本完全隔离在 `platform/`。
+`src/` 网格 CLI 仅依赖 Python 标准库，无需安装第三方包，使用系统任意 Python ≥3.7 即可运行。内网平台使用 Python ≥3.11，其第三方依赖和锁定版本完全隔离在 `platform/`。
 
 内网平台的安装、迁移、启动、HTTPS、备份与验收说明见 [`platform/README.md`](platform/README.md)。
 
@@ -63,19 +64,19 @@ IGG_EXE=C:\ProgramData\NUMECA\fine171\bin64\iggx86_64.exe
 默认生成网格：
 
 ```powershell
-python mesh.py geometries/Rotor37.geomTurbo
+python src/mesh.py geometries/Rotor37.geomTurbo
 ```
 
 只完成静态校验、脚本渲染和计划记录，不启动 IGG：
 
 ```powershell
-python mesh.py geometries/Rotor37.geomTurbo --dry-run
+python src/mesh.py geometries/Rotor37.geomTurbo --dry-run
 ```
 
 指定输出目录和超时：
 
 ```powershell
-python mesh.py geometries/WP100_comp.geomTurbo --out runs/wp100 --timeout 1200
+python src/mesh.py geometries/WP100_comp.geomTurbo --out runs/wp100 --timeout 1200
 ```
 
 ## 控制目录查询
@@ -83,18 +84,18 @@ python mesh.py geometries/WP100_comp.geomTurbo --out runs/wp100 --timeout 1200
 查询不需要提供几何文件：
 
 ```powershell
-python mesh.py --list-controls
-python mesh.py --list-controls P0
-python mesh.py --list-controls P1
-python mesh.py --describe-control row/optimization.steps
+python src/mesh.py --list-controls
+python src/mesh.py --list-controls P0
+python src/mesh.py --list-controls P1
+python src/mesh.py --describe-control row/optimization.steps
 ```
 
-`--describe-control` 会显示类型、范围、单位、优先级、阶段、适用拓扑、setter/getter 和回读能力。完整控制目录以 `controls.py` 的注册表及上述命令输出为准。
+`--describe-control` 会显示类型、范围、单位、优先级、阶段、适用拓扑、setter/getter 和回读能力。完整控制目录以 `src/controls.py` 的注册表及上述命令输出为准。
 
 ## 高频控制
 
 ```powershell
-python mesh.py geometries/Rotor37.geomTurbo `
+python src/mesh.py geometries/Rotor37.geomTurbo `
   --mesh-level fine `
   --first-cell-width 1e-5 `
   --spanwise-paths 97 `
@@ -120,7 +121,7 @@ python mesh.py geometries/Rotor37.geomTurbo `
 `--set` 可重复使用，每次只接收一条已注册控制：
 
 ```powershell
-python mesh.py geometries/WP100_comp.geomTurbo `
+python src/mesh.py geometries/WP100_comp.geomTurbo `
   --set "configuration/grid_levels=3" `
   --set "row:*/optimization.steps=200" `
   --set "row:diffuser_axial/flow_path.number=89" `
@@ -130,7 +131,7 @@ python mesh.py geometries/WP100_comp.geomTurbo `
 blade/gap 示例：
 
 ```powershell
-python mesh.py geometries/Rotor37.geomTurbo `
+python src/mesh.py geometries/Rotor37.geomTurbo `
   --set "row:row 1/blade:Main Blade/gap:shroud/spanwise_points=17"
 ```
 
@@ -254,7 +255,7 @@ quality
 
 ## 测试
 
-只运行当前根目录测试：
+只运行当前实现的根测试：
 
 ```powershell
 python -m pytest tests -q

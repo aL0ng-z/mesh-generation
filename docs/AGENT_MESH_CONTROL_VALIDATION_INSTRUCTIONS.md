@@ -10,7 +10,7 @@
 
 ### 一、最终目标
 
-对当前 `controls.py` 注册的 341 个控制键逐项回答：
+对当前 `src/controls.py` 注册的 341 个控制键逐项回答：
 
 1. API 映射、对象、调用签名、类型、单位、阶段和依赖是否正确；
 2. 在适用几何和实体上，真实 AutoGrid 调用是否成功；
@@ -40,11 +40,11 @@ API/签名
 ```text
 AGENTS.md
 docs/MESH_CONTROL_AUDIT_AND_TEST_PLAN.md
-controls.py
-autogrid.py
-mesh.py
-geomturbo.py
-quality.py
+src/controls.py
+src/autogrid.py
+src/mesh.py
+src/geomturbo.py
+src/quality.py
 tests/test_controls.py
 tests/test_autogrid.py
 tests/test_mesh.py
@@ -66,11 +66,11 @@ C:\ProgramData\NUMECA\fine171\_python\_igg\PYTHON.py
 2. 不使用 Git worktree，不新建分支，不提交，除非用户另行明确要求。
 3. 先执行 `git status --short`，保留所有用户已有改动；不得覆盖、还原或顺手整理无关文件。
 4. 生产实现保持不变：
-   - 不修改 `mesh.py`
-   - 不修改 `controls.py`
-   - 不修改 `autogrid.py`
-   - 不修改 `geomturbo.py`
-   - 不修改 `quality.py`
+   - 不修改 `src/mesh.py`
+   - 不修改 `src/controls.py`
+   - 不修改 `src/autogrid.py`
+   - 不修改 `src/geomturbo.py`
+   - 不修改 `src/quality.py`
 5. 如需自动化，可新增最小化 test-only 脚本或测试文件，但不得引入包级子目录、JSON/YAML 配置或第三方依赖。
 6. 项目和测试工具只使用 Python 标准库、本机 NUMECA/IGG API 和系统已有命令。
 7. 如新增或修改任何代码，必须用中文更新 `docs/DevLog.md`。

@@ -157,11 +157,12 @@ NI_END niRow
 
 ```text
 项目根目录/
-├── mesh.py          ← CLI 入口：解析参数、编排全流程、写摘要和报告
-├── controls.py      ← 核心：344 项控制规格的静态注册表 + 选择器 + 解析 + 校验 + 审计
-├── geomturbo.py     ← 输入：解析 .geomTurbo 文件的几何与拓扑信息
-├── autogrid.py      ← 输出：生成 AutoGrid Python 脚本并调用 IGG 执行
-├── quality.py       ← 输出后：解析 .qualityReport 并判定 PASS/FAIL/UNKNOWN
+├── src/             ← 扁平的网格内核源码目录
+│   ├── mesh.py      ← CLI 入口：解析参数、编排全流程、写摘要和报告
+│   ├── controls.py  ← 核心：344 项控制规格的静态注册表 + 选择器 + 解析 + 校验 + 审计
+│   ├── geomturbo.py ← 输入：解析 .geomTurbo 文件的几何与拓扑信息
+│   ├── autogrid.py  ← 输出：生成 AutoGrid Python 脚本并调用 IGG 执行
+│   └── quality.py   ← 输出后：解析 .qualityReport 并判定 PASS/FAIL/UNKNOWN
 ├── geometries/      ← 样例：.geomTurbo 输入文件
 ├── tests/           ← 测试：单元测试（当前 39 个通过）
 ├── docs/            ← 文档：设计说明、控制目录、质量准则、开发日志
@@ -174,7 +175,7 @@ NI_END niRow
 **依赖关系**（谁 import 谁）：
 
 ```text
-mesh.py
+src/mesh.py
   ├── controls.py      # 控制项解析和校验
   ├── geomturbo.py     # 几何文件解析
   ├── autogrid.py      # 脚本生成和执行
@@ -189,17 +190,17 @@ mesh.py
 用户执行：
 
 ```powershell
-python mesh.py geometries/Rotor37.geomTurbo --mesh-level fine --first-cell-width 1e-5
+python src/mesh.py geometries/Rotor37.geomTurbo --mesh-level fine --first-cell-width 1e-5
 ```
 
 下面是每一步的详细数据流：
 
 ```text
-Step 1: 解析命令行参数（mesh.py:main）
+Step 1: 解析命令行参数（src/mesh.py:main）
   └→ args = argparse.Namespace(geomturbo="geometries/Rotor37.geomTurbo",
          mesh_level="fine", first_cell_width=1e-5, ...)
 
-Step 2: 解析几何文件（geomturbo.py:parse_geomturbo）
+Step 2: 解析几何文件（src/geomturbo.py:parse_geomturbo）
   输入:  "geometries/Rotor37.geomTurbo" 文件内容（文本）
   输出:  GeomTurboSummary(
            path="...",
@@ -209,37 +210,37 @@ Step 2: 解析几何文件（geomturbo.py:parse_geomturbo）
            rows=[RowInfo(name="Rotor", periodicity=36, blades=[BladeInfo(...)])]
          )
 
-Step 3: 构建控制请求（mesh.py:_build_control_requests）
+Step 3: 构建控制请求（src/mesh.py:_build_control_requests）
   输入:  args.mesh_level="fine", args.first_cell_width=1e-5
   输出:  ["row:*/mesh_level=fine", "row:*/wizard/first_cell_width=1e-5"]
          (快捷参数被转换为标准的 --set 表达式)
 
-Step 4: 解析并校验控制（controls.py:parse_control_assignments）
+Step 4: 解析并校验控制（src/controls.py:parse_control_assignments）
   输入:  ["row:*/mesh_level=fine", "row:*/wizard/first_cell_width=1e-5"]
   输出:  [ControlRequest(raw="row:*/mesh_level=fine", key="row/mesh_level",
            selectors=(EntitySelector(kind="row", mode="wildcard", value="*"),),
            value="fine", spec=ControlSpec(...)), ...]
 
-Step 5: 展开通配符、绑定实体（controls.py:resolve_control_requests）
+Step 5: 展开通配符、绑定实体（src/controls.py:resolve_control_requests）
   输入:  requests + GeomTurboSummary
   输出:  [ResolvedControl(control_id="C0001", key="row/mesh_level",
            target=(TargetEntity(kind="row", index=1, name="Rotor"),),
            requested_value="fine", project_value="fine",
            api_value=4, setter="set_coarse_grid_level", ...)]
 
-Step 6: 生成 AutoGrid 脚本（autogrid.py:render_autogrid_script）
+Step 6: 生成 AutoGrid 脚本（src/autogrid.py:render_autogrid_script）
   输入:  GeomTurboSummary + ResolvedControl[]
   输出:  "runs/Rotor37_.../autogrid_init.py" 文件（Python 脚本文本）
 
-Step 7: 执行 IGG（autogrid.py:run_autogrid_init）
+Step 7: 执行 IGG（src/autogrid.py:run_autogrid_init）
   输入:  "iggx86_64.exe -autogrid5 -batch -script autogrid_init.py"
   输出:  AutoGridRun(command, returncode=0, outputs={...}, control_results=[...])
 
-Step 8: 解析质量报告（quality.py:summarize_quality）
+Step 8: 解析质量报告（src/quality.py:summarize_quality）
   输入:  outputs["quality_report"] = "runs/.../mesh.qualityReport"
   输出:  {metrics_source, metadata, project, entities, metrics, result}
 
-Step 9: 写入运行摘要和报告（mesh.py:main）
+Step 9: 写入运行摘要和报告（src/mesh.py:main）
   输出:  run_summary.json + report.md
 ```
 
@@ -288,7 +289,7 @@ Step 9: 写入运行摘要和报告（mesh.py:main）
 
 ## 2. 几何解析（`geomturbo.py`）
 
-文件位置：`geomturbo.py`（249 行）
+文件位置：`src/geomturbo.py`（249 行）
 
 ### 2.1 `.geomTurbo` 文件格式
 
@@ -504,7 +505,7 @@ api_value = 1e-5 / 0.001 = 0.01  (毫米)
 
 ## 3. 控制项系统（`controls.py`）
 
-文件位置：`controls.py`（2093 行，项目最大的模块）
+文件位置：`src/controls.py`（2093 行，项目最大的模块）
 
 ### 3.1 设计动机：为什么需要控制项系统
 
@@ -916,7 +917,7 @@ missing    (  0 个) → 不允许存在
 
 ## 4. AutoGrid 脚本执行（`autogrid.py`）
 
-文件位置：`autogrid.py`（642 行）
+文件位置：`src/autogrid.py`（642 行）
 
 ### 4.1 概览
 
@@ -952,7 +953,7 @@ class AutoGridRun:
 
 ```python
 # -*- coding: utf-8 -*-
-# 由 mesh.py 自动生成，目标版本仅限 NUMECA AutoGrid 17.1。
+# 由 src/mesh.py 自动生成，目标版本仅限 NUMECA AutoGrid 17.1。
 
 import os, json
 
@@ -1159,7 +1160,7 @@ if effective_returncode == 0 and (failed_control is not None or script_error is 
 
 ## 5. 质量评估（`quality.py`）
 
-文件位置：`quality.py`（709 行）
+文件位置：`src/quality.py`（709 行）
 
 ### 5.1 概览
 
@@ -1350,7 +1351,7 @@ class QualityEvaluation:
 
 ## 6. CLI 入口（`mesh.py`）
 
-文件位置：`mesh.py`（468 行）
+文件位置：`src/mesh.py`（468 行）
 
 ### 6.1 `main()` 函数
 
@@ -1505,6 +1506,6 @@ Float64 坐标，记录 I/J/K、点数/单元数、逐 block SHA-256、固定坐
 
 > **文档版本**：2026-07-23，基于 AutoGrid 17.1 实现
 > 
-> 本文档对应的代码版本是 `controls.py` 344 项控制注册表、`autogrid.py`
+> 本文档对应的代码版本是 `src/controls.py` 344 项控制注册表、`src/autogrid.py`
 > 721 项 setter 审计、`run_summary.json` Schema v3，以及保持兼容的
-> `quality.py` Schema v2 质量模型。
+> `src/quality.py` Schema v2 质量模型。

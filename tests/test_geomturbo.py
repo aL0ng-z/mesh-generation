@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from geomturbo import (
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE_DIR = ROOT / "src"
+if str(SOURCE_DIR) not in sys.path:
+    sys.path.insert(0, str(SOURCE_DIR))
+
+from geomturbo import (  # noqa: E402
     MAX_BLADES_PER_ROW,
     MAX_IDENTIFIER_CHARS,
     MAX_NESTING_DEPTH,
@@ -14,9 +21,6 @@ from geomturbo import (
     GeomTurboParseError,
     parse_geomturbo,
 )
-
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 class GeomTurboParserTests(unittest.TestCase):

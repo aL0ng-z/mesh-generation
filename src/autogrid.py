@@ -192,7 +192,7 @@ def render_autogrid_script(
     control_plan = _serialize_control_plan(controls)
     control_plan_json = json.dumps(control_plan, ensure_ascii=True, sort_keys=True)
     return f'''# -*- coding: utf-8 -*-
-# 由 mesh.py 自动生成，目标版本仅限 NUMECA AutoGrid 17.1。
+# 由 src/mesh.py 自动生成，目标版本仅限 NUMECA AutoGrid 17.1。
 # 仅从 geomTurbo 初始化；不读取模板，不修改 .trb 文本。
 
 import os

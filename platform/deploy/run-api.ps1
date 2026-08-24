@@ -24,7 +24,7 @@ if (-not (Test-Path -LiteralPath $uiIndex -PathType Leaf)) {
     throw "找不到前端构建产物：$uiIndex。请先在 platform\ui 执行 npm ci 和 npm run build。"
 }
 
-# 从仓库根运行，使根目录 mesh.py/controls.py 可导入；platform 提供 mesh_app 包。
+# 从仓库根运行；platform 提供 mesh_app 包，其初始化会定位 src/ 网格内核。
 $env:PYTHONPATH = $platformDir
 Set-Location -LiteralPath $repoRoot
 

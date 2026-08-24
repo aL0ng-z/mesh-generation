@@ -7,5 +7,7 @@ from pathlib import Path
 
 
 PLATFORM_DIR = Path(__file__).resolve().parents[1]
-if str(PLATFORM_DIR) not in sys.path:
-    sys.path.insert(0, str(PLATFORM_DIR))
+SOURCE_DIR = PLATFORM_DIR.parent / "src"
+for module_dir in (PLATFORM_DIR, SOURCE_DIR):
+    if str(module_dir) not in sys.path:
+        sys.path.insert(0, str(module_dir))

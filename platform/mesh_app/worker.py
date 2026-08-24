@@ -1,7 +1,7 @@
 """SQLite 持久队列与本地网格 Worker。
 
-Worker 只在资源门控通过后原子领取任务，以独立 Python 子进程调用根目录
-``mesh.py``。进程退出后一次性写入终态；网格质量 FAIL/UNKNOWN 不会被误判为
+Worker 只在资源门控通过后原子领取任务，以独立 Python 子进程调用
+``src/mesh.py``。进程退出后一次性写入终态；网格质量 FAIL/UNKNOWN 不会被误判为
 执行失败，预览转换失败也只影响 ``preview_status``。
 """
 
@@ -319,7 +319,7 @@ def recover_stale_runs(
 
 
 def control_snapshot_to_assignments(snapshot: Mapping[str, Any] | str) -> list[str]:
-    """把平台规范化控制快照转换为根 ``mesh.py --set`` 表达式。"""
+    """把平台规范化控制快照转换为 ``src/mesh.py --set`` 表达式。"""
 
     if isinstance(snapshot, str):
         try:
@@ -367,12 +367,12 @@ def build_mesh_command(
     timeout_seconds: int | None = None,
     python_executable: str | os.PathLike[str] = sys.executable,
 ) -> list[str]:
-    """构造不经过 shell 的根网格 CLI 命令。"""
+    """构造不经过 shell 的网格 CLI 命令。"""
 
     root = Path(project_root).resolve()
-    mesh_script = root / "mesh.py"
+    mesh_script = root / "src" / "mesh.py"
     if not mesh_script.is_file():
-        raise FileNotFoundError(f"找不到根网格入口：{mesh_script}")
+        raise FileNotFoundError(f"找不到网格入口：{mesh_script}")
     geometry = Path(geometry_path).resolve()
     if not geometry.is_file():
         raise FileNotFoundError(f"找不到几何输入：{geometry}")

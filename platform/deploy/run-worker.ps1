@@ -18,7 +18,7 @@ if ([string]::IsNullOrWhiteSpace($PythonExecutable)) {
     }
 }
 
-# 从仓库根运行，使 Worker 子进程沿用根 CLI；不在脚本中迁移数据库或探测许可证。
+# 从仓库根运行，使 Worker 子进程调用 src/mesh.py；不在脚本中迁移数据库或探测许可证。
 $env:PYTHONPATH = $platformDir
 Set-Location -LiteralPath $repoRoot
 

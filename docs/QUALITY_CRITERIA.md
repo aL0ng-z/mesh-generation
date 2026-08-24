@@ -1,6 +1,6 @@
 # AutoGrid 17.1 网格质量解析与判定准则
 
-本文档定义 `quality.py` 的质量数据模型和判定行为。质量判定只用于初始网格硬门槛检查，不能替代 CFD 收敛、目标 `y+` 或网格无关性验证。
+本文档定义 `src/quality.py` 的质量数据模型和判定行为。质量判定只用于初始网格硬门槛检查，不能替代 CFD 收敛、目标 `y+` 或网格无关性验证。
 
 ## 数据源优先级
 
@@ -174,6 +174,10 @@ WP100 的失败原因是最大膨胀比和展向角偏差；ori1 的失败原因
 ## 使用示例
 
 ```python
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path("src").resolve()))
 from quality import summarize_quality
 
 summary = summarize_quality(

@@ -2,7 +2,7 @@
 
 ## 1. 总体架构
 
-从干净的 `main` 开始重建，不复用 `feat/platform-mvp` 的控制面、数据库或在线数据。保留根目录网格内核，通过同机 Python 服务直接调用，移除 Sites、登录、D1/R2 和远程 Runner 协议。
+从干净的 `main` 开始重建，不复用 `feat/platform-mvp` 的控制面、数据库或在线数据。保留 `src/` 网格内核，通过同机 Python 服务直接调用，移除 Sites、登录、D1/R2 和远程 Runner 协议。
 
 ```text
 内网浏览器
@@ -16,7 +16,7 @@ FastAPI API + React 静态页面
    ├── 本地文件系统：几何、CGNS、TRB、报告、预览缓存
    └── 本地调度 Worker
           ├── 最多 20 个任务，受内存/磁盘门控
-          ├── 独立子进程调用 main/mesh.py
+          ├── 独立子进程调用 src/mesh.py
           ├── Windows Job Object 管理 IGG 进程树
           └── HDF5 CGNS → vtk.js 预览资产
 ```
@@ -41,11 +41,12 @@ FastAPI API + React 静态页面
 ## 2. 文件结构与核心实现
 
 ```text
-mesh.py
-geomturbo.py
-autogrid.py
-controls.py
-quality.py
+src/
+├── mesh.py
+├── geomturbo.py
+├── autogrid.py
+├── controls.py
+└── quality.py
 
 platform/
 ├── pyproject.toml
@@ -90,7 +91,7 @@ platform/
     └── install-startup-tasks.ps1
 ```
 
-根目录网格 CLI 保持兼容，仅在 `controls.py` 增加一个受测试的公开目标枚举接口，供网页复用现有几何适用性逻辑。Web 依赖完全隔离在 `platform/`，不改变命令行工具的标准库运行边界。
+`src/` 网格 CLI 保持标准库运行边界；`src/controls.py` 提供一个受测试的公开目标枚举接口，供网页复用现有几何适用性逻辑。Web 依赖完全隔离在 `platform/`。
 
 生产数据由 `MESH_DATA_DIR` 指定，默认示例为 `C:\ProgramData\MeshExperience`；数据库和产物不写入仓库。开发环境可显式指向 `runs/platform-dev/`。
 

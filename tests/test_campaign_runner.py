@@ -33,7 +33,8 @@ from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
+SOURCE_DIR = PROJECT_ROOT / "src"
+sys.path.insert(0, str(SOURCE_DIR))
 
 from controls import (  # noqa: E402
     CONDITIONAL_KEY_TOPOLOGY,
@@ -60,7 +61,7 @@ from controls import (  # noqa: E402
 
 
 GEOMETRY_PATH = PROJECT_ROOT / "geometries" / "Rotor37.geomTurbo"
-MESH_PY = PROJECT_ROOT / "mesh.py"
+MESH_PY = SOURCE_DIR / "mesh.py"
 AUTOGRID_171 = Path(r"C:\ProgramData\NUMECA\fine171\_python\_autogrid\Autogrid.py")
 IGG_PYTHON_171 = Path(r"C:\ProgramData\NUMECA\fine171\_python\_igg\PYTHON.py")
 RUNS_ROOT = PROJECT_ROOT / "runs" / "rotor37-control-validation"
@@ -72,11 +73,11 @@ TOPOLOGY_VALUES = ("default", "hoh", "hi")
 REQUIRED_OUTPUTS = frozenset({"igg", "cgns", "trb", "quality_report"})
 
 SOURCE_FILES = (
-    PROJECT_ROOT / "mesh.py",
-    PROJECT_ROOT / "controls.py",
-    PROJECT_ROOT / "autogrid.py",
-    PROJECT_ROOT / "geomturbo.py",
-    PROJECT_ROOT / "quality.py",
+    SOURCE_DIR / "mesh.py",
+    SOURCE_DIR / "controls.py",
+    SOURCE_DIR / "autogrid.py",
+    SOURCE_DIR / "geomturbo.py",
+    SOURCE_DIR / "quality.py",
     Path(__file__).resolve(),
     PROJECT_ROOT / "tests" / "test_analyze_results.py",
     GEOMETRY_PATH,

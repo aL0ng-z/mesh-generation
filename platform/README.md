@@ -74,7 +74,7 @@ $env:MESH_PYTHON = (Resolve-Path platform\.venv\Scripts\python.exe).Path
 .\platform\deploy\run-worker.ps1
 ```
 
-脚本会解析仓库绝对路径，从仓库根运行，并把 `PYTHONPATH` 指向 `platform`。因此 `mesh_app` 与根目录 `mesh.py`、`controls.py` 均可导入，不依赖调用者当前目录。
+脚本会解析仓库绝对路径，从仓库根运行，并把 `PYTHONPATH` 指向 `platform`。`mesh_app` 初始化时会定位 `src/` 网格内核，因此平台模块与 `src/mesh.py`、`src/controls.py` 均不依赖调用者当前目录。
 
 前端热更新开发：
 

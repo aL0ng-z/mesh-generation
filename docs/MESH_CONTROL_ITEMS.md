@@ -1,6 +1,6 @@
 # AutoGrid 17.1 网格控制目录与 API 审计
 
-本文档说明当前已实现的控制模型。完整、可执行的唯一参数来源是项目根目录 `controls.py` 中的静态 `ControlSpec` 注册表；本文不维护第二份容易失步的手工键清单。
+本文档说明当前已实现的控制模型。完整、可执行的唯一参数来源是 `src/controls.py` 中的静态 `ControlSpec` 注册表；本文不维护第二份容易失步的手工键清单。
 
 ## 实现边界
 
@@ -52,7 +52,7 @@
 | `wizard/spanwise_paths` | row wizard | RowWizard 展向 flow paths 数 |
 | `gap/spanwise_points` | 已有 gap | gap 展向点数 |
 
-其中高频项还具有 `mesh.py` 的显式 CLI 参数；其余控制统一通过 `--set` 使用。
+其中高频项还具有 `src/mesh.py` 的显式 CLI 参数；其余控制统一通过 `--set` 使用。
 
 ## P1：常用精细控制
 
@@ -69,8 +69,8 @@ P1 共 59 项，覆盖：
 查询完整目录：
 
 ```powershell
-python mesh.py --list-controls P1
-python mesh.py --describe-control blade/b2b.default.streamwise_inlet_points
+python src/mesh.py --list-controls P1
+python src/mesh.py --describe-control blade/b2b.default.streamwise_inlet_points
 ```
 
 ## P2：高级与已有实体控制
@@ -88,8 +88,8 @@ P2 共 275 项，覆盖：
 查询完整目录：
 
 ```powershell
-python mesh.py --list-controls P2
-python mesh.py --describe-control blade/b2b.hoh.wake_control
+python src/mesh.py --list-controls P2
+python src/mesh.py --describe-control blade/b2b.hoh.wake_control
 ```
 
 ## 路径与选择器
@@ -177,6 +177,7 @@ C:\ProgramData\NUMECA\fine171\_python\_autogrid\Autogrid.py
 审计可复现：
 
 ```powershell
+$env:PYTHONPATH = "src"
 python -c "from collections import Counter; from controls import audit_autogrid_source; p=r'C:\ProgramData\NUMECA\fine171\_python\_autogrid\Autogrid.py'; print(Counter(x['status'] for x in audit_autogrid_source(p)))"
 ```
 
@@ -208,7 +209,7 @@ dry-run 只在 `controls.resolved` 中记录 `planned`，不会把控制写成 `
 
 ### 途径 1：独立 CLI 参数（7 个 P0 高频项）
 
-以下 P0 控制项在 `mesh.py` 中有专用命令行参数，无需书写 `--set` 表达式：
+以下 P0 控制项在 `src/mesh.py` 中有专用命令行参数，无需书写 `--set` 表达式：
 
 | CLI 参数 | 对应控制键 | 值类型 | 说明 |
 |---|---|---|---|
@@ -225,14 +226,20 @@ dry-run 只在 `controls.resolved` 中记录 `planned`，不会把控制写成 `
 ### 途径 2：通用 `--set` 表达式（全部 344 个控制键）
 
 ```bash
-python mesh.py input.geomTurbo --set "row:*/mesh_level=medium"
-python mesh.py input.geomTurbo --set "row:Rotor/blade:#1/b2b.default.streamwise_inlet_points=33"
-python mesh.py input.geomTurbo --set "configuration/grid_levels=3"
+python src/mesh.py input.geomTurbo --set "row:*/mesh_level=medium"
+python src/mesh.py input.geomTurbo --set "row:Rotor/blade:#1/b2b.default.streamwise_inlet_points=33"
+python src/mesh.py input.geomTurbo --set "configuration/grid_levels=3"
 ```
 
 `--set` 可在一条命令中重复多次，每次定义一个控制项。
 
 ### 途径 3：Python API（程序化调用）
+
+从仓库根运行自定义脚本前，将 `src/` 加入模块搜索路径：
+
+```powershell
+$env:PYTHONPATH = "src"
+```
 
 ```python
 from controls import parse_control_assignments, resolve_control_requests
@@ -271,7 +278,7 @@ project_value = requested_si / units_factor
 
 ## 按作用域分类总览
 
-以下按 `target_kind` 列出全部 344 个控制键的分布。完整、可执行的权威来源仍是 `controls.py` 中的 `CONTROL_REGISTRY`；此表用于快速定位。
+以下按 `target_kind` 列出全部 344 个控制键的分布。完整、可执行的权威来源仍是 `src/controls.py` 中的 `CONTROL_REGISTRY`；此表用于快速定位。
 
 ### configuration（全局配置）— 20 项
 
@@ -368,7 +375,7 @@ project_value = requested_si / units_factor
 
 ## P1 控制项完整列表
 
-查询实时目录：`python mesh.py --list-controls P1`。以下为 P1 全部 59 项的速览：
+查询实时目录：`python src/mesh.py --list-controls P1`。以下为 P1 全部 59 项的速览：
 
 **wizard（4 项）：** `wizard/far_field_spanwise_paths`、`wizard/far_field_constant_cells_percent`、`wizard/full_matching`、`wizard/blade_tip_rounded_topology`
 

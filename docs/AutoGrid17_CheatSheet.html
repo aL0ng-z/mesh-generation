@@ -858,17 +858,17 @@ Rotor37 全绿通过；WP100_comp 膨胀比超标（3.72 > 3.0）且展向偏斜
 <h3>八、常用命令</h3>
 <table>
 <thead><tr><th style="width:28%">用途</th><th>命令</th></tr></thead>
-<tr><td>列出全部控制</td><td class="mono-cell">python mesh.py --list-controls</td></tr>
-<tr><td>列 P0/P1/P2 控制</td><td class="mono-cell">python mesh.py --list-controls P1</td></tr>
-<tr><td>查看单项详情</td><td class="mono-cell">python mesh.py --describe-control blade/b2b.default.streamwise_inlet_points</td></tr>
-<tr><td>dry-run 验证</td><td class="mono-cell">python mesh.py in.geomTurbo --dry-run --set "row:*/mesh_level=fine"</td></tr>
-<tr><td>实机生成</td><td class="mono-cell">python mesh.py in.geomTurbo --mesh-level fine --target-points 500000</td></tr>
-<tr><td>多项 --set 组合</td><td class="mono-cell">python mesh.py in.geomTurbo --set "config/grid_levels=3" --set "row:*/flow_path.number=73"</td></tr>
+<tr><td>列出全部控制</td><td class="mono-cell">python src/mesh.py --list-controls</td></tr>
+<tr><td>列 P0/P1/P2 控制</td><td class="mono-cell">python src/mesh.py --list-controls P1</td></tr>
+<tr><td>查看单项详情</td><td class="mono-cell">python src/mesh.py --describe-control blade/b2b.default.streamwise_inlet_points</td></tr>
+<tr><td>dry-run 验证</td><td class="mono-cell">python src/mesh.py in.geomTurbo --dry-run --set "row:*/mesh_level=fine"</td></tr>
+<tr><td>实机生成</td><td class="mono-cell">python src/mesh.py in.geomTurbo --mesh-level fine --target-points 500000</td></tr>
+<tr><td>多项 --set 组合</td><td class="mono-cell">python src/mesh.py in.geomTurbo --set "config/grid_levels=3" --set "row:*/flow_path.number=73"</td></tr>
 </table>
 
 
 <!-- ═══════ FOOTER ═══════ -->
-<p class="footer">AutoGrid 17.1 网格控制与质量速查 · 基于 controls.py (341 项) &amp; quality.py · 2026-07-23 · 由 generate_cheatsheet.py 自动生成</p>
+<p class="footer">AutoGrid 17.1 网格控制与质量速查 · 基于 src/controls.py (341 项) &amp; src/quality.py · 2026-07-23 · 由 generate_cheatsheet.py 自动生成</p>
 
 </body>
 </html>

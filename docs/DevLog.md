@@ -1,5 +1,19 @@
 # 开发日志
 
+## 2026-08-24：网格内核迁移至 src 目录
+
+### 源码与调用路径
+
+- 将 `mesh.py`、`controls.py`、`geomturbo.py`、`autogrid.py` 和 `quality.py` 从项目根目录迁入扁平的 `src/`；保持脚本间同级导入和仅依赖 Python 标准库的既有边界，不引入包封装或兼容入口。
+- CLI 调用统一改为 `python src/mesh.py ...`；平台模块初始化时显式定位 `src/`，Worker 子进程入口同步改为仓库内绝对路径 `src/mesh.py`。
+- 更新根测试、平台测试、控制验证活动、部署脚本及维护中的 Markdown/HTML 文档路径；历史开发日志不回写。
+
+### 验证
+
+- `python src/mesh.py --describe-control row/optimization.steps` 执行成功，确认新 CLI 入口及同级模块导入可用。
+- 根测试通过：17 项测试及 5 个子测试全部通过。
+- 使用既有 `platform/.venv` 完成平台回归：38 项全部通过；仅保留 FastAPI TestClient 已有的 1 条弃用警告。
+
 ## 2026-08-09：修复网页用户验收问题
 
 ### 状态呈现与可用性
