@@ -53,6 +53,8 @@ class Settings:
     preview_dir: Path
     ui_dist_dir: Path
     igg_path: Path | None
+    auth_username: str | None = None
+    auth_password_hash: str | None = None
     max_concurrency: int = 20
     memory_reservation_gb: float = 2.5
     min_free_memory_gb: float = 8.0
@@ -89,6 +91,10 @@ class Settings:
         max_concurrency = _env_int(env, "MESH_MAX_CONCURRENCY", 20, minimum=1)
         if max_concurrency > 20:
             raise ValueError("环境变量 MESH_MAX_CONCURRENCY 不得超过 20")
+        auth_username = env.get("MESH_AUTH_USERNAME", "").strip() or None
+        auth_password_hash = env.get("MESH_AUTH_PASSWORD_HASH", "").strip() or None
+        if (auth_username is None) != (auth_password_hash is None):
+            raise ValueError("MESH_AUTH_USERNAME 与 MESH_AUTH_PASSWORD_HASH 必须同时设置或同时留空")
         return cls(
             project_root=root,
             platform_dir=platform_dir,
@@ -100,6 +106,8 @@ class Settings:
             preview_dir=data_dir / "previews",
             ui_dist_dir=platform_dir / "ui" / "dist",
             igg_path=igg_path,
+            auth_username=auth_username,
+            auth_password_hash=auth_password_hash,
             max_concurrency=max_concurrency,
             memory_reservation_gb=_env_float(env, "MESH_MEMORY_RESERVATION_GB", 2.5),
             min_free_memory_gb=_env_float(env, "MESH_MIN_FREE_MEMORY_GB", 8.0),

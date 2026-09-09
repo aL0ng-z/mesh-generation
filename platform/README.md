@@ -1,8 +1,8 @@
 # 叶轮机械网格经验内网平台
 
-本目录提供一个无登录的内网共享工作区：上传 `.geomTurbo` 后自动创建 baseline，通过不可变运行树保存控制分支、质量、事件、产物与专家经验。FastAPI 同时托管 API 和 React 静态页面，独立 Worker 从 SQLite 持久队列领取任务，Caddy 在最外层提供 HTTPS。
+本目录提供一个内网共享工作区：上传 `.geomTurbo` 后自动创建 baseline，通过不可变运行树保存控制分支、质量、事件、产物与专家经验。FastAPI 同时托管 API 和 React 静态页面，独立 Worker 从 SQLite 持久队列领取任务，Caddy 在最外层提供 HTTPS。
 
-> 任何能访问该内网站点的人都可以查看、修改和冻结会话。专家署名只用于展示，不是权限控制。
+> 配置共享密码后，用户需通过共享账号登录后才能查看、修改和冻结会话；未配置时任何能访问该内网站点的人均可直接使用。专家署名只用于展示，不是权限控制。
 
 ## 目录
 
@@ -52,6 +52,8 @@ Copy-Item .env.example .env
 | `MESH_MIN_FREE_MEMORY_GB` | `8` | 最低空闲内存门限 |
 | `MESH_MIN_FREE_DISK_GB` | `20` | 最低空闲磁盘门限 |
 | `MESH_JOB_TIMEOUT_SECONDS` | `1800` | 单任务超时 |
+| `MESH_AUTH_USERNAME` | 空 | 共享登录用户名；必须与密码哈希同时设置 |
+| `MESH_AUTH_PASSWORD_HASH` | 空 | `python -m mesh_app.auth` 生成的 scrypt 编码串 |
 | `MESH_PYTHON` | 自动发现 | 部署脚本使用的 Python 路径 |
 
 除总上传大小外，解析器还限制单条 geomTurbo 物理行、token/名称长度、嵌套深度、叶排数和每叶排叶片实体数，校验显式块配对，并对重复侧别去重；超过任一安全边界会返回 `422 INVALID_GEOMTURBO`，避免异常输入无界扩张内存状态。
@@ -61,6 +63,29 @@ Copy-Item .env.example .env
 同一个 SQLite 数据库只部署一个 Worker 进程；单个 Worker 会在进程内部并发调度最多 20 个任务。当前资源预留与许可证退避按这一部署模型设计，不支持多个 Worker 共享同一数据库做横向扩展。
 
 Windows 下 Worker 会把网格子进程加入带 `KILL_ON_JOB_CLOSE` 的 Job Object，正常退出、超时和取消时终止整棵进程树；若部署账户或宿主环境不支持 Job Object，则降级使用 `taskkill /T`。投产前应通过一次真实任务确认事件中的 `job_object` 标志为 `true`。
+
+## 访问密码
+
+平台默认不启用登录。需要在入口处增加信任边界时，配置单一共享账号（所有用户共用，内部仍是共享工作区，不引入按用户权限）：
+
+```powershell
+# 1. 生成密码哈希（两次输入确认，明文不落任何文件）
+platform\.venv\Scripts\python.exe -m mesh_app.auth
+
+# 2. 将输出粘贴到根目录 .env（两个变量必须同时设置）
+# MESH_AUTH_USERNAME=mesh
+# MESH_AUTH_PASSWORD_HASH=scrypt$32768$8$1$<salt_hex>$<hash_hex>
+```
+
+行为要点：
+
+- 登录态由 HMAC 签名的无状态 Cookie 保持 **7 天**，服务重启不失效；到期或点击"退出登录"后需重新登录。
+- 签名密钥从密码哈希派生：**修改密码后所有已登录用户立即下线**。
+- 登录失败统一返回"用户名或密码错误"，不区分哪一项错误；未登录访问数据接口一律 401。
+- `/api/health` 保持匿名可访问（供启动脚本就绪探测），但匿名请求不返回 Worker 主机名与 IGG 安装路径；FastAPI 自动文档端点（`/docs`、`/redoc`、`/openapi.json`）在鉴权部署中已关闭。Worker 走 SQLite 队列，不经 HTTP，不受影响。
+- 仅依赖 Python 标准库（scrypt/hmac），不新增任何包。
+- 明文 HTTP 下密码会以明文经过内网链路；如需加密，按下方 Caddy 路径升级 HTTPS。
+- 明确不做：按用户账号、角色权限、注册/改密页面、登录限速、服务端可吊销会话表。
 
 ## 本机启动与开发
 

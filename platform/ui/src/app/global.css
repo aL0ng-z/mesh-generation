@@ -69,6 +69,15 @@ a {
   color: inherit;
 }
 
+.auth-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  color: #fff;
+  background: var(--navy);
+}
+
 ::selection {
   color: #fff;
   background: #087b77;

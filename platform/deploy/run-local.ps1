@@ -184,6 +184,9 @@ try {
     } elseif (-not (Test-Path -LiteralPath $env:MESH_IGG_PATH -PathType Leaf)) {
         Write-Warning "MESH_IGG_PATH 指向的文件不存在：$env:MESH_IGG_PATH"
     }
+    if ([string]::IsNullOrWhiteSpace($env:MESH_AUTH_PASSWORD_HASH)) {
+        Write-Warning "未配置 MESH_AUTH_PASSWORD_HASH；共享密码登录未启用，内网用户无需登录即可访问。"
+    }
     Write-Host "Worker 正在当前终端运行，按 Ctrl+C 同时停止 API 和 Worker。"
     Write-Host ""
 

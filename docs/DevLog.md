@@ -1,5 +1,41 @@
 # 开发日志
 
+## 2026-09-09：平台共享密码登录
+
+### 后端
+
+- 新建 `platform/mesh_app/auth.py`：标准库 scrypt 密码编码/校验（格式 `scrypt$n$r$p$salt_hex$hash_hex`，显式放宽 OpenSSL 32MiB 内存限制）、从密码哈希派生会话签名密钥、`exp.signature` 无状态 Cookie token 的签名/校验，以及纯 ASGI 的 `AuthMiddleware`；`python -m mesh_app.auth` 交互式生成可粘贴进 `.env` 的哈希。
+- `config.py` 的 `Settings` 新增 `MESH_AUTH_USERNAME` / `MESH_AUTH_PASSWORD_HASH`，两者必须同时设置或同时留空，否则启动快速失败。
+- `api.py` 注册 `AuthMiddleware` 为最外层中间件（未认证请求不进入上传解析）；新增 `POST /api/auth/login`（登录成功签发 `mesh_session` Cookie，`HttpOnly`、`SameSite=Lax`、7 天）、`GET /api/auth/session`（三态：未启用/已认证/未认证）、`POST /api/auth/logout`（清除 Cookie）。`/api/health` 与非 `/api/*` 静态资源放行；登录失败统一 401 `INVALID_CREDENTIALS`，用户名与密码比较均用 `hmac.compare_digest`。
+- 会话无状态：签名密钥从密码哈希派生，改密码即全员下线；未配置鉴权变量时中间件直接放行，行为与现状完全一致。
+
+### 前端
+
+- 新建 `features/auth/`：`AuthGate` 查询 `/api/auth/session`，加载中显示过渡态，未认证渲染登录页，已认证渲染应用；`LoginPage` 居中卡片式登录页，中文文案，复用 global.css 设计变量。
+- `main.tsx` 用 `AuthGate` 包裹 `RouterProvider`；`queryClient.ts` 新增 `QueryCache.onError`——任何数据请求 401 时失效会话查询，全局回落到登录页（含会话过期）；查询重试规则同步排除 401。
+- 登录成功后 `queryClient.invalidateQueries()` 全量失效，会话查询重取通过后自动进入应用；会话列表页头部增加"退出登录"按钮。
+
+### 部署与文档
+
+- `run-local.ps1` 加载 `.env` 后，未配置鉴权时与 IGG 未配置警告同一风格打印 `Write-Warning`。
+- `.env.example` 追加注释掉的鉴权配置示例与生成命令说明；`platform/README.md` 新增"访问密码"小节（配置步骤、7 天会话、退出、明文 HTTP 风险、Caddy 升级路径）并更新开篇信任边界表述；根 README 一句带过并链接。
+
+### 验证
+
+- 新增 `platform/tests/test_auth.py`：未登录 401、健康端点匿名可访问、错误用户名/密码返回一致 401、登录成功 Set-Cookie 属性（HttpOnly/SameSite/Max-Age=604800/无 Secure）、篡改与过期 token 拒绝、登出后 401、会话端点三态、环境变量成对校验、未配置鉴权保持现状；平台回归 53 项全部通过（原 38 项不动）。
+- 前端新增 `AuthGate.test.tsx` 6 项：未启用/已认证直接渲染、未认证渲染登录页、登录成功进入应用、登录失败提示、401 经真实 `QueryCache.onError` 路径回落登录页；`npm test` 33 项、`typecheck`、`lint`、`build` 全部通过。
+- Python 依赖零新增，`requirements.lock` 不变；`src/` 网格 CLI 不受影响。
+
+### 多智能体对抗审查修复
+
+实现完成后运行四维（安全/正确性/回归/测试盲区）审查工作流，对发现逐项复现修复：
+
+- **非 ASCII Cookie 签名 500（major，已复现修复）**：Cookie 头经 latin-1 解码后签名段可含高位字节，`hmac.compare_digest` 对非 ASCII str 抛 `TypeError`，未认证请求得到 500 而非 401。`verify_session` 改为按字节比较（`sig.encode("latin-1")`），畸形一律返回 False。
+- **畸形密码哈希 500（自测发现，已修复）**：`verify_password` 对 `n=0`、负数、超范围参数等损坏编码串捕获 `hashlib.scrypt` 的 `ValueError/TypeError`，返回 False 而非让登录请求 500。
+- **自动文档端点绕过登录（minor，已修复）**：FastAPI 默认 `/docs`、`/redoc`、`/openapi.json` 不以 `/api/` 开头，未登录可读完整 API 结构；`create_app` 显式关闭三个文档端点。
+- **匿名健康快照泄露（minor，已修复）**：`/api/health` 匿名可访问但原样返回 `worker.id`（主机名）与 `igg.path`（完整安装路径）；鉴权启用时匿名请求将二者置空，已认证返回完整快照，前端横幅不受影响。
+- **测试盲区（major + 3 minor，已修复）**：401 回落测试改为经真实 `QueryCache.onError` 路径（原版手工 invalidate 绕过了被测逻辑）；补登出测试机制注释更正（httpx 在 Max-Age=0 即丢弃 Cookie）、Cookie `Max-Age=604800`（7 天）断言、未认证超大上传 401 先于 413 的中间件顺序回归。
+
 ## 2026-08-24：本地平台一键启动与 .env 配置
 
 ### 启动流程

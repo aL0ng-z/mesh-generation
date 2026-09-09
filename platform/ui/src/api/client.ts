@@ -1,4 +1,5 @@
 import type {
+  AuthSession,
   ControlChange,
   ControlPreview,
   ControlState,
@@ -85,6 +86,18 @@ export function newRequestId(): string {
 export const api = {
   getHealth(): Promise<HealthSnapshot> {
     return request('/api/health');
+  },
+
+  getAuthSession(): Promise<AuthSession> {
+    return request('/api/auth/session');
+  },
+
+  login(username: string, password: string): Promise<AuthSession> {
+    return request('/api/auth/login', json('POST', { username, password }));
+  },
+
+  logout(): Promise<{ authenticated: boolean }> {
+    return request('/api/auth/logout', { method: 'POST' });
   },
 
   async listSessions(status?: string, cursor?: string): Promise<SessionListResponse> {

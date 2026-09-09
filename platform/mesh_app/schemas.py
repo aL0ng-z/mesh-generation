@@ -48,6 +48,11 @@ class CompleteSessionRequest(StrictModel):
     expected_version: int = Field(ge=1)
 
 
+class LoginRequest(StrictModel):
+    username: str = Field(min_length=1, max_length=200)
+    password: str = Field(min_length=1, max_length=1024)
+
+
 class ErrorDetail(BaseModel):
     code: str
     message: str
@@ -65,5 +70,6 @@ __all__ = [
     "CreateRunRequest",
     "ErrorResponse",
     "ExperienceNoteRequest",
+    "LoginRequest",
     "RetryRunRequest",
 ]

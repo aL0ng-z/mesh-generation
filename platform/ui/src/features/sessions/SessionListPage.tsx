@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { useInfiniteQuery } from '@tanstack/react-query';
+import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useSearchParams } from 'react-router-dom';
 import { api } from '../../api/client';
 import type { SessionStatus } from '../../api/types';
@@ -26,6 +26,7 @@ export function SessionListPage() {
   const rawStatus = params.get('status');
   const filter: Filter = rawStatus === 'ACTIVE' || rawStatus === 'COMPLETED' ? rawStatus : 'ALL';
   const [uploadOpen, setUploadOpen] = useState(false);
+  const queryClient = useQueryClient();
 
   const sessionsQuery = useInfiniteQuery({
     queryKey: ['sessions', filter],
@@ -54,9 +55,22 @@ export function SessionListPage() {
           <h1>叶轮机械网格经验平台</h1>
           <p>以不可变运行树沉淀几何、控制、质量与专家经验。</p>
         </div>
-        <button className={styles.primary} type="button" onClick={() => setUploadOpen(true)}>
-          新建会话
-        </button>
+        <div className={styles.headerActions}>
+          <button className={styles.primary} type="button" onClick={() => setUploadOpen(true)}>
+            新建会话
+          </button>
+          <button
+            className={styles.logout}
+            type="button"
+            onClick={() => {
+              void api.logout().finally(() => {
+                void queryClient.invalidateQueries();
+              });
+            }}
+          >
+            退出登录
+          </button>
+        </div>
       </header>
 
       <section className={styles.workspace} aria-labelledby="sessions-heading">

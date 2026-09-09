@@ -215,3 +215,9 @@ export interface HealthSnapshot {
   };
   resource_gate: Record<string, unknown>;
 }
+
+export interface AuthSession {
+  enabled: boolean;
+  authenticated: boolean;
+  username: string | null;
+}

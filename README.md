@@ -43,7 +43,7 @@ archive/                v0～v6 历史快照；当前实现完全不读取
 
 `src/` 网格 CLI 仅依赖 Python 标准库，无需安装第三方包，使用系统任意 Python ≥3.7 即可运行。内网平台使用 Python ≥3.11，其第三方依赖和锁定版本完全隔离在 `platform/`。
 
-内网平台的安装、迁移、启动、HTTPS、备份与验收说明见 [`platform/README.md`](platform/README.md)。
+内网平台的安装、迁移、启动、HTTPS、备份与验收说明见 [`platform/README.md`](platform/README.md)；可选的共享密码登录配置见其中的"访问密码"小节。
 
 已完成首次安装和数据库迁移后，可从仓库根目录一键启动本地 API 与 Worker：
 

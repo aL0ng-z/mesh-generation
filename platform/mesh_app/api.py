@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -10,7 +12,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, Form, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, Query, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -20,6 +22,15 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .artifacts import ArtifactStore, iter_file_range
+from .auth import (
+    AuthMiddleware,
+    derive_session_key,
+    SESSION_COOKIE,
+    SESSION_TTL,
+    sign_session,
+    verify_password,
+    verify_session,
+)
 from .config import Settings
 from .control_service import ControlService
 from .db import Database
@@ -28,6 +39,7 @@ from .schemas import (
     ControlPreviewRequest,
     CreateRunRequest,
     ExperienceNoteRequest,
+    LoginRequest,
     RetryRunRequest,
 )
 from .sessions import ServiceError, SessionService, load_json
@@ -140,11 +152,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title="叶轮机械网格经验平台",
         version="0.1.0",
         lifespan=lifespan,
+        # 内网部署关闭自动文档端点，避免未登录用户读取完整 API 结构。
+        openapi_url=None,
+        docs_url=None,
+        redoc_url=None,
     )
     application.add_middleware(
         _UploadBodyLimitMiddleware,
         max_body_bytes=resolved_settings.max_upload_bytes + _MULTIPART_OVERHEAD_BYTES,
         max_file_bytes=resolved_settings.max_upload_bytes,
+    )
+    application.add_middleware(
+        AuthMiddleware,
+        username=resolved_settings.auth_username,
+        password_hash=resolved_settings.auth_password_hash,
     )
     application.state.settings = resolved_settings
     application.state.database = database
@@ -195,8 +216,64 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return _error_response(500, "INTERNAL_ERROR", "服务内部发生错误，请联系运维并查看服务日志", {})
 
     @application.get("/api/health")
-    async def health() -> dict[str, Any]:
-        return await run_in_threadpool(_health_snapshot, database, resolved_settings)
+    async def health(request: Request) -> dict[str, Any]:
+        snapshot = await run_in_threadpool(_health_snapshot, database, resolved_settings)
+        # 鉴权启用时该端点保持匿名可访问（就绪探测），但匿名请求
+        # 不暴露主机名与 IGG 完整路径，只返回状态计数。
+        if resolved_settings.auth_password_hash is None:
+            return snapshot
+        token = request.cookies.get(SESSION_COOKIE)
+        authenticated = (
+            token is not None
+            and verify_session(token, _session_key(resolved_settings))
+        )
+        if authenticated:
+            return snapshot
+        snapshot["worker"] = {**snapshot["worker"], "id": None}
+        snapshot["igg"] = {**snapshot["igg"], "path": None}
+        return snapshot
+
+    @application.post("/api/auth/login")
+    async def login(payload: LoginRequest, response: Response) -> dict[str, Any]:
+        if resolved_settings.auth_password_hash is None:
+            raise ServiceError("AUTH_DISABLED", "鉴权未配置，无需登录", status_code=409)
+        username_match = hmac.compare_digest(
+            payload.username.encode(),
+            (resolved_settings.auth_username or "").encode(),
+        )
+        password_match = verify_password(payload.password, resolved_settings.auth_password_hash)
+        if not (username_match and password_match):
+            raise ServiceError("INVALID_CREDENTIALS", "用户名或密码错误", status_code=401)
+        token = sign_session(int(time.time()) + SESSION_TTL, _session_key(resolved_settings))
+        response.set_cookie(
+            SESSION_COOKIE,
+            token,
+            max_age=SESSION_TTL,
+            httponly=True,
+            samesite="lax",
+            path="/",
+        )
+        return {"authenticated": True, "username": resolved_settings.auth_username}
+
+    @application.get("/api/auth/session")
+    async def auth_session(request: Request) -> dict[str, Any]:
+        if resolved_settings.auth_password_hash is None:
+            return {"enabled": False, "authenticated": True, "username": None}
+        token = request.cookies.get(SESSION_COOKIE)
+        authenticated = (
+            token is not None
+            and verify_session(token, _session_key(resolved_settings))
+        )
+        return {
+            "enabled": True,
+            "authenticated": authenticated,
+            "username": resolved_settings.auth_username if authenticated else None,
+        }
+
+    @application.post("/api/auth/logout")
+    async def logout(response: Response) -> dict[str, Any]:
+        response.delete_cookie(SESSION_COOKIE, path="/")
+        return {"authenticated": False}
 
     @application.get("/api/v1/sessions")
     async def list_sessions(
@@ -427,6 +504,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return FileResponse(index_path, media_type="text/html")
 
     return application
+
+
+def _session_key(settings: Settings) -> bytes:
+    return derive_session_key(settings.auth_password_hash or "")
 
 
 def _health_snapshot(database: Database, settings: Settings) -> dict[str, Any]:
