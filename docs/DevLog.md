@@ -1,5 +1,26 @@
 # 开发日志
 
+## 2026-09-09：清理临时产物并新增新机器部署指南
+
+### 清理
+
+- 确认 `C:\ProgramData\MeshExperience` 为 8 月初遗留的空数据目录（数据库 4 KB 且无任何表，三个子目录为空），已删除；真实数据在 `runs\platform-dev`。
+- 删除 `runs\platform-chrome-user-test-20260809/`、`runs\platform-chrome-user-test-20260824/`（Playwright 验收遗留，共约 0.5 MB）。
+- 删除 `runs\platform-dev\logs` 中 8 月的 6 个旧 API 日志，仅保留当日。
+- 删除根目录、`src`、`tests` 的 `__pycache__`，根目录与 `platform` 的 `.pytest_cache`，以及空的 `.playwright-cli/`。
+- 保留 `runs\platform-dev`（1 个会话、2 次成功运行、71 个产物记录）及 `platform\.venv`、`node_modules`、`ui\dist` 等运行必需目录。
+
+### 文档
+
+- 新增 `docs/SETUP_GUIDE.md`：新机器从 git clone 到平台可用的完整步骤——前置要求（Python ≥3.11、Node 20+、AutoGrid 17.1）、`.env` 配置与共享密码登录、后端 venv（requirements.lock 精确锁定）、前端 `npm ci` 构建、首次 `-Migrate` 启动、日常启停、验证命令（平台 53 项测试已实际运行通过）、常见问题与生产部署提示。
+- 文档中平台测试命令经实际执行验证：`53 passed`。
+
+## 2026-09-09：统一 .env / .env.example 并补充配置项注释
+
+- 确认两文件配置值完全一致，`.env.example` 为更新版本（含共享密码登录注释段）；以注释版为基准统一两文件。
+- 按 `platform/mesh_app/config.py`、`run-local.ps1`、`worker.py`、`api.py` 的实际读取逻辑，为全部配置项补充分组注释：IGG 路径解析顺序、数据目录与数据库默认值、上传上限、SQLite busy_timeout、Worker 并发/内存/磁盘/超时/心跳恢复、共享密码登录的启用条件与哈希生成命令。
+- `.env` 本身在 `.gitignore` 中，不纳入版本管理；仅 `.env.example` 进入提交。
+
 ## 2026-09-09：平台共享密码登录
 
 ### 后端
