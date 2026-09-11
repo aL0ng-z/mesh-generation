@@ -58,6 +58,7 @@ from controls import (  # noqa: E402
     audit_autogrid_source,
     audit_control_bindings,
 )
+from mesh import source_signature  # noqa: E402
 
 
 GEOMETRY_PATH = PROJECT_ROOT / "geometries" / "Rotor37.geomTurbo"
@@ -114,14 +115,7 @@ def _sha256_file(path: Path) -> str:
 
 
 def _source_signature() -> str:
-    payload = [
-        (str(path.relative_to(PROJECT_ROOT)), _sha256_file(path))
-        for path in SOURCE_FILES
-        if path.exists()
-    ]
-    return hashlib.sha256(
-        json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    return source_signature(SOURCE_FILES, root=PROJECT_ROOT)
 
 
 def _safe_name(value: Any, *, limit: int = 96) -> str:
@@ -1113,8 +1107,11 @@ def execute_batch(
     ]
     for case in retry_cases:
         print(f"串行重试基础设施失败：{case['case_id']}")
+        # 运行目录一经占用不可复用；串行重试使用全新同级目录。
+        retry_case = dict(case)
+        retry_case["out_dir"] = f"{case['out_dir']}_retry"
         retry_result = execute_case(
-            case,
+            retry_case,
             timeout_seconds=timeout_seconds,
             igg_executable=igg_executable,
         )

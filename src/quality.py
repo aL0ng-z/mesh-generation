@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -49,6 +50,21 @@ LEGACY_CRITERION_PREFIX = {
     "wall_distance": "wall_distance",
 }
 
+REQUIRED_FIELDS = (
+    "negative_cells",
+    "number_of_points",
+    "grid_levels",
+    "min_skewness_angle",
+    "max_expansion_ratio",
+    "min_spanwise_skewness_angle",
+    "max_spanwise_expansion_ratio",
+    "max_aspect_ratio",
+)
+
+COUNT_FIELDS = ("negative_cells", "number_of_points", "grid_levels")
+
+METRIC_PATH_PREFIX = "quality.metrics"
+
 
 @dataclass(frozen=True)
 class QualityEvaluation:
@@ -95,16 +111,27 @@ def summarize_quality(
             "entities": [],
             "metrics": {},
             "result": QualityEvaluation("UNKNOWN", False, ["No quality source found"]).to_dict(),
+            "quality_validation": {
+                "status": "UNKNOWN",
+                "reasons": [{"field": "quality", "problem": "No quality source found"}],
+            },
+            "raw": None,
         }
 
     metrics = model["metrics"]
+    result = evaluate_quality(metrics)
+    validation = _quality_validation(metrics, result.status)
+    for key in ("metadata", "project", "entities", "metrics"):
+        model[key] = _sanitize_non_finite(model[key])
     return {
         "metrics_source": metrics_source,
         "metadata": model["metadata"],
         "project": model["project"],
         "entities": model["entities"],
-        "metrics": metrics,
-        "result": evaluate_quality(metrics).to_dict(),
+        "metrics": model["metrics"],
+        "result": result.to_dict(),
+        "quality_validation": validation,
+        "raw": model.get("raw"),
     }
 
 
@@ -183,7 +210,7 @@ def parse_quality_report(
                 continue
             value_match = re.match(rf"NUMBER\s+OF\s+POINTS\s+({NUMBER_TEXT})", stripped, flags=re.IGNORECASE)
             if value_match:
-                value = int(float(value_match.group(1)))
+                value = _strict_count(value_match.group(1))
                 if current_project_row is None:
                     project["number_of_points"] = value
                 else:
@@ -191,7 +218,7 @@ def parse_quality_report(
                 continue
             rows_match = re.match(rf"NUMBER\s+OF\s+ROWS\s+({NUMBER_TEXT})", stripped, flags=re.IGNORECASE)
             if rows_match and current_project_row is None:
-                project["number_of_rows"] = int(float(rows_match.group(1)))
+                project["number_of_rows"] = _strict_count(rows_match.group(1))
                 continue
             if current_project_row is not None:
                 project_field_patterns = (
@@ -206,7 +233,7 @@ def parse_quality_report(
                     if not match:
                         continue
                     current_project_row[field] = (
-                        int(float(match.group(1))) if converter is int else match.group(1).strip()
+                        _strict_count(match.group(1)) if converter is int else match.group(1).strip()
                     )
                     matched_project_field = True
                     break
@@ -254,15 +281,15 @@ def parse_quality_report(
             continue
         negative_match = re.search(rf"\bNegative\s+Cells?\s*:?\s*({NUMBER_TEXT})", stripped, flags=re.IGNORECASE)
         if negative_match:
-            current_entity["negative_cells"] = int(float(negative_match.group(1)))
+            current_entity["negative_cells"] = _strict_count(negative_match.group(1))
             continue
         points_match = re.match(rf"Number\s+of\s+Points\s*:?\s*({NUMBER_TEXT})", stripped, flags=re.IGNORECASE)
         if points_match:
-            current_entity["number_of_points"] = int(float(points_match.group(1)))
+            current_entity["number_of_points"] = _strict_count(points_match.group(1))
             continue
         levels_match = re.match(rf"Number\s+of\s+grid\s+levels\s*:?\s*({NUMBER_TEXT})", stripped, flags=re.IGNORECASE)
         if levels_match:
-            current_entity["grid_levels"] = int(float(levels_match.group(1)))
+            current_entity["grid_levels"] = _strict_count(levels_match.group(1))
             continue
 
         location = _parse_location_line(stripped)
@@ -295,6 +322,7 @@ def parse_quality_report(
         "metrics": metrics,
     }
     model.update(metrics)
+    model["raw"] = text
     return model
 
 
@@ -306,9 +334,9 @@ def parse_embedded_cgns_quality(path: str | Path) -> dict[str, Any]:
         raise ValueError(f"No embedded NIGridQuality data found: {path}")
 
     metrics: dict[str, Any] = {
-        "negative_cells": _last_int(text, r"NEGATIVE_CELLS\s+(\d+)"),
-        "number_of_points": _last_int(text, r"NUMBER_OF_POINTS\s+(\d+)"),
-        "grid_levels": _last_int(text, r"MULTIGRID_LEVEL\s+(\d+)"),
+        "negative_cells": _last_count(text, rf"NEGATIVE_CELLS\s+{NUMBER}"),
+        "number_of_points": _last_count(text, rf"NUMBER_OF_POINTS\s+{NUMBER}"),
+        "grid_levels": _last_count(text, rf"MULTIGRID_LEVEL\s+{NUMBER}"),
     }
     quality_map = {
         "NIGridQuality_skewness": ("skewness_angle", "min_skewness_angle", "max_skewness_angle", "avg_skewness_angle"),
@@ -353,23 +381,21 @@ def parse_embedded_cgns_quality(path: str | Path) -> dict[str, Any]:
 
 
 def evaluate_quality(metrics: dict[str, Any]) -> QualityEvaluation:
-    """依据预设硬性阈值评估网格质量指标。"""
+    """先校验质量指标数据合法性，再依据预设硬性阈值评估网格质量。"""
 
     if "metrics" in metrics and "negative_cells" not in metrics and isinstance(metrics["metrics"], dict):
         metrics = metrics["metrics"]
-    required = {
-        "negative_cells",
-        "number_of_points",
-        "grid_levels",
-        "min_skewness_angle",
-        "max_expansion_ratio",
-        "min_spanwise_skewness_angle",
-        "max_spanwise_expansion_ratio",
-        "max_aspect_ratio",
-    }
-    missing = sorted(field for field in required if field not in metrics or metrics[field] is None)
+    missing = sorted(field for field in REQUIRED_FIELDS if field not in metrics or metrics[field] is None)
     if missing:
-        return QualityEvaluation("UNKNOWN", False, [f"Missing metric: {field}" for field in missing])
+        return QualityEvaluation(
+            "UNKNOWN", False, [f"{METRIC_PATH_PREFIX}.{field}: 缺失" for field in missing]
+        )
+
+    problems = _validation_problems(metrics)
+    if problems:
+        return QualityEvaluation(
+            "UNKNOWN", False, [f"{field}: {problem}" for field, problem in problems]
+        )
 
     reasons: list[str] = []
     if metrics["negative_cells"] != HARD_LIMITS["negative_cells"]:
@@ -387,6 +413,71 @@ def evaluate_quality(metrics: dict[str, Any]) -> QualityEvaluation:
     if metrics["max_aspect_ratio"] > HARD_LIMITS["max_aspect_ratio"]:
         reasons.append("Maximum aspect ratio above hard limit")
     return QualityEvaluation("FAIL" if reasons else "PASS", not reasons, reasons)
+
+
+def _validation_problems(metrics: dict[str, Any]) -> list[tuple[str, str]]:
+    """校验所有已提供的质量统计值，返回（字段路径，问题描述）列表。"""
+
+    problems: list[tuple[str, str]] = []
+    for field in COUNT_FIELDS:
+        if field not in metrics or metrics[field] is None:
+            continue
+        value = metrics[field]
+        path = f"{METRIC_PATH_PREFIX}.{field}"
+        if isinstance(value, bool):
+            problems.append((path, "布尔值不是合法计数"))
+        elif not isinstance(value, int):
+            problems.append((path, "计数必须为整数"))
+        elif value < 0 or (field != "negative_cells" and value == 0):
+            label = "非负整数" if field == "negative_cells" else "正整数"
+            problems.append((path, f"计数必须为{label}"))
+    for field, value in metrics.items():
+        if field in COUNT_FIELDS:
+            continue
+        if isinstance(value, bool):
+            problems.append((f"{METRIC_PATH_PREFIX}.{field}", "非实数"))
+            continue
+        if not isinstance(value, (int, float)):
+            continue
+        path = f"{METRIC_PATH_PREFIX}.{field}"
+        if not math.isfinite(value):
+            problems.append((path, "非有限数值"))
+        elif "skewness_angle" in field and not 0.0 <= value <= 180.0:
+            problems.append((path, "角度必须在 [0, 180] 内"))
+        elif ("expansion_ratio" in field or "aspect_ratio" in field) and value <= 0.0:
+            problems.append((path, "比例必须为正"))
+        elif "wall_distance" in field and value < 0.0:
+            problems.append((path, "壁面距离必须非负"))
+    return problems
+
+
+def _quality_validation(metrics: dict[str, Any], result_status: str) -> dict[str, Any]:
+    """汇总质量数据校验结果，生成 quality_validation 摘要。"""
+
+    if result_status != "UNKNOWN":
+        return {"status": "VALID", "reasons": []}
+    missing = sorted(field for field in REQUIRED_FIELDS if field not in metrics or metrics[field] is None)
+    problems: list[tuple[str, str]] = [
+        (f"{METRIC_PATH_PREFIX}.{field}", "缺失") for field in missing
+    ]
+    if not missing:
+        problems = _validation_problems(metrics)
+    return {
+        "status": "INVALID",
+        "reasons": [{"field": field, "problem": problem} for field, problem in problems],
+    }
+
+
+def _sanitize_non_finite(value: Any) -> Any:
+    """将结构中的非有限浮点数转换为 null，保证对外 JSON 可序列化。"""
+
+    if isinstance(value, float):
+        return None if not math.isfinite(value) else value
+    if isinstance(value, dict):
+        return {key: _sanitize_non_finite(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_non_finite(item) for item in value]
+    return value
 
 
 def _new_entity(*, scope: str, name: str) -> dict[str, Any]:
@@ -673,11 +764,19 @@ def _first_float(text: str, pattern: str) -> float | None:
     return float(match.group(1)) if match else None
 
 
-def _last_int(text: str, pattern: str) -> int | None:
-    """返回正则表达式最后一次匹配到的整数。"""
+def _strict_count(token: str) -> int | float:
+    """将计数字段文本转为严格整数；非整数字面量保留为浮点而不截断。"""
+
+    if re.fullmatch(r"[+-]?\d+", token):
+        return int(token)
+    return float(token)
+
+
+def _last_count(text: str, pattern: str) -> int | float | None:
+    """返回正则表达式最后一次匹配到的计数值，不做小数截断。"""
 
     matches = list(re.finditer(pattern, text, flags=re.IGNORECASE))
-    return int(matches[-1].group(1)) if matches else None
+    return _strict_count(matches[-1].group(1)) if matches else None
 
 
 def _first_text(text: str, pattern: str) -> str | None:

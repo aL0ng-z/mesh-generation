@@ -241,7 +241,7 @@ def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
     )
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-            json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())

@@ -5,13 +5,18 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import re
+import subprocess
 import sys
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
-from autogrid import run_autogrid_init
+from autogrid import RunDirectoryError, run_autogrid_init
 from controls import (
+    CONTROL_REGISTRY,
     ControlRequest,
     ControlValidationError,
     describe_control,
@@ -24,6 +29,11 @@ from geomturbo import GeomTurboParseError, parse_geomturbo
 from quality import summarize_quality
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SOURCE_MODULE_FILES = ("mesh.py", "controls.py", "autogrid.py", "geomturbo.py", "quality.py")
+QUALITY_RULES_VERSION = "1"
+
+
 def main() -> int:
     """解析命令行参数，执行网格生成并输出运行摘要。"""
 
@@ -31,7 +41,8 @@ def main() -> int:
         description="从 .geomTurbo 直接生成 NUMECA AutoGrid 17.1 CFD 网格。"
     )
     parser.add_argument("geomturbo", nargs="?", help="输入 .geomTurbo 文件。查询控制目录时可省略。")
-    parser.add_argument("--out", default=None, help="运行产物目录；默认 runs/<文件名>_<时间戳>。")
+    parser.add_argument("--out", default=None, help="运行产物目录；默认 runs/<文件名>_<时间戳>_<uuid>。")
+    parser.add_argument("--run-id", default=None, help="本次运行的唯一标识；未传时生成 UUID4 十六进制字符串。")
     parser.add_argument("--igg", default=None, help="IGG 可执行文件或完整路径；优先于 .env。")
     parser.add_argument("--no-row-wizard", action="store_true", help="不执行 RowWizard。")
     parser.add_argument("--dry-run", action="store_true", help="只生成脚本和摘要，不启动 IGG。")
@@ -105,25 +116,36 @@ def main() -> int:
     env_settings = _load_env_file(Path(".env"))
     igg_executable = args.igg or env_settings.get("IGG_EXE") or env_settings.get("IGG_PATH") or "igg"
 
+    run_id = args.run_id or uuid.uuid4().hex
     run_dir = Path(args.out) if args.out else _default_run_dir(geomturbo_path)
-    run_dir.mkdir(parents=True, exist_ok=True)
 
-    autogrid_run = run_autogrid_init(
-        geomturbo_path,
-        run_dir,
-        igg_executable=igg_executable,
-        use_row_wizard=not args.no_row_wizard,
-        dry_run=args.dry_run,
-        timeout_seconds=args.timeout,
-        controls=resolved_controls,
-        mesh_fingerprint=args.mesh_fingerprint,
-    )
+    try:
+        autogrid_run = run_autogrid_init(
+            geomturbo_path,
+            run_dir,
+            igg_executable=igg_executable,
+            use_row_wizard=not args.no_row_wizard,
+            dry_run=args.dry_run,
+            timeout_seconds=args.timeout,
+            controls=resolved_controls,
+            mesh_fingerprint=args.mesh_fingerprint,
+            run_id=run_id,
+            units_factor=geometry.units_factor,
+        )
+    except RunDirectoryError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 2
 
     quality_summary: dict[str, Any] | None = None
     missing_mesh_outputs = (
-        not args.dry_run and autogrid_run.returncode == 0 and "igg" not in autogrid_run.outputs
+        []
+        if args.dry_run
+        else [key for key in ("igg", "cgns") if key not in autogrid_run.outputs]
     )
-    if missing_mesh_outputs:
+    missing_igg = (
+        not args.dry_run and autogrid_run.returncode == 0 and "igg" in missing_mesh_outputs
+    )
+    if missing_igg:
         quality_summary = {
             "metrics_source": None,
             "metadata": {},
@@ -134,6 +156,10 @@ def main() -> int:
                 "status": "UNKNOWN",
                 "accepted": False,
                 "reasons": ["No AutoGrid mesh outputs found"],
+            },
+            "quality_validation": {
+                "status": "UNKNOWN",
+                "reasons": [{"field": "quality", "problem": "No AutoGrid mesh outputs found"}],
             },
         }
     elif not args.dry_run and autogrid_run.returncode == 0:
@@ -155,6 +181,10 @@ def main() -> int:
                     "accepted": False,
                     "reasons": [f"{type(exc).__name__}: {exc}"],
                 },
+                "quality_validation": {
+                    "status": "UNKNOWN",
+                    "reasons": [{"field": "quality", "problem": f"{type(exc).__name__}: {exc}"}],
+                },
             }
 
     mesh_fingerprint = _finalize_mesh_fingerprint(
@@ -163,8 +193,26 @@ def main() -> int:
     )
     autogrid_data = autogrid_run.to_dict()
     autogrid_data["mesh_fingerprint"] = mesh_fingerprint
+    sources, source_issues = _build_sources(
+        geomturbo_path, geometry, run_dir, quality_summary
+    )
+    quality_validation = (
+        quality_summary.get("quality_validation")
+        if quality_summary
+        else {
+            "status": "UNKNOWN",
+            "reasons": [{"field": "quality", "problem": "无质量数据源"}],
+        }
+    )
+    stages_completed = ["planning"] if args.dry_run else ["generation"]
+    if quality_summary is not None:
+        stages_completed.append("quality")
+    if mesh_fingerprint is not None:
+        stages_completed.append("fingerprint")
     run_summary = {
-        "schema_version": 3,
+        "schema_version": 4,
+        "run_id": run_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "run_dir": str(run_dir),
         "geometry": geometry.to_dict(),
         "controls": {
@@ -172,10 +220,23 @@ def main() -> int:
             "resolved": [control.to_dict() for control in resolved_controls],
             "applied": [] if args.dry_run else autogrid_run.control_results,
             "post_generation": [] if args.dry_run else autogrid_run.post_control_results,
+            "verification": autogrid_run.controls_verification,
         },
         "autogrid": autogrid_data,
         "mesh_fingerprint": mesh_fingerprint,
         "quality": quality_summary,
+        "quality_validation": quality_validation,
+        "execution_evidence": {
+            "completion_event": autogrid_run.completion_event,
+            "protocol_errors": autogrid_run.protocol_errors,
+        },
+        "sources": sources,
+        "manifest": {
+            "stages_completed": stages_completed,
+            "outputs": autogrid_run.manifest_outputs,
+        },
+        "missing_mesh_outputs": missing_mesh_outputs,
+        "issues": source_issues,
     }
     _write_json(run_dir / "run_summary.json", run_summary)
 
@@ -188,10 +249,10 @@ def main() -> int:
     )
     (run_dir / "report.md").write_text(report, encoding="utf-8")
 
-    print(json.dumps(run_summary, indent=2, ensure_ascii=False, default=str))
+    print(json.dumps(run_summary, indent=2, ensure_ascii=False, default=str, allow_nan=False))
     if autogrid_run.returncode not in (None, 0):
         return 1
-    if missing_mesh_outputs:
+    if missing_igg:
         return 1
     return 0
 
@@ -268,16 +329,155 @@ def _build_control_requests(args: argparse.Namespace) -> list[ControlRequest]:
 
 
 def _default_run_dir(geomturbo_path: Path) -> Path:
-    """根据几何文件名和当前时间生成默认运行目录。"""
+    """根据几何文件名、当前时间与 UUID 生成默认运行目录。"""
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return Path("runs") / f"{geomturbo_path.stem}_{stamp}"
+    return Path("runs") / f"{geomturbo_path.stem}_{stamp}_{uuid.uuid4().hex}"
 
 
 def _write_json(path: Path, data: Any) -> None:
-    """以便于审阅的格式写入 JSON 文件。"""
+    """以临时文件 + 原子替换写入 JSON，拒绝非有限数值。"""
 
-    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    text = json.dumps(data, indent=2, sort_keys=True, allow_nan=False)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _sha256_file(path: Path) -> str:
+    """流式计算文件 sha256。"""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def source_signature(files: Sequence[Path], *, root: Path) -> str:
+    """对一组源文件的相对路径与 sha256 生成确定性聚合签名。
+
+    算法从 tests/test_campaign_runner.py 的 ``_source_signature`` 迁入，
+    campaign runner 通过本函数保持原有签名语义。
+    """
+
+    payload = [
+        (str(path.relative_to(root)), _sha256_file(path))
+        for path in files
+        if path.exists()
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _control_registry_signature() -> tuple[str, int]:
+    """生成控制注册表的确定性签名与键数量。"""
+
+    entries = [
+        (key, spec.to_dict())
+        for key, spec in sorted(CONTROL_REGISTRY.items())
+    ]
+    payload = json.dumps(
+        entries,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest(), len(entries)
+
+
+def _git_sources(root: Path) -> tuple[str | None, bool, list[str]]:
+    """读取当前 git 提交与工作区状态；git 不可用时记录说明。"""
+
+    issues: list[str] = []
+    commit: str | None = None
+    dirty = False
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        candidate = completed.stdout.strip()
+        if completed.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", candidate):
+            commit = candidate
+        elif completed.returncode == 0:
+            issues.append("git rev-parse HEAD 输出不是 40 位十六进制提交")
+        else:
+            issues.append("git rev-parse HEAD 失败，无法记录提交")
+    except (OSError, subprocess.SubprocessError) as exc:
+        commit = None
+        issues.append(f"git 不可用：{type(exc).__name__}: {exc}")
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        if completed.returncode == 0:
+            dirty = bool(completed.stdout.strip())
+        else:
+            issues.append("git status 失败，工作区修改状态未知")
+    except (OSError, subprocess.SubprocessError) as exc:
+        issues.append(f"git 状态不可用：{type(exc).__name__}: {exc}")
+    return commit, dirty, issues
+
+
+def _build_sources(
+    geomturbo_path: Path,
+    geometry: Any,
+    run_dir: Path,
+    quality_summary: dict[str, Any] | None,
+) -> tuple[dict[str, Any], list[str]]:
+    """按共享契约 A.7 汇总本次执行的来源信息。"""
+
+    git_commit, git_dirty, issues = _git_sources(PROJECT_ROOT)
+    registry_signature, key_count = _control_registry_signature()
+    metadata = (quality_summary or {}).get("metadata") or {}
+    src_root = Path(__file__).resolve().parent
+    source_files = []
+    for name in SOURCE_MODULE_FILES:
+        path = src_root / name
+        if not path.exists():
+            continue
+        relative = str(path.relative_to(PROJECT_ROOT)).replace(os.sep, "/")
+        source_files.append({"path": relative, "sha256": _sha256_file(path)})
+    script_path = run_dir / "autogrid_init.py"
+    sources = {
+        "input_summary": {
+            "path": str(geomturbo_path),
+            "sha256": _sha256_file(geomturbo_path),
+            "size_bytes": geomturbo_path.stat().st_size,
+            "version": geometry.version,
+            "units": geometry.units,
+            "units_factor": geometry.units_factor,
+        },
+        "source_signature": {
+            "algorithm": "sha256",
+            "files": source_files,
+        },
+        "git": {"commit": git_commit, "dirty": git_dirty},
+        "generated_script": {
+            "path": "autogrid_init.py",
+            "sha256": _sha256_file(script_path),
+        },
+        "control_registry": {
+            "signature": registry_signature,
+            "key_count": key_count,
+        },
+        "quality_rules_version": QUALITY_RULES_VERSION,
+        "vendor_version": metadata.get("autogrid_version"),
+    }
+    return sources, issues
 
 
 def _load_env_file(path: Path) -> dict[str, str]:

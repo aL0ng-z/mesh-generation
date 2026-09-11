@@ -132,7 +132,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         resolved_settings.migrations_dir,
         resolved_settings.busy_timeout_ms,
     )
-    sessions = SessionService(database)
+    sessions = SessionService(database, project_root=resolved_settings.project_root)
     controls = ControlService(database, resolved_settings.data_dir)
     artifacts = ArtifactStore(
         database,

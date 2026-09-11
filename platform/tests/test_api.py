@@ -390,18 +390,25 @@ def test_control_preview_events_preview_degradation_and_path_safety(tmp_path: Pa
         assert invalid_preview.json()["errors"][0]["code"] == "CONTROL_PREREQUISITE_NOT_MET"
 
         with database.transaction(immediate=True) as connection:
+            # 创建会话时已写入入队来源快照事件，测试事件使用下一个可用序号。
+            sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM run_events WHERE run_id = ?",
+                    (baseline_id,),
+                ).fetchone()[0]
+            )
             connection.execute(
                 """
                 INSERT INTO run_events (
                     run_id, sequence, stage, level, progress, message, data_json, created_at
-                ) VALUES (?, 1, 'geometry', 'INFO', 0.25, '几何解析完成', ?, ?)
+                ) VALUES (?, ?, 'geometry', 'INFO', 0.25, '几何解析完成', ?, ?)
                 """,
-                (baseline_id, json.dumps({"rows": 1}), utc_now()),
+                (baseline_id, sequence, json.dumps({"rows": 1}), utc_now()),
             )
         events = client.get(f"/api/v1/runs/{baseline_id}/events", params={"after": 0})
         assert events.status_code == 200
-        assert events.json()["items"][0]["message"] == "几何解析完成"
-        assert events.json()["next_after"] == 1
+        assert events.json()["items"][-1]["message"] == "几何解析完成"
+        assert events.json()["next_after"] == sequence
 
         with database.transaction(immediate=True) as connection:
             connection.execute(

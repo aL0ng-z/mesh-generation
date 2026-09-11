@@ -64,6 +64,10 @@ class ResourceSnapshot:
         return asdict(self)
 
 
+class RunDirectoryUnavailable(OSError):
+    """运行目录无法独占创建：已存在、被并发占用或创建失败。"""
+
+
 @dataclass
 class _RunningTask:
     run_id: str
@@ -362,13 +366,16 @@ def build_mesh_command(
     project_root: str | os.PathLike[str],
     geometry_path: str | os.PathLike[str],
     output_dir: str | os.PathLike[str],
+    run_id: str,
     control_snapshot: Mapping[str, Any] | str,
     igg_path: str | os.PathLike[str] | None = None,
     timeout_seconds: int | None = None,
     python_executable: str | os.PathLike[str] = sys.executable,
 ) -> list[str]:
-    """构造不经过 shell 的网格 CLI 命令。"""
+    """构造不经过 shell 的网格 CLI 命令；``run_id`` 与平台运行身份一致。"""
 
+    if not run_id or not isinstance(run_id, str):
+        raise ValueError("run_id 必须是平台运行标识字符串")
     root = Path(project_root).resolve()
     mesh_script = root / "src" / "mesh.py"
     if not mesh_script.is_file():
@@ -376,7 +383,15 @@ def build_mesh_command(
     geometry = Path(geometry_path).resolve()
     if not geometry.is_file():
         raise FileNotFoundError(f"找不到几何输入：{geometry}")
-    command = [os.fspath(python_executable), str(mesh_script), str(geometry), "--out", str(Path(output_dir).resolve())]
+    command = [
+        os.fspath(python_executable),
+        str(mesh_script),
+        str(geometry),
+        "--out",
+        str(Path(output_dir).resolve()),
+        "--run-id",
+        run_id,
+    ]
     if igg_path is not None:
         command.extend(("--igg", str(Path(igg_path).resolve())))
     if timeout_seconds is not None:
@@ -463,6 +478,13 @@ class Worker:
             activity = True
             try:
                 self._start_claimed_run(claimed)
+            except RunDirectoryUnavailable as exc:
+                mark_run_failed(
+                    self.database,
+                    str(claimed["id"]),
+                    error_code="RUN_DIR_UNAVAILABLE",
+                    error_message=self._sanitize(f"运行目录不可用：{exc}"),
+                )
             except Exception as exc:
                 mark_run_failed(
                     self.database,
@@ -531,15 +553,25 @@ class Worker:
         session_id = str(row["session_id"])
         geometry_path = _safe_relative_path(self.settings.data_dir, row["geometry_relative_path"])
         run_dir = _safe_child_path(self.settings.artifact_dir, session_id, run_id)
-        run_dir.mkdir(parents=True, exist_ok=True)
+        # 会话父目录可复用，但运行目录必须由本 Worker 独占创建：绝不覆盖既有
+        # 目录，也绝不向既有日志追加。
+        run_dir.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            run_dir.mkdir()
+        except FileExistsError as exc:
+            raise RunDirectoryUnavailable(f"运行目录已存在，拒绝复用或覆盖：{run_dir}") from exc
+        except OSError as exc:
+            raise RunDirectoryUnavailable(f"无法创建运行目录：{run_dir}（{exc}）") from exc
         command = build_mesh_command(
             project_root=self.settings.project_root,
             geometry_path=geometry_path,
             output_dir=run_dir,
+            run_id=run_id,
             control_snapshot=row["control_snapshot_json"],
             igg_path=self.settings.igg_path,
             timeout_seconds=self.settings.job_timeout_seconds,
         )
+        # 文件名保持共享契约 B 的白名单；CLI 会容忍这两份预写日志。
         stdout_stream = (run_dir / "worker.stdout.log").open("wb")
         stderr_stream = (run_dir / "worker.stderr.log").open("wb")
         environment = dict(os.environ)
@@ -1233,12 +1265,17 @@ def _safe_child_path(root: Path, *parts: str) -> Path:
 
 
 def _load_run_summary(run_dir: Path) -> dict[str, Any] | None:
+    """读取 run_summary.json；接受 schema v3（历史）与 v4（当前契约）。"""
+
     path = run_dir / "run_summary.json"
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
-    return value if isinstance(value, dict) and value.get("schema_version") == 3 else None
+    if not isinstance(value, dict):
+        return None
+    schema_version = value.get("schema_version")
+    return value if schema_version in {3, 4} else None
 
 
 def _summary_cgns_path(summary: Mapping[str, Any], run_dir: Path) -> Path | None:
@@ -1295,7 +1332,7 @@ def _sanitize_text(text: str, max_length: int = 2000) -> str:
 
 
 def _json_text(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def _sha256_file(path: Path) -> str:
@@ -1404,6 +1441,7 @@ __all__ = [
     "HARD_MAX_CONCURRENCY",
     "LicenseBackoff",
     "ResourceSnapshot",
+    "RunDirectoryUnavailable",
     "Worker",
     "append_run_event",
     "atomic_claim_run",

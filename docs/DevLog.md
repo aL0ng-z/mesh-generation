@@ -1,5 +1,40 @@
 # 开发日志
 
+## 2026-09-11：批次② 结果契约（CR-01~03、D-02）
+
+### CR-01：独占运行目录与原子产物清单
+
+- CLI 新增 `--run-id`（未传生成 UUID4 hex），平台 Worker 强制传入，平台身份与摘要身份一致。
+- `src/autogrid.py` 新增 `acquire_run_directory`：复制输入、写脚本前以 O_CREAT|O_EXCL 排他创建 `.mesh_run.lock`（含 run_id 与创建时间）；显式 `--out` 仅允许不存在、为空或仅含 `worker.stdout.log`/`worker.stderr.log` 白名单文件；其余既有文件或已有标记 → `RunDirectoryError`、退出码 2、保留既有文件；dry-run 同样占用且标记保留。
+- 默认目录改为 `runs/<名称>_<时间戳>_<uuid>`；`run_summary.json` 以临时文件 + `os.replace` 原子写入；`collect_outputs` 以占用时快照为对照只登记本次新产物（manifest.outputs 含相对路径/大小/sha256）。
+- `.igg` 仍为最低产物要求；CGNS 缺失在摘要中单独记录（missing_mesh_outputs）。
+- Worker 以 `os.mkdir` 独占创建运行目录（失败 → run FAILED，error_code=RUN_DIR_UNAVAILABLE），成功后才打开两份日志，绝不覆盖既有目录或追加历史日志。
+
+### CR-02：事件协议校验与控制验证
+
+- 生成脚本的控制事件带 run_id 与 stage（apply/post_generation）；脚本末尾无条件输出 `AGMESH_COMPLETION:` 完成事件（无控制也必须有）。
+- 宿主解析对损坏 JSON、缺失/重复/未知 ID、key/目标/阶段/run_id 不匹配、缺失应用/观察/完成事件全部记录 protocol_errors（code+message）并使运行 FAILED（returncode 1），不再字典覆盖或跳过。
+- 每项控制验证四枚举 VERIFIED/MISMATCH/READBACK_ERROR/UNVERIFIABLE：整数/布尔/枚举归一化精确比较，浮点 rel_tol=1e-7、abs_tol=1e-10，si_length 按 units_factor 换算到 SI 比较；无法解释的回读不判 VERIFIED；setter 前回读失败仅诊断；getter 报错或回读不匹配时运行仍 SUCCEEDED，验证异常单独标记。
+- 新增 tests/fake_igg.py（15 种行为可配置的假 IGG 桩）与 tests/test_run_contract.py（20 项合同测试，覆盖批次②验收矩阵）。
+
+### CR-03：质量校验先行
+
+- 去除 `src/quality.py` 全部计数字段 `int(float(...))` 截断（改 `_strict_count`；CGNS 的 `_last_int` 改 `_last_count` 捕获完整数值记号），计数必须为严格整数：点数/层级正整数、负体积单元非负、拒绝布尔与小数文本。
+- `evaluate_quality()` 在硬阈值前校验全部已提供统计值：实数有限、角度 [0,180]、比例为正、壁面距离非负；非法 → UNKNOWN/accepted=False，reasons 含字段路径；三个入口（直接调用、报告解析、CGNS 降级解析）全部生效。
+- 非有限值在对外结构中转 null 并保留错误说明与原始报告；硬阈值与等号行为不变。
+- 新增 tests/test_quality.py 28 项：NaN/±Inf/1e309/零负点数/小数布尔计数/非法角度比例/缺字段/等号矩阵，评审四个复现用例全部转为 UNKNOWN。
+
+### D-02：来源记录与样本资格
+
+- 运行摘要升级 Schema v4：保留 v3 全部字段，新增 run_id/created_at/execution_evidence/controls.verification/quality_validation/sources/manifest；`_write_json` 与平台全部持久化 json.dumps 使用 allow_nan=False。
+- sources 记录输入摘要、src 五模块执行源码签名（算法从 tests/test_campaign_runner.py 迁入 src/mesh.py，campaign runner 改为从 src 导入并保持语义）、git commit/dirty、生成脚本摘要、控制注册表确定性签名（344 键）、质量规则版本、厂商版本。
+- 平台创建/重试子运行时在 run_events 记录入队来源快照（stage=ENQUEUE_SOURCE，与执行算法一致）；运行详情新增 sample_eligibility：执行证据完整、控制验证充分、质量可判定、来源完整且产物已登记才合格；质量 FAIL 仍合格（有效失败经验）；v3 历史 → 不合格「新证据缺失」；入队与执行来源漂移 → 不合格并注明。
+
+### 验证
+
+- 根测试 71 项全部通过（批次① 23 + 质量 28 + 合同 20）；平台测试 62 项全部通过（原 53 + 新增 9）。
+- Worker `_load_run_summary` 接受 v3/v4；平台持久化 JSON 不含 NaN/Infinity 字面量。
+
 ## 2026-09-11：CR-10 可分发测试基线与合成几何夹具
 
 ### 夹具与忽略规则

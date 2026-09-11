@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import math
 import os
 import json
 import shutil
 import struct
 import subprocess
 import sys
+import uuid
 import re
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -20,7 +23,18 @@ from controls import CONTROL_REGISTRY, MAPPED_SETTERS, _ALL_KNOWN_SETTERS, Resol
 
 CONTROL_RESULT_MARKER = "AGMESH_CONTROL_RESULT:"
 CONTROL_POST_RESULT_MARKER = "AGMESH_CONTROL_POST_RESULT:"
+COMPLETION_MARKER = "AGMESH_COMPLETION:"
 MESH_FINGERPRINT_FILE = "mesh_fingerprint.json"
+
+LOCK_FILE_NAME = ".mesh_run.lock"
+ALLOWED_PREEXISTING_FILES = frozenset({"worker.stdout.log", "worker.stderr.log"})
+
+CONTROL_APPLY_STAGE = "apply"
+CONTROL_POST_STAGE = "post_generation"
+
+
+class RunDirectoryError(OSError):
+    """运行目录不可用：已占用、包含既有文件或无法创建。"""
 
 
 @dataclass(frozen=True)
@@ -36,11 +50,72 @@ class AutoGridRun:
     error: str | None = None
     post_control_results: list[dict[str, Any]] = field(default_factory=list)
     mesh_fingerprint: dict[str, Any] | None = None
+    completion_event: dict[str, Any] | None = None
+    protocol_errors: list[dict[str, str]] = field(default_factory=list)
+    controls_verification: dict[str, Any] | None = None
+    manifest_outputs: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """将运行记录转换为可序列化字典。"""
 
         return asdict(self)
+
+
+def acquire_run_directory(run_dir: str | Path, run_id: str) -> frozenset[str]:
+    """校验运行目录并排他创建占用标记，返回占用成功时的既有文件快照。
+
+    允许目录不存在、为空，或仅包含共享契约白名单预存文件；其余既有文件、
+    已存在的占用标记或并发创建失败都抛出 :class:`RunDirectoryError`，
+    不删除、不覆盖任何既有内容。
+    """
+
+    run_path = Path(run_dir)
+    try:
+        run_path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RunDirectoryError(f"无法创建运行目录：{run_path}（{exc}）") from exc
+    if not run_path.is_dir():
+        raise RunDirectoryError(f"运行路径不是目录：{run_path}")
+    lock_path = run_path / LOCK_FILE_NAME
+    if lock_path.exists():
+        raise RunDirectoryError(f"运行目录已被占用（存在 {LOCK_FILE_NAME}）：{run_path}")
+    try:
+        children = list(run_path.iterdir())
+    except OSError as exc:
+        raise RunDirectoryError(f"无法读取运行目录：{run_path}（{exc}）") from exc
+    unexpected: list[str] = []
+    snapshot: set[str] = set()
+    for item in children:
+        if item.name in ALLOWED_PREEXISTING_FILES and item.is_file():
+            snapshot.add(item.name)
+        else:
+            unexpected.append(item.name)
+    if unexpected:
+        raise RunDirectoryError(
+            "运行目录包含既有文件，拒绝复用："
+            + ", ".join(sorted(unexpected))
+            + f"（{run_path}）"
+        )
+    try:
+        descriptor = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError as exc:
+        raise RunDirectoryError(
+            f"运行目录已被并发占用（{LOCK_FILE_NAME}）：{run_path}"
+        ) from exc
+    except OSError as exc:
+        raise RunDirectoryError(f"无法创建占用标记：{lock_path}（{exc}）") from exc
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            )
+        )
+    return frozenset(snapshot)
 
 
 def run_autogrid_init(
@@ -54,11 +129,16 @@ def run_autogrid_init(
     timeout_seconds: int | None = None,
     controls: Sequence[ResolvedControl] = (),
     mesh_fingerprint: bool = False,
+    run_id: str | None = None,
+    units_factor: float | None = None,
 ) -> AutoGridRun:
     """生成 AutoGrid 脚本并按配置执行或仅进行 dry-run。"""
 
+    if not run_id:
+        run_id = uuid.uuid4().hex
     run_path = Path(run_dir)
-    run_path.mkdir(parents=True, exist_ok=True)
+    # 在复制输入、写脚本之前排他占用目录；失败时抛出 RunDirectoryError。
+    snapshot = acquire_run_directory(run_path, run_id)
 
     geom_source = Path(geomturbo_path).resolve()
     geom_copy = run_path / "input.geomTurbo"
@@ -73,6 +153,7 @@ def run_autogrid_init(
             use_row_wizard=use_row_wizard,
             controls=controls,
             mesh_fingerprint=mesh_fingerprint,
+            run_id=run_id,
         ),
         encoding="utf-8",
     )
@@ -96,6 +177,13 @@ def run_autogrid_init(
             error=None,
             post_control_results=[],
             mesh_fingerprint=None,
+            completion_event=None,
+            protocol_errors=[],
+            controls_verification={
+                "status": "INCOMPLETE" if controls else "NOT_REQUESTED",
+                "results": [],
+            },
+            manifest_outputs=[],
         )
 
     try:
@@ -124,12 +212,44 @@ def run_autogrid_init(
         runner_error = f"无法启动 IGG：{exc}"
     (run_path / "stdout.log").write_text(stdout, encoding="utf-8")
     (run_path / "stderr.log").write_text(stderr, encoding="utf-8")
-    outputs = collect_outputs(run_path, output_prefix)
-    parsed_events = parse_control_results(stdout)
-    parsed_post_events = parse_control_results(stdout, marker=CONTROL_POST_RESULT_MARKER)
-    control_results = merge_control_results(controls, parsed_events)
-    post_control_results = merge_post_control_results(controls, parsed_post_events)
+    protocol_errors: list[dict[str, str]] = []
+    outputs = collect_outputs(run_path, output_prefix, snapshot=snapshot)
+    parsed_events = parse_control_results(
+        stdout,
+        expected_stage=CONTROL_APPLY_STAGE,
+        run_id=run_id,
+        protocol_errors=protocol_errors,
+    )
+    parsed_post_events = parse_control_results(
+        stdout,
+        marker=CONTROL_POST_RESULT_MARKER,
+        expected_stage=CONTROL_POST_STAGE,
+        run_id=run_id,
+        protocol_errors=protocol_errors,
+    )
+    completion_event = parse_completion_event(
+        stdout,
+        run_id=run_id,
+        protocol_errors=protocol_errors,
+    )
+    control_results = merge_control_results(
+        controls, parsed_events, protocol_errors=protocol_errors
+    )
+    post_control_results = merge_post_control_results(
+        controls, parsed_post_events, protocol_errors=protocol_errors
+    )
+    controls_verification = {
+        "status": (
+            "PROTOCOL_ERROR"
+            if protocol_errors
+            else ("COMPLETE" if controls else "NOT_REQUESTED")
+        ),
+        "results": verify_control_readbacks(
+            controls, control_results, units_factor=units_factor
+        ),
+    }
     fingerprint_data = None
+    fingerprint_path = None
     if (
         mesh_fingerprint
         and process_returncode == 0
@@ -140,7 +260,8 @@ def run_autogrid_init(
                 outputs["cgns"],
                 hdf5_dll=Path(command[0]).resolve().parent / "hdf5dll.dll",
             )
-            (run_path / MESH_FINGERPRINT_FILE).write_text(
+            fingerprint_path = run_path / MESH_FINGERPRINT_FILE
+            fingerprint_path.write_text(
                 json.dumps(
                     fingerprint_data,
                     ensure_ascii=False,
@@ -158,6 +279,8 @@ def run_autogrid_init(
     effective_returncode = process_returncode
     if effective_returncode == 0 and (failed_control is not None or script_error is not None):
         effective_returncode = 1
+    if protocol_errors:
+        effective_returncode = 1
     if effective_returncode == 0 and mesh_fingerprint and fingerprint_data is None:
         effective_returncode = 1
         if runner_error is None:
@@ -166,6 +289,8 @@ def run_autogrid_init(
         runner_error = failed_control.get("error") or "AutoGrid 控制应用失败"
     if runner_error is None and script_error is not None:
         runner_error = script_error
+    if runner_error is None and protocol_errors:
+        runner_error = protocol_errors[0]["message"]
     return AutoGridRun(
         command=command,
         returncode=effective_returncode,
@@ -176,6 +301,14 @@ def run_autogrid_init(
         error=runner_error,
         post_control_results=post_control_results,
         mesh_fingerprint=fingerprint_data,
+        completion_event=completion_event,
+        protocol_errors=protocol_errors,
+        controls_verification=controls_verification,
+        manifest_outputs=_output_manifest(
+            run_path,
+            outputs,
+            extra_paths=[fingerprint_path] if fingerprint_path is not None else [],
+        ),
     )
 
 
@@ -186,6 +319,7 @@ def render_autogrid_script(
     use_row_wizard: bool = True,
     controls: Sequence[ResolvedControl | dict[str, Any]] = (),
     mesh_fingerprint: bool = False,
+    run_id: str,
 ) -> str:
     """渲染可由 IGG 执行的 AutoGrid Python 脚本文本。"""
 
@@ -201,8 +335,10 @@ import json
 GEOMTURBO_FILE = r"{Path(geomturbo_path)}"
 OUTPUT_PREFIX = r"{output_prefix}"
 USE_ROW_WIZARD = {bool(use_row_wizard)!r}
+RUN_ID = {json.dumps(run_id)}
 CONTROL_RESULT_MARKER = {CONTROL_RESULT_MARKER!r}
 CONTROL_POST_RESULT_MARKER = {CONTROL_POST_RESULT_MARKER!r}
+COMPLETION_MARKER = {COMPLETION_MARKER!r}
 CONTROL_PLAN = json.loads({control_plan_json!r})
 
 
@@ -468,6 +604,8 @@ def _emit_control(
         "error": error,
         "readback_before": readback_before,
         "readback_before_error": readback_before_error,
+        "run_id": RUN_ID,
+        "stage": {CONTROL_APPLY_STAGE!r},
     }}
     print(CONTROL_RESULT_MARKER + json.dumps(event, sort_keys=True))
 
@@ -535,6 +673,8 @@ def _emit_post_generation_readbacks():
             "status": "no_getter",
             "readback": None,
             "error": None,
+            "run_id": RUN_ID,
+            "stage": {CONTROL_POST_STAGE!r},
         }}
         try:
             if control.get("getter"):
@@ -584,6 +724,13 @@ _require_global("a5_save_project")(_TRB_OUT)
 _require_global("a5_save_mesh")(_IGG_OUT)
 _require_global("a5_export_CGNS_project")(_CGNS_OUT)
 print("AutoGrid geomTurbo init script completed for", OUTPUT_PREFIX)
+
+# 完成事件：即使没有任何控制也必须输出，供宿主校验本次脚本完整执行。
+print(COMPLETION_MARKER + json.dumps({{
+    "stage": "final",
+    "run_id": RUN_ID,
+    "status": "completed",
+}}, sort_keys=True))
 '''
 
 
@@ -614,12 +761,30 @@ def _serialize_control_plan(
     return serialized
 
 
+def _record_protocol_error(
+    protocol_errors: list[dict[str, str]] | None,
+    code: str,
+    message: str,
+) -> None:
+    """向协议错误列表追加一条结构化错误。"""
+
+    if protocol_errors is not None:
+        protocol_errors.append({"code": code, "message": message})
+
+
 def parse_control_results(
     stdout: str,
     *,
     marker: str = CONTROL_RESULT_MARKER,
+    expected_stage: str | None = None,
+    run_id: str | None = None,
+    protocol_errors: list[dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
-    """从 IGG 标准输出中解析网格控制应用结果。"""
+    """从 IGG 标准输出中解析网格控制应用结果。
+
+    损坏 JSON、缺失 id、run_id 或阶段不匹配都记录为协议错误；
+    解析时不静默跳过或覆盖任何事件。
+    """
 
     results: list[dict[str, Any]] = []
     for line in stdout.splitlines():
@@ -629,24 +794,175 @@ def parse_control_results(
         payload = line[marker_index + len(marker) :].strip()
         try:
             value = json.loads(payload)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            _record_protocol_error(
+                protocol_errors,
+                "corrupt_json_event",
+                f"控制事件 JSON 损坏（{marker.strip(':')}）：{payload[:80]}（{exc}）",
+            )
             continue
-        if isinstance(value, dict) and value.get("id"):
-            results.append(value)
+        if not isinstance(value, dict) or not value.get("id"):
+            _record_protocol_error(
+                protocol_errors,
+                "malformed_control_event",
+                f"控制事件缺少 id 字段：{payload[:80]}",
+            )
+            continue
+        event_id = str(value.get("id"))
+        if run_id is not None and value.get("run_id") != run_id:
+            _record_protocol_error(
+                protocol_errors,
+                "control_event_run_id_mismatch",
+                f"控制事件 {event_id} 的 run_id 与本次运行不一致",
+            )
+        if expected_stage is not None and value.get("stage") != expected_stage:
+            _record_protocol_error(
+                protocol_errors,
+                "control_event_stage_mismatch",
+                f"控制事件 {event_id} 的阶段不是 {expected_stage}",
+            )
+        results.append(value)
     return results
+
+
+def parse_completion_event(
+    stdout: str,
+    *,
+    run_id: str,
+    protocol_errors: list[dict[str, str]] | None = None,
+) -> dict[str, Any] | None:
+    """解析生成脚本末尾的完成事件；缺失、损坏或不匹配记录为协议错误。"""
+
+    found: dict[str, Any] | None = None
+    saw_marker = False
+    for line in stdout.splitlines():
+        marker_index = line.find(COMPLETION_MARKER)
+        if marker_index < 0:
+            continue
+        saw_marker = True
+        payload = line[marker_index + len(COMPLETION_MARKER) :].strip()
+        try:
+            value = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            _record_protocol_error(
+                protocol_errors,
+                "corrupt_completion_event",
+                f"完成事件 JSON 损坏：{payload[:80]}（{exc}）",
+            )
+            continue
+        if not isinstance(value, dict):
+            _record_protocol_error(
+                protocol_errors,
+                "malformed_completion_event",
+                f"完成事件不是 JSON 对象：{payload[:80]}",
+            )
+            continue
+        if value.get("stage") != "final":
+            _record_protocol_error(
+                protocol_errors,
+                "completion_event_stage_mismatch",
+                f"完成事件 stage 不是 final：{value.get('stage')!r}",
+            )
+            continue
+        if value.get("run_id") != run_id:
+            _record_protocol_error(
+                protocol_errors,
+                "completion_event_run_id_mismatch",
+                "完成事件 run_id 与本次运行不一致",
+            )
+            continue
+        if value.get("status") != "completed":
+            _record_protocol_error(
+                protocol_errors,
+                "completion_event_invalid",
+                f"完成事件 status 不是 completed：{value.get('status')!r}",
+            )
+            continue
+        found = value
+    if not saw_marker:
+        _record_protocol_error(
+            protocol_errors,
+            "missing_completion_event",
+            "未收到 AGMESH_COMPLETION 完成事件",
+        )
+    return found
+
+
+def _merge_events_by_id(
+    events: Sequence[dict[str, Any]],
+    *,
+    protocol_errors: list[dict[str, str]] | None,
+) -> dict[str, dict[str, Any]]:
+    """按控制 ID 建立事件索引；重复 ID 记录为协议错误，不覆盖首个事件。"""
+
+    event_by_id: dict[str, dict[str, Any]] = {}
+    for event in events:
+        event_id = str(event.get("id"))
+        if event_id in event_by_id:
+            _record_protocol_error(
+                protocol_errors,
+                "duplicate_control_event",
+                f"控制事件 ID 重复：{event_id}",
+            )
+            continue
+        event_by_id[event_id] = dict(event)
+    return event_by_id
+
+
+def _check_event_matches_plan(
+    event: dict[str, Any],
+    control: ResolvedControl,
+    *,
+    protocol_errors: list[dict[str, str]] | None,
+) -> None:
+    """校验事件的 key 与目标与控制计划一致，不一致记录为协议错误。"""
+
+    event_id = str(event.get("id"))
+    if event.get("key") != control.key:
+        _record_protocol_error(
+            protocol_errors,
+            "control_event_key_mismatch",
+            f"控制事件 {event_id} 的 key 不匹配：{event.get('key')!r} != {control.key!r}",
+        )
+    if event.get("target_path") != control.target_path:
+        _record_protocol_error(
+            protocol_errors,
+            "control_event_target_mismatch",
+            f"控制事件 {event_id} 的目标不匹配："
+            f"{event.get('target_path')!r} != {control.target_path!r}",
+        )
 
 
 def merge_post_control_results(
     controls: Sequence[ResolvedControl],
     events: Sequence[dict[str, Any]],
+    *,
+    protocol_errors: list[dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
-    """将生成后的 getter 回读与原控制计划合并。"""
+    """将生成后的 getter 回读与原控制计划合并，并记录协议错误。"""
 
-    event_by_id = {str(event.get("id")): dict(event) for event in events}
+    event_by_id = _merge_events_by_id(events, protocol_errors=protocol_errors)
+    planned_by_id = {control.control_id: control for control in controls}
+    for event in event_by_id.values():
+        event_id = str(event.get("id"))
+        control = planned_by_id.get(event_id)
+        if control is None:
+            _record_protocol_error(
+                protocol_errors,
+                "unknown_control_event",
+                f"收到未计划控制的生成后事件：{event_id}（{event.get('key')}）",
+            )
+            continue
+        _check_event_matches_plan(event, control, protocol_errors=protocol_errors)
     merged: list[dict[str, Any]] = []
     for control in controls:
         event = event_by_id.get(control.control_id)
         if event is None:
+            _record_protocol_error(
+                protocol_errors,
+                "missing_post_generation_event",
+                f"控制 {control.control_id}（{control.key}）未收到生成后观察事件",
+            )
             merged.append(
                 {
                     "id": control.control_id,
@@ -665,15 +981,29 @@ def merge_post_control_results(
 def merge_control_results(
     controls: Sequence[ResolvedControl],
     events: Sequence[dict[str, Any]],
+    *,
+    protocol_errors: list[dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
-    """将控制计划与实际执行结果合并为完整状态列表。"""
+    """将控制计划与实际执行结果合并为完整状态列表，并记录协议错误。"""
 
-    event_by_id = {str(event.get("id")): dict(event) for event in events}
+    event_by_id = _merge_events_by_id(events, protocol_errors=protocol_errors)
+    planned_by_id = {control.control_id: control for control in controls}
+    for event in event_by_id.values():
+        event_id = str(event.get("id"))
+        control = planned_by_id.get(event_id)
+        if control is None:
+            _record_protocol_error(
+                protocol_errors,
+                "unknown_control_event",
+                f"收到未计划控制的执行事件：{event_id}（{event.get('key')}）",
+            )
+            continue
+        _check_event_matches_plan(event, control, protocol_errors=protocol_errors)
     merged: list[dict[str, Any]] = []
     for control in controls:
         data = control.to_dict()
         event = event_by_id.get(control.control_id)
-        if event:
+        if event is not None:
             data.update(
                 {
                     "status": event.get("status", "failed"),
@@ -684,6 +1014,11 @@ def merge_control_results(
                 }
             )
         else:
+            _record_protocol_error(
+                protocol_errors,
+                "missing_control_event",
+                f"控制 {control.control_id}（{control.key}）未收到应用事件",
+            )
             data.update(
                 {
                     "status": "not_applied",
@@ -695,6 +1030,195 @@ def merge_control_results(
             )
         merged.append(data)
     return merged
+
+
+def _normalize_int(value: Any) -> int | None:
+    """将整数或可解释的数值/文本归一化为精确整数。"""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if math.isfinite(value) and value.is_integer() else None
+    if isinstance(value, str):
+        try:
+            parsed = int(value.strip())
+        except ValueError:
+            return None
+        return parsed
+    return None
+
+
+def _normalize_float(value: Any) -> float | None:
+    """将实数或可解释的数值文本归一化为有限浮点数。"""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    if isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except ValueError:
+            return None
+        return number if math.isfinite(number) else None
+    return None
+
+
+def _normalize_bool(value: Any) -> bool | None:
+    """将布尔、0/1 整数或 true/false/yes/no 文本归一化为布尔值。"""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes"}:
+            return True
+        if lowered in {"false", "0", "no"}:
+            return False
+    return None
+
+
+def compare_control_readback(
+    value_type: str,
+    api_value: Any,
+    requested_value: Any,
+    *,
+    si_length: bool,
+    units_factor: float | None,
+    readback: Any,
+) -> bool | None:
+    """按注册表规则比较 setter 后回读与请求值。
+
+    返回 True/False 表示匹配或不匹配；None 表示无法按已确认规则解释，
+    不认定为 VERIFIED。整数、布尔和枚举归一化后精确比较；浮点使用
+    rel_tol=1e-7、abs_tol=1e-10；si_length 控制把回读按 units_factor
+    换算到 SI 后与请求值（米）比较。
+    """
+
+    if readback is None:
+        return None
+    if value_type == "bool":
+        expected = _normalize_bool(api_value)
+        observed = _normalize_bool(readback)
+        return None if expected is None or observed is None else expected == observed
+    if value_type == "int":
+        expected = _normalize_int(api_value)
+        observed = _normalize_int(readback)
+        return None if expected is None or observed is None else expected == observed
+    if value_type == "enum":
+        if isinstance(api_value, str):
+            if not isinstance(readback, str):
+                return None
+            return api_value == readback
+        expected = _normalize_int(api_value)
+        observed = _normalize_int(readback)
+        return None if expected is None or observed is None else expected == observed
+    if value_type == "float":
+        if si_length:
+            if units_factor is None or units_factor <= 0:
+                return None
+            observed = _normalize_float(readback)
+            if observed is None:
+                return None
+            return math.isclose(
+                observed * units_factor,
+                float(requested_value),
+                rel_tol=1.0e-7,
+                abs_tol=1.0e-10,
+            )
+        expected = _normalize_float(api_value)
+        observed = _normalize_float(readback)
+        if expected is None or observed is None:
+            return None
+        return math.isclose(observed, expected, rel_tol=1.0e-7, abs_tol=1.0e-10)
+    if value_type in {"tuple_int", "tuple_float"}:
+        if not isinstance(readback, (list, tuple)) or len(readback) != len(api_value):
+            return None
+        element_type = "int" if value_type == "tuple_int" else "float"
+        outcomes = [
+            compare_control_readback(
+                element_type,
+                expected,
+                expected,
+                si_length=False,
+                units_factor=None,
+                readback=observed,
+            )
+            for expected, observed in zip(api_value, readback)
+        ]
+        if any(outcome is None for outcome in outcomes):
+            return None
+        return all(outcomes)
+    return None
+
+
+def verify_control_readbacks(
+    controls: Sequence[ResolvedControl],
+    merged: Sequence[dict[str, Any]],
+    *,
+    units_factor: float | None = None,
+) -> list[dict[str, Any]]:
+    """为每项计划控制生成 VERIFIED/MISMATCH/READBACK_ERROR/UNVERIFIABLE 验证结果。"""
+
+    merged_by_id = {str(item.get("id")): item for item in merged}
+    results: list[dict[str, Any]] = []
+    for control in controls:
+        spec = CONTROL_REGISTRY.get(control.key)
+        event = merged_by_id.get(control.control_id, {})
+        status = event.get("status")
+        readback = event.get("readback")
+        error = event.get("error")
+        verification: str
+        detail: str | None
+        if status == "failed":
+            verification = "UNVERIFIABLE"
+            detail = error or "setter 执行失败"
+        elif status == "not_applied":
+            verification = "UNVERIFIABLE"
+            detail = error or "未收到应用事件"
+        elif not control.getter:
+            verification = "UNVERIFIABLE"
+            detail = "该控制未注册 getter，无法回读验证"
+        elif error:
+            verification = "READBACK_ERROR"
+            detail = error
+        elif spec is None:
+            verification = "UNVERIFIABLE"
+            detail = f"控制 {control.key} 不在注册表中"
+        else:
+            matched = compare_control_readback(
+                spec.value_type,
+                control.api_value,
+                control.requested_value,
+                si_length=spec.si_length,
+                units_factor=units_factor,
+                readback=readback,
+            )
+            if matched is True:
+                verification = "VERIFIED"
+                detail = None
+            elif matched is False:
+                verification = "MISMATCH"
+                detail = None
+            else:
+                verification = "UNVERIFIABLE"
+                detail = "无法按注册表规则解释回读"
+        results.append(
+            {
+                "control_id": control.control_id,
+                "key": control.key,
+                "target_path": control.target_path,
+                "verification": verification,
+                "readback": readback,
+                "error": detail,
+            }
+        )
+    return results
 
 
 def fingerprint_cgns_coordinates(
@@ -1076,8 +1600,17 @@ def _script_error(stderr: str) -> str | None:
     return lines[-1] if lines else "AutoGrid Python 脚本执行失败"
 
 
-def collect_outputs(run_dir: str | Path, output_prefix: str = "mesh") -> dict[str, Path]:
-    """收集运行目录中已生成的 AutoGrid 网格及报告文件。"""
+def collect_outputs(
+    run_dir: str | Path,
+    output_prefix: str = "mesh",
+    *,
+    snapshot: frozenset[str] = frozenset(),
+) -> dict[str, Path]:
+    """收集运行目录中本次新生成的 AutoGrid 网格及报告文件。
+
+    以占用成功时的目录快照为对照：快照内的既有文件（含白名单预存文件）
+    绝不登记为本此产物。
+    """
 
     run_path = Path(run_dir)
     suffixes = {
@@ -1093,9 +1626,58 @@ def collect_outputs(run_dir: str | Path, output_prefix: str = "mesh") -> dict[st
     outputs: dict[str, Path] = {}
     for key, suffix in suffixes.items():
         candidate = run_path / f"{output_prefix}{suffix}"
+        if candidate.name in snapshot:
+            continue
         if candidate.exists() and candidate.stat().st_size > 0:
             outputs[key] = candidate
     return outputs
+
+
+def _sha256_file(path: Path) -> str:
+    """流式计算文件 sha256。"""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _output_manifest(
+    run_dir: str | Path,
+    outputs: dict[str, Path],
+    *,
+    extra_paths: Sequence[Path] = (),
+) -> list[dict[str, Any]]:
+    """为本次新生成的产物生成相对路径、大小与可计算时的 sha256 清单。"""
+
+    run_path = Path(run_dir)
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for path in [outputs[key] for key in sorted(outputs)] + list(extra_paths):
+        relative = str(path.relative_to(run_path)).replace(os.sep, "/")
+        if relative in seen:
+            continue
+        seen.add(relative)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        try:
+            sha256 = _sha256_file(path)
+        except OSError:
+            sha256 = None
+        entries.append(
+            {
+                "relative_path": relative,
+                "size_bytes": size,
+                "sha256": sha256,
+            }
+        )
+    return entries
 
 
 def resolve_igg(executable: str = "igg") -> str | None:

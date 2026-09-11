@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import re
 import sqlite3
+import subprocess
 import uuid
 from datetime import datetime, timezone
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
 from .db import Database
@@ -46,9 +48,9 @@ def utc_now() -> str:
 
 
 def dump_json(value: Any) -> str:
-    """以稳定格式持久化 JSON。"""
+    """以稳定格式持久化 JSON；拒绝非有限数值。"""
 
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def load_json(value: str | None, default: Any) -> Any:
@@ -62,11 +64,92 @@ def load_json(value: str | None, default: Any) -> Any:
         return default
 
 
+def _enqueue_source_snapshot(project_root: Path) -> dict[str, Any]:
+    """记录入队时刻的来源快照：git 提交、控制注册表签名与 src 五模块 sha256。
+
+    与执行时摘要（schema v4 ``sources``）使用同一套算法，供运行详情
+    比较入队与执行来源是否发生漂移。
+    """
+
+    commit: str | None = None
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(project_root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        candidate = completed.stdout.strip()
+        if completed.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", candidate):
+            commit = candidate
+    except (OSError, subprocess.SubprocessError):
+        commit = None
+    registry_signature: str | None = None
+    source_files: dict[str, str] = {}
+    try:
+        from mesh import SOURCE_MODULE_FILES, _control_registry_signature
+
+        registry_signature, _key_count = _control_registry_signature()
+        src_root = Path(project_root) / "src"
+        for name in SOURCE_MODULE_FILES:
+            path = src_root / name
+            if not path.is_file():
+                continue
+            source_files[f"src/{name}"] = _sha256_file(path)
+    except Exception:
+        # 来源快照是诊断证据；内核不可用时降级为缺失，不阻断运行创建。
+        registry_signature = None
+        source_files = {}
+    return {
+        "git_commit": commit,
+        "control_registry_signature": registry_signature,
+        "source_files": source_files,
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _append_enqueue_source_event(
+    connection: sqlite3.Connection,
+    run_id: str,
+    source: Mapping[str, Any],
+    timestamp: str,
+) -> None:
+    """在 run_events 中记录入队来源快照；stage 无约束，允许新增事件类型。"""
+
+    sequence = int(
+        connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM run_events WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+    )
+    connection.execute(
+        """
+        INSERT INTO run_events (
+            run_id, sequence, stage, level, progress, message, data_json, created_at
+        ) VALUES (?, ?, 'ENQUEUE_SOURCE', 'INFO', NULL, '运行入队来源快照', ?, ?)
+        """,
+        (run_id, sequence, dump_json(source), timestamp),
+    )
+
+
 class SessionService:
     """共享会话和运行树的事务服务。"""
 
-    def __init__(self, database: Database) -> None:
+    def __init__(
+        self,
+        database: Database,
+        *,
+        project_root: str | Path | None = None,
+    ) -> None:
         self.database = database
+        self.project_root = Path(project_root).resolve() if project_root is not None else None
 
     def create_session(
         self,
@@ -108,6 +191,9 @@ class SessionService:
             "schema_version": 1,
             "geometry": dict(geometry_summary),
         }
+        enqueue_source = (
+            _enqueue_source_snapshot(self.project_root) if self.project_root is not None else None
+        )
         with self.database.transaction(immediate=True) as connection:
             connection.execute(
                 """
@@ -152,6 +238,8 @@ class SessionService:
                     timestamp,
                 ),
             )
+            if enqueue_source is not None:
+                _append_enqueue_source_event(connection, baseline_id, enqueue_source, timestamp)
             if geometry_artifact_size is not None:
                 connection.execute(
                     """
@@ -242,7 +330,7 @@ class SessionService:
         return result
 
     def get_run(self, run_id: str) -> dict[str, Any]:
-        """返回单轮控制、质量、经验、事件摘要和产物元数据。"""
+        """返回单轮控制、质量、经验、事件摘要、产物元数据与样本资格。"""
 
         with self.database.reading() as connection:
             run = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
@@ -255,6 +343,16 @@ class SessionService:
             artifacts = connection.execute(
                 "SELECT * FROM artifacts WHERE run_id = ? ORDER BY created_at, id", (run_id,)
             ).fetchall()
+            enqueue_row = connection.execute(
+                """
+                SELECT data_json FROM run_events
+                WHERE run_id = ? AND stage = 'ENQUEUE_SOURCE'
+                ORDER BY sequence LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+        summary = load_json(run["run_summary_json"], EMPTY_RUN_SUMMARY)
+        enqueue_source = load_json(enqueue_row["data_json"], {}) if enqueue_row is not None else {}
         result = _run_summary(run)
         result.update(
             {
@@ -262,7 +360,14 @@ class SessionService:
                 "control_changes": load_json(run["control_delta_json"], EMPTY_CONTROL_DELTA).get("items", []),
                 "parse_result": load_json(run["parse_result_json"], {}),
                 "quality": load_json(run["quality_json"], EMPTY_QUALITY),
-                "run_summary": load_json(run["run_summary_json"], EMPTY_RUN_SUMMARY),
+                "run_summary": summary,
+                "sample_eligibility": _sample_eligibility(
+                    summary,
+                    artifacts,
+                    session_id=str(run["session_id"]),
+                    run_id=run_id,
+                    enqueue_source=enqueue_source,
+                ),
                 "experience_note": run["experience_note"],
                 "note_version": run["note_version"],
                 "events": [_event_dict(row) for row in reversed(events)],
@@ -288,6 +393,9 @@ class SessionService:
         normalized_request_id = _validate_request_id(request_id)
         snapshot_json = dump_json(control_snapshot)
         delta_json = dump_json(control_delta)
+        enqueue_source = (
+            _enqueue_source_snapshot(self.project_root) if self.project_root is not None else None
+        )
         with self.database.transaction(immediate=True) as connection:
             existing = connection.execute(
                 "SELECT * FROM runs WHERE session_id = ? AND request_id = ?",
@@ -345,6 +453,8 @@ class SessionService:
                         timestamp,
                     ),
                 )
+                if enqueue_source is not None:
+                    _append_enqueue_source_event(connection, run_id, enqueue_source, timestamp)
                 _bump_session_version(connection, session_id, expected_version, timestamp)
         return self.get_run(run_id)
 
@@ -358,6 +468,9 @@ class SessionService:
         """为失败运行创建具有相同完整控制快照的重试子节点。"""
 
         normalized_request_id = _validate_request_id(request_id)
+        enqueue_source = (
+            _enqueue_source_snapshot(self.project_root) if self.project_root is not None else None
+        )
         with self.database.transaction(immediate=True) as connection:
             source = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
             if source is None:
@@ -409,6 +522,8 @@ class SessionService:
                         timestamp,
                     ),
                 )
+                if enqueue_source is not None:
+                    _append_enqueue_source_event(connection, retry_id, enqueue_source, timestamp)
                 _bump_session_version(connection, session_id, expected_version, timestamp)
         return self.get_run(retry_id)
 
@@ -693,6 +808,120 @@ def _preview_artifact_block_id(kind: str, relative_path: str) -> str | None:
     except ValueError:
         return None
     return parts[marker + 1] if marker + 1 < len(parts) else None
+
+
+def _sample_eligibility(
+    summary: Mapping[str, Any],
+    artifacts: Sequence[sqlite3.Row],
+    *,
+    session_id: str,
+    run_id: str,
+    enqueue_source: Mapping[str, Any],
+) -> dict[str, Any]:
+    """按共享契约 C 从不可变摘要、已登记产物与入队来源计算样本资格。
+
+    每个不满足项给出对应原因；``quality.result == FAIL`` 不影响资格
+    （有效失败经验）。v3 历史摘要视为新证据缺失，不自动认定合格。
+    """
+
+    if not isinstance(summary, Mapping) or summary.get("schema_version") != 4:
+        if isinstance(summary, Mapping) and summary.get("schema_version") == 3:
+            return {"eligible": False, "reasons": ["新证据缺失"]}
+        return {"eligible": False, "reasons": ["运行摘要不是 schema v4，无可用执行证据"]}
+    reasons: list[str] = []
+    summary_run_id = summary.get("run_id")
+    evidence = summary.get("execution_evidence")
+    completion = evidence.get("completion_event") if isinstance(evidence, Mapping) else None
+    if not (
+        isinstance(completion, Mapping)
+        and completion.get("stage") == "final"
+        and completion.get("run_id") == summary_run_id
+    ):
+        reasons.append("完成事件缺失、损坏或与运行身份不一致")
+    protocol_errors = evidence.get("protocol_errors") if isinstance(evidence, Mapping) else None
+    if protocol_errors:
+        reasons.append("执行证据存在协议错误")
+    controls = summary.get("controls")
+    verification = controls.get("verification") if isinstance(controls, Mapping) else None
+    verification_status = verification.get("status") if isinstance(verification, Mapping) else None
+    if verification_status not in {"COMPLETE", "NOT_REQUESTED"}:
+        reasons.append(f"控制验证不充分（{verification_status}）")
+    quality_validation = summary.get("quality_validation")
+    quality_validation_status = (
+        quality_validation.get("status") if isinstance(quality_validation, Mapping) else None
+    )
+    if quality_validation_status != "VALID":
+        reasons.append(f"质量数据校验不可判定（{quality_validation_status}）")
+    sources = summary.get("sources")
+    source_map = sources if isinstance(sources, Mapping) else {}
+    git = source_map.get("git")
+    if not (isinstance(git, Mapping) and git.get("commit")):
+        reasons.append("缺少执行时的 git 提交来源")
+    source_signature = source_map.get("source_signature")
+    if not (isinstance(source_signature, Mapping) and source_signature.get("files")):
+        reasons.append("缺少执行源码签名")
+    registry = source_map.get("control_registry")
+    if not (isinstance(registry, Mapping) and registry.get("signature")):
+        reasons.append("缺少控制注册表签名")
+    manifest = summary.get("manifest")
+    outputs = manifest.get("outputs") if isinstance(manifest, Mapping) else None
+    if not isinstance(outputs, list):
+        reasons.append("产物清单缺失或损坏")
+    else:
+        registered = [str(row["relative_path"]).replace("\\", "/") for row in artifacts]
+        unregistered: list[str] = []
+        for entry in outputs:
+            relative = entry.get("relative_path") if isinstance(entry, Mapping) else None
+            if not isinstance(relative, str):
+                unregistered.append(str(relative))
+                continue
+            suffix = f"{session_id}/{run_id}/{relative}"
+            if not any(path.endswith("/" + suffix) or path == suffix for path in registered):
+                unregistered.append(relative)
+        if unregistered:
+            reasons.append("产物未全部登记为平台产物：" + ", ".join(unregistered))
+    reasons.extend(_source_drift_reasons(summary, enqueue_source))
+    return {"eligible": not reasons, "reasons": reasons}
+
+
+def _source_drift_reasons(
+    summary: Mapping[str, Any],
+    enqueue_source: Mapping[str, Any],
+) -> list[str]:
+    """比较入队与执行来源；出现差异时逐项给出「来源漂移」说明。"""
+
+    reasons: list[str] = []
+    sources = summary.get("sources")
+    source_map = sources if isinstance(sources, Mapping) else {}
+    git = source_map.get("git")
+    exec_commit = git.get("commit") if isinstance(git, Mapping) else None
+    enqueue_commit = enqueue_source.get("git_commit")
+    if enqueue_commit and exec_commit and enqueue_commit != exec_commit:
+        reasons.append(f"来源漂移：git 提交不一致（入队 {enqueue_commit[:12]}…，执行 {exec_commit[:12]}…）")
+    registry = source_map.get("control_registry")
+    exec_signature = registry.get("signature") if isinstance(registry, Mapping) else None
+    enqueue_signature = enqueue_source.get("control_registry_signature")
+    if enqueue_signature and exec_signature and enqueue_signature != exec_signature:
+        reasons.append("来源漂移：控制注册表签名不一致")
+    source_signature = source_map.get("source_signature")
+    exec_files: dict[str, Any] = {}
+    if isinstance(source_signature, Mapping):
+        for entry in source_signature.get("files", []) or []:
+            if isinstance(entry, Mapping) and entry.get("path"):
+                exec_files[str(entry["path"])] = entry.get("sha256")
+    enqueue_files = enqueue_source.get("source_files")
+    if isinstance(enqueue_files, Mapping):
+        changed = sorted(
+            path
+            for path, sha256 in enqueue_files.items()
+            if sha256
+            and path in exec_files
+            and exec_files[path]
+            and sha256 != exec_files[path]
+        )
+        if changed:
+            reasons.append("来源漂移：执行源码 sha256 不一致（" + ", ".join(changed) + "）")
+    return reasons
 
 
 def _encode_cursor(created_at: str, session_id: str) -> str:

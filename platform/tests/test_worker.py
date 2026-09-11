@@ -201,12 +201,14 @@ def test_control_snapshot_builds_stable_mesh_cli(tmp_path: Path) -> None:
         project_root=root,
         geometry_path=geometry,
         output_dir=root / "out",
+        run_id="run-abc123",
         control_snapshot=snapshot,
         igg_path=root / "igg.exe",
         timeout_seconds=123,
     )
     assert command[1] == str((root / "src" / "mesh.py").resolve())
     assert command[2] == str(geometry.resolve())
+    assert command[command.index("--run-id") + 1] == "run-abc123"
     assert command.count("--set") == 5
     assert command[command.index("--timeout") + 1] == "123"
 
@@ -246,13 +248,34 @@ def test_worker_child_process_quality_fail_still_succeeds_and_heartbeats(tmp_pat
             parser = argparse.ArgumentParser()
             parser.add_argument("geometry")
             parser.add_argument("--out", required=True)
+            parser.add_argument("--run-id", required=True)
             args, _ = parser.parse_known_args()
             output = Path(args.out)
             output.mkdir(parents=True, exist_ok=True)
             summary = {
-                "schema_version": 3,
+                "schema_version": 4,
+                "run_id": args.run_id,
+                "created_at": "2026-08-06T00:00:00.000Z",
                 "autogrid": {"outputs": {}, "returncode": 0, "error": None},
                 "quality": {"result": {"status": "FAIL", "accepted": False, "reasons": ["测试阈值"]}},
+                "quality_validation": {"status": "VALID", "reasons": []},
+                "controls": {"verification": {"status": "NOT_REQUESTED", "results": []}},
+                "execution_evidence": {
+                    "completion_event": {"stage": "final", "run_id": args.run_id, "status": "completed"},
+                    "protocol_errors": [],
+                },
+                "sources": {
+                    "git": {"commit": "a" * 40, "dirty": False},
+                    "source_signature": {"algorithm": "sha256", "files": [{"path": "src/mesh.py", "sha256": "b" * 64}]},
+                    "control_registry": {"signature": "c" * 64, "key_count": 1},
+                },
+                "manifest": {
+                    "stages_completed": ["generation"],
+                    "outputs": [
+                        {"relative_path": "report.md", "size_bytes": 1, "sha256": "d" * 64},
+                        {"relative_path": "mesh.qualityReport", "size_bytes": 1, "sha256": "e" * 64},
+                    ],
+                },
             }
             (output / "run_summary.json").write_text(json.dumps(summary), encoding="utf-8")
             (output / "report.md").write_text("# 测试报告", encoding="utf-8")
@@ -326,9 +349,16 @@ def test_worker_child_process_quality_fail_still_succeeds_and_heartbeats(tmp_pat
                 "SELECT kind FROM artifacts WHERE run_id = ?", (run_ids[0],)
             ).fetchall()
         }
+        stored_summary = json.loads(
+            connection.execute(
+                "SELECT run_summary_json FROM runs WHERE id = ?", (run_ids[0],)
+            ).fetchone()[0]
+        )
     assert heartbeat is not None
     assert heartbeat["max_concurrency"] == 20
     assert {"RUN_SUMMARY", "REPORT", "QUALITY_REPORT", "LOG"}.issubset(kinds)
+    # Worker 必须把平台运行身份作为 --run-id 传入，摘要身份与平台身份一致。
+    assert stored_summary["run_id"] == run_ids[0]
 
 
 def test_post_spawn_database_failure_terminates_process_tree_and_releases_task(
@@ -526,3 +556,178 @@ def test_online_backup_contains_consistent_database_and_artifact_manifest(tmp_pa
     second = create_backup(database.path, data_dir, data_dir / "backups")
     assert second["database"] != result["database"]
     assert second["manifest"] != result["manifest"]
+
+
+def _always_allowed_probe(count: int) -> ResourceSnapshot:
+    return ResourceSnapshot(
+        available_memory_gb=100,
+        free_disk_gb=100,
+        running_count=count,
+        reservation_gb=2.5 * (count + 1),
+        min_free_memory_gb=8,
+        min_free_disk_gb=20,
+        allowed=True,
+        reason_code=None,
+        reason=None,
+    )
+
+
+def _worker_settings(
+    tmp_path: Path,
+    database: Database,
+    data_dir: Path,
+    fake_root: Path,
+) -> Settings:
+    settings = Settings(
+        project_root=fake_root,
+        platform_dir=PROJECT_ROOT / "platform",
+        data_dir=data_dir,
+        database_path=database.path,
+        migrations_dir=MIGRATIONS_DIR,
+        geometry_dir=data_dir / "geometries",
+        artifact_dir=data_dir / "artifacts",
+        preview_dir=data_dir / "previews",
+        ui_dist_dir=fake_root / "ui",
+        igg_path=None,
+        max_concurrency=20,
+        memory_reservation_gb=2.5,
+        min_free_memory_gb=8,
+        min_free_disk_gb=20,
+        job_timeout_seconds=10,
+        busy_timeout_ms=10_000,
+        worker_stale_seconds=30,
+        max_upload_bytes=1024,
+    )
+    settings.ensure_directories()
+    return settings
+
+
+def _write_geometry(data_dir: Path, session_id: str) -> Path:
+    geometry = data_dir / "geometries" / session_id / "source.geomTurbo"
+    geometry.parent.mkdir(parents=True, exist_ok=True)
+    geometry.write_text("GEOMETRY", encoding="utf-8")
+    return geometry
+
+
+def _run_worker_until_terminal(
+    worker: Worker,
+    database: Database,
+    run_id: str,
+    *,
+    deadline_seconds: float = 10,
+) -> sqlite3.Row:
+    deadline = time.monotonic() + deadline_seconds
+    while time.monotonic() < deadline:
+        worker.run_once()
+        with database.reading() as connection:
+            row = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row["status"] in {"SUCCEEDED", "FAILED"}:
+            return row
+        time.sleep(0.05)
+    worker.shutdown()
+    pytest.fail("Worker 未在期限内将运行推进到终态")
+
+
+def test_worker_refuses_existing_run_directory_and_marks_failed(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    session_id, run_ids = _insert_session_and_runs(database, 1)
+    data_dir = tmp_path / "data"
+    _write_geometry(data_dir, session_id)
+    fake_root = tmp_path / "fake-project"
+    fake_root.mkdir()
+    (fake_root / "src").mkdir()
+    (fake_root / "src" / "mesh.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    settings = _worker_settings(tmp_path, database, data_dir, fake_root)
+    run_dir = data_dir / "artifacts" / session_id / run_ids[0]
+    run_dir.mkdir(parents=True)
+    sentinel = run_dir / "历史产物.log"
+    sentinel.write_text("旧内容", encoding="utf-8")
+    worker = Worker(
+        settings,
+        database=database,
+        worker_id="occupancy-worker",
+        resource_probe=_always_allowed_probe,
+    )
+    row = _run_worker_until_terminal(worker, database, run_ids[0])
+    assert row["status"] == "FAILED"
+    assert row["error_code"] == "RUN_DIR_UNAVAILABLE"
+    assert "已存在" in row["error_message"]
+    # 既有目录与文件保持原样，不追加日志、不覆盖内容。
+    assert sorted(path.name for path in run_dir.iterdir()) == ["历史产物.log"]
+    assert sentinel.read_text(encoding="utf-8") == "旧内容"
+
+
+def test_worker_protocol_error_marks_run_failed_with_clear_error(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    session_id, run_ids = _insert_session_and_runs(database, 1)
+    data_dir = tmp_path / "data"
+    _write_geometry(data_dir, session_id)
+    fake_root = tmp_path / "fake-project"
+    fake_root.mkdir()
+    (fake_root / "src").mkdir()
+    (fake_root / "src" / "mesh.py").write_text(
+        textwrap.dedent(
+            """
+            import argparse, json
+            from pathlib import Path
+            parser = argparse.ArgumentParser()
+            parser.add_argument("geometry")
+            parser.add_argument("--out", required=True)
+            parser.add_argument("--run-id", required=True)
+            args, _ = parser.parse_known_args()
+            output = Path(args.out)
+            summary = {
+                "schema_version": 4,
+                "run_id": args.run_id,
+                "autogrid": {"outputs": {}, "returncode": 1, "error": "未收到 AGMESH_COMPLETION 完成事件"},
+                "execution_evidence": {
+                    "completion_event": None,
+                    "protocol_errors": [{"code": "missing_completion_event", "message": "未收到 AGMESH_COMPLETION 完成事件"}],
+                },
+            }
+            (output / "run_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+            raise SystemExit(1)
+            """
+        ),
+        encoding="utf-8",
+    )
+    settings = _worker_settings(tmp_path, database, data_dir, fake_root)
+    worker = Worker(
+        settings,
+        database=database,
+        worker_id="protocol-worker",
+        resource_probe=_always_allowed_probe,
+    )
+    row = _run_worker_until_terminal(worker, database, run_ids[0])
+    assert row["status"] == "FAILED"
+    assert row["error_code"] == "MESH_PROCESS_FAILED"
+    assert "完成事件" in row["error_message"]
+    stored = json.loads(row["run_summary_json"])
+    assert stored["schema_version"] == 4
+    assert stored["execution_evidence"]["protocol_errors"][0]["code"] == "missing_completion_event"
+
+
+def test_persisted_json_rejects_non_finite_numbers(tmp_path: Path) -> None:
+    from mesh_app.sessions import dump_json
+
+    with pytest.raises(ValueError):
+        worker_module._json_text({"value": float("nan")})
+    with pytest.raises(ValueError):
+        worker_module._json_text({"value": float("inf")})
+    with pytest.raises(ValueError):
+        dump_json({"value": float("-inf")})
+
+    database = _database(tmp_path)
+    _, run_ids = _insert_session_and_runs(database, 1)
+    assert atomic_claim_run(database, "nan-worker")["id"] == run_ids[0]
+    with pytest.raises(ValueError):
+        mark_run_succeeded(
+            database,
+            run_ids[0],
+            run_summary={"schema_version": 4, "run_id": run_ids[0], "bad": float("nan")},
+            quality={},
+            quality_status="PASS",
+        )
+    with database.reading() as connection:
+        row = connection.execute("SELECT * FROM runs WHERE id = ?", (run_ids[0],)).fetchone()
+    assert row["status"] == "RUNNING"
