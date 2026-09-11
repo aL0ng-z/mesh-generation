@@ -49,6 +49,10 @@ quality
     status                   PASS | FAIL | UNKNOWN
     accepted
     reasons
+  quality_validation         数据校验摘要（VALID | INVALID | UNKNOWN）
+    status
+    reasons                  {field, problem} 列表
+  raw                        原始质量报告文本（非有限值的原始记录）
 ```
 
 `quality.metrics` 和 `quality.result` 是兼容接口，仍可供旧调用方读取；新代码应优先使用 `quality.entities` 获得逐叶排统计和位置。
@@ -151,9 +155,24 @@ SI 换算使用 `.geomTurbo` 的 `UNITS-FACTOR`。单位或换算因子未知时
 
 ## 状态规则
 
-- `PASS`：所有必需字段存在，且全部硬门槛满足；`accepted = true`。
-- `FAIL`：所有必需字段足以判定，但至少一个硬门槛违反；`accepted = false`。
-- `UNKNOWN`：任一必需字段缺失，或没有可用质量源；`accepted = false`。
+判定采用"先校验、后比较"的两步顺序：
+
+1. **领域校验**：必需字段缺失，或任何已提供的统计值非法（计数不是严格整数、非有限数值、角度超出 `[0, 180]`、比例非正、壁面距离为负）时直接返回 `UNKNOWN`。
+2. **硬门槛比较**：校验通过后逐项比较固定硬门槛，保持现有阈值与等号行为不变。
+
+状态规则：
+
+- `PASS`：所有必需字段存在、领域校验通过，且全部硬门槛满足；`accepted = true`。
+- `FAIL`：所有必需字段存在、领域校验通过，但至少一个硬门槛违反；`accepted = false`。
+- `UNKNOWN`：任一必需字段缺失、领域校验失败，或没有可用质量源；`accepted = false`。原因包含字段路径，例如 `quality.metrics.min_skewness_angle: 非有限数值`。
+
+非有限值（NaN、±Inf）在对外结构中统一转换为 `null`，错误说明保留在 `quality_validation`、原始报告保留在 `raw`；摘要及平台持久化 JSON 使用 `allow_nan=False` 序列化。
+
+`quality_validation` 是独立于判定结果的数据校验摘要，三态：
+
+- `VALID`：校验通过（`PASS` 与 `FAIL` 运行均可能）；
+- `INVALID`：必需字段缺失或统计值非法，`reasons` 逐项给出字段路径与问题；
+- `UNKNOWN`：没有可用质量源。
 
 状态枚举和机器字段保持英文。`report.md` 会将判定原因转换成中文供人工阅读。
 
@@ -308,20 +327,24 @@ for entity in summary["entities"]:
 
 对于 `scope == "row"` 的实体，`criteria` 中的 `critical_location` 为报告直接给出的位置；对于 `entire_mesh`，若报告未直接提供位置，解析器从匹配的 row 中自动推导，并在 location 中附加 `derived_from_scope` 和 `derived_from_name` 字段。
 
-### 9. 质量判定（3 个）
+### 9. 质量判定与校验摘要（6 个）
 
 | 字段路径 | 类型 | 含义 |
 |---|---|---|
 | `result.status` | enum | `PASS` / `FAIL` / `UNKNOWN` |
 | `result.accepted` | bool | `true` 仅当 status 为 PASS |
-| `result.reasons` | list[str] | 失败或无法判定时的具体原因 |
+| `result.reasons` | list[str] | 失败或无法判定时的具体原因（含字段路径） |
+| `quality_validation.status` | enum | 数据校验摘要三态：`VALID` / `INVALID` / `UNKNOWN` |
+| `quality_validation.reasons` | list[dict] | 非法数据时逐项给出 `{field, problem}`；`VALID` 时为空 |
+| `raw` | str \| null | 原始质量报告文本，供非有限值转换后溯源 |
 
-### 10. 辅助字段（2 个）
+### 10. 辅助字段（3 个）
 
 | 字段路径 | 类型 | 含义 |
 |---|---|---|
 | `metrics_source` | str | 数据来源：`quality_report` / `embedded_cgns` / `null` |
 | `metrics` | dict | Entire Mesh 的旧扁平兼容字段集合（含以上全部 min/max/avg 及位置字段） |
+| `raw` | str \| null | 原始质量报告文本；非有限值在对外结构中转 `null` 后仍可溯源 |
 
 ### 指标总数汇总
 
@@ -338,15 +361,16 @@ for entity in summary["entities"]:
 | 项目基础信息（name / template_path / units / units_factor / number_of_points / number_of_rows） | 6 |
 | 逐行项目信息（每行 6 字段 × N_rows） | 6 × N |
 | 质量判定（status / accepted / reasons） | 3 |
-| 辅助（metrics_source） | 1 |
-| **基础合计（不含逐行）** | **~55** |
-| **含 1 行完整统计** | **~100+**（55 基础 + 1 个 entire_mesh entity 的 ~25 准则字段 + 1 个 row entity 的 ~25 准则字段） |
+| 校验摘要（quality_validation.status / reasons） | 2 |
+| 辅助（metrics_source / raw） | 2 |
+| **基础合计（不含逐行）** | **~58** |
+| **含 1 行完整统计** | **~100+**（58 基础 + 1 个 entire_mesh entity 的 ~25 准则字段 + 1 个 row entity 的 ~25 准则字段） |
 
 其中 `quality.entities` 是信息最丰富的结构——每个 entity 包含独立的三项全局计数和六类准则完整 min/max/avg/位置。对于 N 行几何，entities 共 N+1 个（1 个 entire_mesh + N 个 row）。
 
-### 评估必需字段
+### 评估必需字段与领域校验
 
-`evaluate_quality()` 判定前会检查以下 8 个字段是否全部存在且非空：
+`evaluate_quality()` 先检查以下 8 个必需字段是否全部存在且非空：
 
 ```text
 negative_cells
@@ -359,7 +383,15 @@ max_spanwise_expansion_ratio
 max_aspect_ratio
 ```
 
-任一字段缺失 → 状态 `UNKNOWN`。全部存在 → 逐项检查硬门槛。
+任一字段缺失 → 状态 `UNKNOWN`，原因含字段路径。随后对**所有已提供的统计值**做领域校验：
+
+- 计数严格整数：`number_of_points`、`grid_levels` 必须为正整数，`negative_cells` 必须为非负整数，拒绝布尔与小数文本；
+- 实数值有限：拒绝 NaN、±Inf 与指数溢出；
+- 角度（skewness 类）在 `[0, 180]` 内；
+- 比例（expansion/aspect 类）为正；
+- 壁面距离非负。
+
+任何非法值 → `UNKNOWN`、`accepted = false`，原因包含字段路径；校验全部通过后才逐项比较硬门槛，阈值与等号行为不变。该语义同时作用于报告解析、CGNS 降级解析与直接调用三个入口。
 
 ### CGNS 降级差异
 

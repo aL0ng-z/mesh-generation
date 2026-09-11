@@ -134,7 +134,10 @@ project_value = requested_si / units_factor
 ```
 
 请求值、项目单位值、传给 API 的值，以及 setter 前、setter 后和 3D
-网格生成后的 getter 回读值均进入 Schema 3 `run_summary.json`。
+网格生成后的 getter 回读值均进入 Schema 4 `run_summary.json`。每项控制的
+验证结论（`VERIFIED` / `MISMATCH` / `READBACK_ERROR` / `UNVERIFIABLE`）记录在
+`controls.verification`；脚本末尾必须输出 `AGMESH_COMPLETION` 完成事件，
+即使没有请求任何控制。
 
 ## 应用阶段
 
@@ -154,6 +157,17 @@ configuration
 ```
 
 这可避免 RowWizard 覆盖后置的拓扑、点数和优化设置。
+
+## 启用条件与前置项
+
+部分控制的启用条件由 `CONTROL_PREREQUISITES` 描述。值为 `">N"` 字符串时表示**启用谓词**（显式值大于 N 才满足），其余按等值判断：
+
+- 优化子项（`freeze_skin`、`orthogonality`、`skewness`、`wake` 等）要求 `row/optimization.steps > 0`；
+- 喉部相关子项（`throat_projection_type`、`throat_inlet_relaxation`、`throat_outlet_relaxation`）要求 `blade/b2b.default.throat_points > 0`，并保留拓扑等值条件（如 `blade/b2b.default.type = streamwise`）。
+
+启用规则统一用于依赖排序、Web 可编辑性、提交校验与必要清除：前置项缺失、被清除或不满足时，子项不可编辑、提交报错并显示 `required_clears`；前置项变为零、被清除或切换到不适用拓扑时才触发子项清除。
+
+**建议值说明**：`optimization.steps = 200` 与 `throat_points = 9` 仅为 campaign 采样矩阵的实验取值（`tests/test_campaign_runner.py` 的 `CAMPAIGN_PREREQUISITE_VALUES`），**不作为**通用启用条件；campaign 调整 `200→100/300`、`9→7/11` 不会清除仍有效的子项。CLI 不校验前置值，也不要求所有前置项必须显式传入。
 
 ## AutoGrid 17.1 setter 审计
 
@@ -273,8 +287,11 @@ project_value = requested_si / units_factor
 ```
 
 请求值、项目单位值、传给 API 的值和三阶段 getter 回读均进入
-`run_summary.json`，完整可审计。需要验证网格是否真正改变时可追加
-`--mesh-fingerprint`，生成完整 block 坐标 SHA-256、I/J/K 和固定坐标探针。
+Schema 4 `run_summary.json`，每项控制带四枚举验证结论（`VERIFIED` /
+`MISMATCH` / `READBACK_ERROR` / `UNVERIFIABLE`；浮点按 rel_tol=1e-7、
+abs_tol=1e-10 比较，长度换算到 SI 后比较），完整可审计。需要验证网格是否
+真正改变时可追加 `--mesh-fingerprint`，生成完整 block 坐标 SHA-256、I/J/K
+和固定坐标探针。
 
 ## 按作用域分类总览
 

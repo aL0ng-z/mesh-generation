@@ -268,10 +268,10 @@ Step 9: 写入运行摘要和报告（src/mesh.py:main）
 | 返回码 | 含义 | 触发场景 |
 |---|---|---|
 | **0** | 成功 | 网格生成完成且质量可评估 |
-| **1** | AutoGrid 阶段失败 | 实体不存在、拓扑不适用、setter/getter 异常、脚本 traceback |
-| **2** | 静态校验失败 | 未知控制键、类型/范围错误、选择器不匹配、重复定义、`--no-row-wizard` 冲突 |
+| **1** | AutoGrid 阶段失败 | 实体不存在、拓扑不适用、setter/getter 异常、脚本 traceback、事件协议错误 |
+| **2** | 静态校验失败或运行目录不可用 | 未知控制键、类型/范围错误、选择器不匹配、重复定义、`--no-row-wizard` 冲突、输出目录被占用或含非白名单既有文件 |
 
-- 返回码 2 **不会**启动 IGG——在解析阶段就直接退出了。
+- 返回码 2 **不会**启动 IGG——在解析阶段或取得运行目录所有权之前就直接退出；运行目录被拒绝时保留既有文件。
 - 返回码 1 会创建运行目录和 `run_summary.json`，其中 `controls.applied` 记录了具体哪个控制失败。
 
 ### 1.6 关键设计原则
@@ -939,6 +939,11 @@ class AutoGridRun:
     outputs: dict[str, str]              # 网格产物路径，如 {"igg": ".../mesh.igg", ...}
     control_results: list[dict]           # 每个控制的执行结果（含 status/readback/error）
     error: str | None                    # 运行错误信息（如有）
+    post_control_results: list[dict]      # 3D 网格生成后的观察事件
+    completion_event: dict | None         # AGMESH_COMPLETION 完成事件
+    protocol_errors: list[dict]           # 事件协议错误（code + message）
+    controls_verification: dict | None    # 每项控制 VERIFIED/MISMATCH/READBACK_ERROR/UNVERIFIABLE
+    manifest_outputs: list[dict]          # 本次新产物清单（相对路径/大小/sha256）
 ```
 
 （`autogrid.py:21-36`）
@@ -1034,17 +1039,21 @@ elif kind == "endwall-holes-line":
 
 **`_require_entity(entity, label)`**（`autogrid.py:196-199`）：检查 `entity is None or entity == 0`。注意 `entity == 0` 这个条件——这是 AutoGrid/IGG 的一个已知怪癖：某些 accessor 方法在实体不存在时返回整数 `0` 而不是 `None`。如果不处理这个情况，后续的 `getattr(entity, "set_xxx")` 调用会得到 `int.set_xxx`，产生令人困惑的错误。
 
-#### 4.3.1 控制结果标记协议
+#### 4.3.1 事件标记协议
 
-脚本通过 stdout 输出控制结果。每条结果是一个 JSON 行，以固定前缀标记：
+脚本通过 stdout 输出事件。控制应用与 3D 网格生成后的观察分别使用两个前缀标记，每条事件是一个 JSON 行：
 
 ```text
-AGMESH_CONTROL_RESULT:{"id":"C0001","key":"row/mesh_level",...,"status":"applied"}
+AGMESH_CONTROL_RESULT:{"id":"C0001","key":"row/mesh_level",...,"run_id":"...","stage":"apply","status":"applied"}
+AGMESH_CONTROL_POST_RESULT:{...,"stage":"post_generation",...}
+AGMESH_COMPLETION:{"stage":"final","run_id":"...","status":"completed"}
 ```
 
-标记字符串 `"AGMESH_CONTROL_RESULT:"` 作为常量定义在 `autogrid.py:18`，同时嵌入生成的脚本中。
+所有事件统一携带 `run_id` 与 `stage`。脚本末尾无条件输出 `AGMESH_COMPLETION` 完成事件——即使没有请求任何控制，也必须收到本次脚本的最终完成事件。
 
-输出的 JSON 字段（`_emit_control`，`autogrid.py:389-400`）：
+宿主解析对协议错误零容忍：损坏 JSON、缺失/重复/未知 ID、key/目标/阶段/run_id 不匹配、缺失应用/观察/完成事件全部记录为 `protocol_errors`（code + message）并使运行 `FAILED`（returncode 1），不再用字典覆盖或静默跳过。
+
+输出的 JSON 字段（`_emit_control`）：
 
 ```json
 {
@@ -1059,17 +1068,28 @@ AGMESH_CONTROL_RESULT:{"id":"C0001","key":"row/mesh_level",...,"status":"applied
 }
 ```
 
+每项计划控制额外生成验证结论（`verify_control_readbacks`，写入 `run_summary.json` 的 `controls.verification`），四枚举之一：
+
+- `VERIFIED`：按注册表规则比较回读与请求值一致——整数、布尔、枚举归一化后精确比较；浮点用 rel_tol=1e-7、abs_tol=1e-10；SI 长度按 units_factor 换算到 SI 后比较；
+- `MISMATCH`：比较结果不一致；
+- `READBACK_ERROR`：getter 报错；
+- `UNVERIFIABLE`：setter 失败、未收到应用事件、无 getter，或回读无法按已确认规则解释（含厂商重采样与特殊枚举）。
+
+setter 前的回读失败仅作诊断；getter 报错或回读不匹配时运行仍可 `SUCCEEDED`，验证异常单独标记，允许继续创建分支。
+
 ### 4.4 `run_autogrid_init()`：进程管理
 
 （`autogrid.py:39-136`）
 
 这个函数负责：
 
-1. 创建运行目录并拷贝几何文件
+1. 通过 `acquire_run_directory()` 取得运行目录所有权，然后拷贝几何文件
 2. 调用 `render_autogrid_script()` 生成脚本
 3. 解析 IGG 可执行文件路径（`resolve_igg`）
 4. 如果是 `dry_run`：直接返回 `AutoGridRun`（不执行 IGG）
 5. 否则：通过 `subprocess.run` 启动 IGG
+
+`acquire_run_directory()`（`autogrid.py`）在复制输入、写脚本之前以排他创建（`O_CREAT|O_EXCL`）方式写入 `.mesh_run.lock`（含 run_id 与创建时间）取得目录所有权：已存在占用标记、并发创建失败、目录已含既有文件（`worker.stdout.log`/`worker.stderr.log` 白名单除外）均抛出 `RunDirectoryError`，由 CLI 转为退出码 2 并保留既有文件。标记保留不删除，已执行或 dry-run 使用过的目录均不能再次执行；占用时快照的既有文件列表用作本次产物登记的对照。
 
 **IGG 的调用方式**：
 
@@ -1135,11 +1155,11 @@ if effective_returncode == 0 and (failed_control is not None or script_error is 
 | `geomturbo` | `.geomTurbo` | 原始几何文件的副本 |
 | `quality_report` | `.qualityReport` | AutoGrid 质量报告（文本格式） |
 
-**`merge_control_results()`**（`autogrid.py:513-535`）：将 `ResolvedControl` 列表（计划）与从 stdout 解析出的 `events`（实际结果）合并：
+**`merge_control_results()` / `merge_post_control_results()`**（`autogrid.py`）：将 `ResolvedControl` 列表（计划）与从 stdout 解析出的 `events`（实际结果）合并：
 
-- 每个 `ResolvedControl` 按 `control_id` （如 `"C0001"`）匹配
-- 匹配到 event → 更新 status / readback / error
-- 未匹配到 event → 状态为 `"not_applied"`，error 为 "未收到 AutoGrid 控制结果标记"
+- 每个 `ResolvedControl` 按 `control_id`（如 `"C0001"`）匹配
+- 匹配到 event → 更新 status / readback / error，并校验 key、目标与计划一致
+- 未匹配到 event → 记录协议错误（`missing_apply_event` / `missing_post_generation_event`）使运行 `FAILED`，控制状态标记为 `"not_applied"`；重复 ID、未知 ID、key/目标/阶段不匹配同样记录为协议错误
 
 ### 4.6 `resolve_igg()`：IGG 路径解析
 
@@ -1292,13 +1312,17 @@ CGNS（CFD General Notation System）是一种跨软件的 CFD 数据交换格�
 CGNS 解析的约束：
 - 不如 `.qualityReport` 完整——没有项目元数据（版本、日期、耗时）
 - 壁面距离的单位无法直接确定（依赖附近的 `geomTurbo` 文件来推断）
-- 数据块可能被 CGNS 库分割成多个片段（取最后一个完整块）
+- 解析改为分块流式扫描（1 MiB 块、标记尾重叠、深度跟踪 NI_BEGIN/NI_END、滚动窗口计数），正确处理跨块标记，不整文件载入内存；解析结果与旧实现逐项一致
 
 ### 5.7 质量判定（`evaluate_quality`）
 
-（`quality.py:355-389`）
+（`quality.py`）
 
-判定逻辑依次检查 7 个硬门槛：
+判定采用"先校验、后比较"两步顺序：
+
+1. **必需字段检查**：8 个必需字段（`negative_cells`、`grid_levels`、偏斜角、增长率、长宽比等）任一缺失或为 `None` → 返回 `UNKNOWN`，原因含字段路径（如 `quality.metrics.grid_levels: 缺失`）。
+2. **领域校验**（`_validation_problems`）：对所有已提供的统计值做合法性检查——计数必须为严格整数（点数/层级正整数、负体积单元非负、拒绝布尔与小数文本）、实数值有限、角度在 `[0, 180]`、比例为正、壁面距离非负。任何非法值 → `UNKNOWN`、`accepted = false`，原因含字段路径（如 `quality.metrics.min_skewness_angle: 非有限数值`）。
+3. **硬门槛比较**：校验通过后依次检查 7 个硬门槛，阈值与等号行为不变：
 
 ```python
 if metrics["negative_cells"] != 0:
@@ -1319,7 +1343,7 @@ if metrics["max_aspect_ratio"] > 15000.0:
 return QualityEvaluation("FAIL" if reasons else "PASS", not reasons, reasons)
 ```
 
-如果任何必需字段缺失（`negative_cells`、`grid_levels`、偏斜角、增长率、长宽比等 8 个字段中的任意一个为 `None`），返回 `UNKNOWN`。
+校验先行语义同时作用于报告解析、CGNS 降级解析与直接调用三个入口。非有限值在对外结构中由 `_sanitize_non_finite()` 统一转换为 `null`，错误说明保留在 `quality_validation`、原始报告保留在 `raw`。`summarize_quality()` 额外返回 `quality_validation` 三态摘要：`VALID`（校验通过，含 PASS 与 FAIL）、`INVALID`（缺失或非法，逐项 `{field, problem}`）、`UNKNOWN`（无质量源）。
 
 `QualityEvaluation` 是一个简单的数据类：
 
@@ -1380,7 +1404,8 @@ main()
 | 参数 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `geomturbo` | 位置参数 | 无 | 输入 `.geomTurbo` 文件路径（查询时可省略） |
-| `--out` | str | 自动生成 | 产物目录；默认 `runs/<stem>_<timestamp>` |
+| `--out` | str | 自动生成 | 产物目录；默认 `runs/<名称>_<时间戳>_<uuid>`，显式目录仅允许不存在、为空或仅含 Worker 预写日志 |
+| `--run-id` | str | 自动生成 | 本次运行唯一标识；未传时生成 UUID4 十六进制字符串 |
 | `--igg` | str | 自动查找 | IGG 可执行文件路径 |
 | `--no-row-wizard` | flag | False | 跳过 RowWizard 自动向导 |
 | `--dry-run` | flag | False | 仅生成脚本不执行 IGG |
@@ -1410,16 +1435,18 @@ main()
 
 然后与用户直接传入的 `--set` 表达式合并，统一交给 `parse_control_assignments()` 处理。
 
-### 6.4 运行目录命名
+### 6.4 运行目录命名与独占占用
 
-（`mesh.py:222-226`）
+（`mesh.py`）
 
 ```python
 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-return Path("runs") / f"{geomturbo_path.stem}_{stamp}"
+return Path("runs") / f"{geomturbo_path.stem}_{stamp}_{uuid.uuid4().hex}"
 ```
 
-示例：`geometries/Rotor37.geomTurbo` → `runs/Rotor37_20260723_143052`
+示例：`geometries/Rotor37.geomTurbo` → `runs/Rotor37_20260723_143052_a1b2c3...`
+
+目录所有权规则（见 4.4 节 `acquire_run_directory`）：执行前以排他创建 `.mesh_run.lock` 取得所有权；显式 `--out` 只允许不存在、为空或仅含 `worker.stdout.log`/`worker.stderr.log` 白名单文件（兼容 Worker 预先写入的两份日志）。历史产物目录与并发占用均明确拒绝，作为输入错误返回退出码 2，保留已有文件。标记保留，已执行或 dry-run 使用过的目录均不能再次执行。`run_summary.json` 以临时文件 + `os.replace` 原子写入；本次完成阶段与产物清单（相对路径、大小、SHA-256）记录在摘要的 `manifest` 中。
 
 ### 6.5 `.env` 文件解析
 
@@ -1434,32 +1461,47 @@ def _load_env_file(path):
 
 这用于在项目根目录配置 IGG 路径（不纳入版本管理）。
 
-### 6.6 `run_summary.json`（Schema v3）
+### 6.6 `run_summary.json`（Schema v4）
 
-（`mesh.py:153-165`）
+（`mesh.py`）
 
 ```json
 {
-    "schema_version": 3,
-    "run_dir": "runs/Rotor37_20260723_143052",
+    "schema_version": 4,
+    "run_id": "a1b2c3...（UUID4 hex）",
+    "created_at": "2026-09-11T08:00:00+00:00（UTC ISO）",
+    "run_dir": "runs/Rotor37_20260723_143052_a1b2c3...",
     "geometry": { /* GeomTurboSummary.to_dict() */ },
     "controls": {
         "requested":  [ /* ControlRequest.to_dict() */ ],
         "resolved":   [ /* ResolvedControl.to_dict() */ ],
         "applied":    [ /* setter 前后回读 */ ],
-        "post_generation": [ /* 3D 网格生成后回读 */ ]
+        "post_generation": [ /* 3D 网格生成后回读 */ ],
+        "verification": [ /* 每项控制 VERIFIED/MISMATCH/READBACK_ERROR/UNVERIFIABLE */ ]
     },
     "autogrid": { /* AutoGridRun.to_dict() */ },
     "mesh_fingerprint": { /* 可选：block 尺寸、完整坐标 SHA 和探针 */ },
-    "quality": { /* summarize_quality() 返回值 */ }
+    "quality": { /* summarize_quality() 返回值 */ },
+    "quality_validation": { /* 数据校验三态摘要：VALID/INVALID/UNKNOWN */ },
+    "execution_evidence": {
+        "completion_event": { /* AGMESH_COMPLETION 完成事件 */ },
+        "protocol_errors": [ /* 事件协议错误（code + message） */ ]
+    },
+    "sources": { /* 输入摘要、源码签名、Git 提交、脚本摘要、注册表签名、质量规则版本、厂商版本 */ },
+    "manifest": {
+        "stages_completed": ["generation", "quality"],
+        "outputs": [ /* 相对路径、大小、sha256 */ ]
+    }
 }
 ```
+
+Schema v4 在 v3 全部字段基础上增加运行身份（`run_id`、`created_at`）、执行证据（`execution_evidence`）、控制验证（`controls.verification`）、质量校验（`quality_validation`）、来源（`sources`）与产物清单（`manifest`）。历史 v3 摘要仍可读：平台侧 `_load_run_summary` 同时接受 v3/v4，缺失的新证据显示为未知，不自动认定合格。所有字段使用 `sort_keys=True` 且 `allow_nan=False` 序列化（领域校验后的序列化保护），以临时文件 + `os.replace` 原子写入。
 
 `controls.resolved` 中的状态为 `"planned"`（dry-run 时）或实际执行后的状态。
 `controls.applied` 和 `controls.post_generation` 只在真实执行时填充。指定
 `--mesh-fingerprint` 时，程序从导出的 CGNS 读取每个结构化 block 的全部
 Float64 坐标，记录 I/J/K、点数/单元数、逐 block SHA-256、固定坐标探针和
-聚合网格指纹。所有字段使用 `sort_keys=True` 序列化，确保稳定输出。
+聚合网格指纹。
 
 ### 6.7 `report.md`（中文报告）
 
@@ -1507,5 +1549,5 @@ Float64 坐标，记录 I/J/K、点数/单元数、逐 block SHA-256、固定坐
 > **文档版本**：2026-07-23，基于 AutoGrid 17.1 实现
 > 
 > 本文档对应的代码版本是 `src/controls.py` 344 项控制注册表、`src/autogrid.py`
-> 721 项 setter 审计、`run_summary.json` Schema v3，以及保持兼容的
+> 721 项 setter 审计、`run_summary.json` Schema v4，以及保持兼容的
 > `src/quality.py` Schema v2 质量模型。

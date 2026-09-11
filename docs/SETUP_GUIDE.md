@@ -159,15 +159,19 @@ python -m pytest tests -q
 
 **Q：升级代码后如何更新？**
 
+升级前先**停止入队、排空在途任务**（停 API 与 Worker，等待运行中的网格与后处理任务结束或恢复），再**备份数据库与真实产物**（产物清单仅登记路径与散列，不能替代文件备份；恢复验收必须包含真实产物文件），然后显式执行迁移并同步更新 API、Worker 和前端：
+
 ```powershell
 git pull
 platform\.venv\Scripts\python.exe -m pip install -r platform\requirements.lock
 Set-Location platform\ui; npm ci; npm run build; Set-Location ..\..
-# 先备份，再显式迁移
+# 先备份（数据库 + 真实产物），再显式迁移
 $env:PYTHONPATH = (Resolve-Path platform).Path
 platform\.venv\Scripts\python.exe -m mesh_app.backup --output-dir <备份目录>
 .\platform\deploy\run-local.ps1 -Migrate
 ```
+
+迁移包含 `0002_postprocess_status.sql`（后处理状态与起止时间、错误字段，user_version=2），只在显式 `-Migrate` 时应用。
 
 ## 10. 生产部署提示
 
@@ -175,6 +179,6 @@ platform\.venv\Scripts\python.exe -m mesh_app.backup --output-dir <备份目录>
 
 - 数据目录默认 `C:\ProgramData\MeshExperience`（通过系统环境变量 `MESH_DATA_DIR` 配置，不用仓库内 `.env`）
 - API 与 Worker 用 `install-startup-tasks.ps1 -Apply`（管理员）注册为开机启动任务；脚本默认只显示计划
-- HTTPS 由 Caddy 反向代理提供（`platform\deploy\Caddyfile`），客户端需信任其内部 CA 或替换为正式证书
+- HTTPS 由 Caddy 反向代理提供（`platform\deploy\Caddyfile`），客户端需信任其内部 CA 或替换为正式证书；经 Caddy 提供 HTTPS 的部署必须设置 `MESH_COOKIE_SECURE=true`（写入 `.env` 或 API 进程环境），使会话 Cookie 只在 HTTPS 连接上携带
 - 同一个 SQLite 数据库只部署一个 Worker 进程；单 Worker 内部最多并发 20 个任务
-- 在线备份：`platform\.venv\Scripts\python.exe -m mesh_app.backup --output-dir <目录>`（默认校验产物 SHA-256）
+- 在线备份：`platform\.venv\Scripts\python.exe -m mesh_app.backup --output-dir <目录>`（默认校验产物 SHA-256）；备份必须包含真实产物文件——产物清单不能替代文件备份，恢复验收必须包含真实文件

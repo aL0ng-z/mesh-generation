@@ -33,7 +33,7 @@ Copy-Item .env.example .env
 .\platform\deploy\run-local.ps1 -Migrate
 ```
 
-`-Migrate` 是显式迁移动作，迁移成功后会继续启动 API 和 Worker。日常启动不要添加该参数。API 和 Worker 只检查数据库版本，不会在请求或启动时悄悄执行 DDL。升级代码后应先备份，再显式执行一次 `run-local.ps1 -Migrate`；生产环境仍使用 `python -m mesh_app.db migrate`。
+`-Migrate` 是显式迁移动作，迁移成功后会继续启动 API 和 Worker。日常启动不要添加该参数。API 和 Worker 只检查数据库版本，不会在请求或启动时悄悄执行 DDL。当前迁移含 `0002_postprocess_status.sql`（runs 表新增后处理状态与起止时间、错误字段，user_version=2）。升级代码后应先停止入队、排空在途任务，备份数据库与真实产物，再显式执行一次 `run-local.ps1 -Migrate`，并同步更新 API、Worker 和前端；生产环境仍使用 `python -m mesh_app.db migrate`。
 
 后端锁文件固定直接与传递依赖版本；前端必须使用 `npm ci`，它严格使用已提交的 `package-lock.json`。
 
@@ -52,6 +52,9 @@ Copy-Item .env.example .env
 | `MESH_MIN_FREE_MEMORY_GB` | `8` | 最低空闲内存门限 |
 | `MESH_MIN_FREE_DISK_GB` | `20` | 最低空闲磁盘门限 |
 | `MESH_JOB_TIMEOUT_SECONDS` | `1800` | 单任务超时 |
+| `MESH_POSTPROCESS_TIMEOUT_SECONDS` | `600` | 单个后处理子进程（产物散列登记 + 预览转换）超时 |
+| `MESH_PREVIEW_MEMORY_BUDGET_MB` | `512` | 切片生成前的工作内存预算，超限拒绝新生成 |
+| `MESH_PREVIEW_CACHE_LIMIT_MB` | `1024` | 每个运行的切片磁盘缓存上限，超限拒绝新生成 |
 | `MESH_AUTH_USERNAME` | 空 | 共享登录用户名；必须与密码哈希同时设置 |
 | `MESH_AUTH_PASSWORD_HASH` | 空 | `python -m mesh_app.auth` 生成的 scrypt 编码串 |
 | `MESH_SCRYPT_MAX_CONCURRENCY` | `2` | 并发 scrypt 密码校验上限；等待的登录请求在异步层排队 |
@@ -65,6 +68,12 @@ Copy-Item .env.example .env
 同一个 SQLite 数据库只部署一个 Worker 进程；单个 Worker 会在进程内部并发调度最多 20 个任务。当前资源预留与许可证退避按这一部署模型设计，不支持多个 Worker 共享同一数据库做横向扩展。
 
 Windows 下 Worker 会把网格子进程加入带 `KILL_ON_JOB_CLOSE` 的 Job Object，正常退出、超时和取消时终止整棵进程树；若部署账户或宿主环境不支持 Job Object，则降级使用 `taskkill /T`。投产前应通过一次真实任务确认事件中的 `job_object` 标志为 `true`。
+
+## 后处理与预览
+
+产物散列登记与预览转换在独立后处理子进程（`python -m mesh_app.postprocess <run_id>`）中执行，不阻塞 Worker 主轮询循环。后处理状态为 `PENDING/RUNNING/COMPLETED/FAILED`（迁移 0002 记录起止时间与错误），默认超时 600 秒（`MESH_POSTPROCESS_TIMEOUT_SECONDS`），固定单并发，资源门控为活动后处理额外计入一份现有内存预留（默认 2.5 GiB）；超时或转换失败记录 FAILED，停止时终止后处理进程树，重启只恢复排队状态、不同步转换。
+
+切片预览按需经 HDF5 hyperslab 直接读取请求平面，不载入全部体坐标；生成前对照工作内存预算（`MESH_PREVIEW_MEMORY_BUDGET_MB`，默认 512 MiB）与每运行切片缓存上限（`MESH_PREVIEW_CACHE_LIMIT_MB`，默认 1 GiB），超限拒绝新生成并返回明确错误码，已有缓存继续可读；同一请求并发共享一次生成结果（单飞），每个 API 进程同时最多执行一个转换任务。
 
 ## 访问密码
 
@@ -122,7 +131,7 @@ Vite 将 `/api` 代理到 `http://127.0.0.1:8000`。生产构建由 FastAPI 从 
 
 ## HTTPS 与启动任务
 
-编辑 [`deploy/Caddyfile`](deploy/Caddyfile) 或设置 `MESH_HOST`，再让 Caddy 反向代理 `127.0.0.1:8000`。示例需要 Caddy 2.10+，使用 Caddy 内部 CA，客户端需要信任其根证书；也可以按组织规范替换为正式内网证书。Caddy 的上传入口默认限制为 `540MB`；若调整 `MESH_MAX_UPLOAD_BYTES`，应同步设置 Caddy 进程环境变量 `MESH_MAX_REQUEST_BODY`，并为 multipart 开销保留余量。
+编辑 [`deploy/Caddyfile`](deploy/Caddyfile) 或设置 `MESH_HOST`，再让 Caddy 反向代理 `127.0.0.1:8000`。示例需要 Caddy 2.10+，使用 Caddy 内部 CA，客户端需要信任其根证书；也可以按组织规范替换为正式内网证书。经 Caddy 提供 HTTPS 的生产部署必须同时设置 `MESH_COOKIE_SECURE=true`，使会话 Cookie 只在 HTTPS 连接上携带（详见「访问密码」）。Caddy 的上传入口默认限制为 `540MB`；若调整 `MESH_MAX_UPLOAD_BYTES`，应同步设置 Caddy 进程环境变量 `MESH_MAX_REQUEST_BODY`，并为 multipart 开销保留余量。
 
 启动任务脚本默认只显示计划，不修改系统：
 
@@ -147,7 +156,7 @@ $env:PYTHONPATH = (Resolve-Path platform).Path
 platform\.venv\Scripts\python.exe -m mesh_app.backup --output-dir D:\MeshBackups
 ```
 
-默认会校验产物 SHA-256；大数据集的受控窗口可加 `--skip-file-hashes`。恢复前应停 API 与 Worker，保留原数据目录，先在隔离目录核对数据库、清单和文件散列，再由运维执行替换。本 MVP 不提供危险的网页批量删除或恢复按钮。
+默认会校验产物 SHA-256；大数据集的受控窗口可加 `--skip-file-hashes`。**产物清单仅登记相对路径、大小与散列，不能替代产物文件本身的备份**；备份必须同时复制数据库与真实产物文件，恢复验收必须在隔离目录核对数据库、清单与真实产物文件（存在、可读且散列一致）后才由运维执行替换。恢复前应停 API 与 Worker，保留原数据目录。本 MVP 不提供危险的网页批量删除或恢复按钮。
 
 ## 前端验证
 
@@ -163,7 +172,7 @@ Vitest 覆盖不可变运行树、控制草稿、活动轮询、质量差值、U
 
 ## 已知安全说明
 
-当前 `npm audit` 报告 2 个 high，均来自 `react-router-dom → react-router` 的同一条 [GHSA-qwww-vcr4-c8h2](https://github.com/advisories/GHSA-qwww-vcr4-c8h2) 依赖链。公告影响的是不稳定 RSC Action 接口；本前端是纯 BrowserRouter SPA，不启用 RSC、Server Actions 或 React Router 服务端请求处理，因此该攻击面不适用。暂不通过降级或 `npm audit fix --force` 引入其他已知漏洞或不兼容；待 `react-router-dom` 发布与当前 Node/Vite 环境兼容的已修复版本后升级并消除告警。
+此前 `npm audit` 报告的 2 个 high 来自 `react-router-dom → react-router` 的同一条 [GHSA-qwww-vcr4-c8h2](https://github.com/advisories/GHSA-qwww-vcr4-c8h2) 依赖链。当前锁定的 `react-router-dom 7.18.2` 已包含该公告的修复，只需保持该版本并通过定期 `npm audit` 关注新增告警即可，无需再等待修复版本；也不要通过降级或 `npm audit fix --force` 引入其他已知漏洞或不兼容。
 
 ## API 交互约定
 
