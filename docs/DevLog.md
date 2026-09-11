@@ -1,5 +1,34 @@
 # 开发日志
 
+## 2026-09-11：批次④ 交互与领域（CR-05~06、CR-11、D-01）
+
+### D-01：分离启用条件和实验取值
+
+- `CONTROL_PREREQUISITES` 中 7 处等值条件改为 `">0"` 启用谓词（优化子项要求 `optimization.steps > 0`，喉部子项要求 `throat_points > 0`），保留全部拓扑等值条件；新增 `prerequisite_satisfied`（`">N"` 数值比较、其余等值、缺失/清除不满足）。
+- 依赖排序、Web 可编辑性（`_missing_prerequisites`）、提交校验（`_validate_prerequisites`）与必要清除（`_required_clears`）统一使用启用规则；锁定/报错文案显示为 `row/optimization.steps>0`。
+- `200` 与 `9` 仅保留为 campaign 取值（`CAMPAIGN_PREREQUISITE_VALUES`），建议值说明留待批次⑤文档更新；`200→100/300`、`9→7/11` 不清除仍有效的子项，变为零、清除或切换到不适用拓扑才触发清除。
+- CLI 零改动：不校验前置值、不新增"前置项必须显式传入"限制。
+
+### CR-05：可编辑性由当前草稿决定
+
+- 服务端 `control-preview` 四条返回路径（含可定位错误路径）均新增 `effective_availability`（按 key + selector，基于"父快照＋草稿＋必要清除"复用现有 availability 规则，服务端保持规则唯一来源）；API 白名单同步扩展；冻结与父运行限制独立生效。
+- 前端行禁用改为 `frozen || effective !== 'EDITABLE'`，仅消费与当前草稿匹配的预检结果（并修复空草稿消费历史预检缓存的既有隐患）；过渡期回退父快照目录状态，正在编辑的行保持可编辑；同草稿内前置项可解锁子项，撤销后重新锁定并正确展示 `required_clears`。
+- `types.ts` 同步 `effective_availability`、`sample_eligibility` 与后处理状态字段；运行详情暴露 `postprocess_status` 等四字段；工作台新增 RunFacts 信息条（终态运行展示样本资格与后处理状态，中文文案）。
+
+### CR-06：编辑时保留原始字符串
+
+- 新增 `numericInput.ts`：完整十进制正则先校验再 `Number()`，支持科学计数法（1e3→1000、+10→10、1.5e-3）；`Number.isFinite` 拒绝溢出（1e309）；整数要求 `Number.isSafeInteger`，1.9 与超安全整数明确报错。
+- 数值输入改为文本状态保存中间态（`type=text + inputMode=decimal`），输入框始终显示原始文本，粘贴与 IME 组合中间态不被改写；解析成功才写入草稿，非法/未完成输入不改草稿、不写成零、不自动清除控制，行内提示并阻止提交；撤销/清除/提交成功均重置文本态；布尔/枚举/字符串路径不变。
+
+### CR-11：资源创建即登记清理责任
+
+- `MeshCanvas.tsx` 在 effect 开始时建立幂等清理登记表（releases + disposed 标志），每项资源创建后立即登记：AbortController、view/renderer/renderWindow/reader/mapper/actor、相机订阅与 window 监听器，按依赖逆序释放。
+- 资产 fetch 统一携带 AbortController.signal，单请求失败取消同批剩余请求，卸载中止在途请求，迟到结果不更新已卸载组件；请求/解析失败路径统一走同一清理（修复 view 与 renderer/renderWindow 泄漏缺口）；StrictMode 双执行安全不变。
+
+### 验证
+
+- 根测试 81 项、平台测试 103 passed + 4 skipped（POSIX 专项）、前端 vitest 58 项全部通过；typecheck 与 eslint 无告警。
+
 ## 2026-09-11：批次③ 调度与资源（CR-04、CR-07~09）
 
 ### CR-04：后处理进入独立、可终止的子进程

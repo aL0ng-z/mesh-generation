@@ -13,6 +13,7 @@ import { isActiveRun, latestRunId } from '../runs/runTreeModel';
 import { ArtifactsPanel } from './ArtifactsPanel';
 import { EventsPanel } from './EventsPanel';
 import { QualityPanel } from './QualityPanel';
+import { RunFacts } from './RunFacts';
 import {
   isSessionFrozen,
   parseCompareIds,
@@ -256,6 +257,7 @@ export function SessionWorkspacePage() {
             ))}
             {compareIds ? <span>双轮同步对比</span> : null}
           </nav>
+          <RunFacts run={runQuery.data} />
           <div className={styles.tabContent} role="tabpanel">
             {compareIds ? <ComparePanel runIds={compareIds} runs={session.runs} /> : null}
             {!compareIds && activeTab === 'viewer' ? <MeshViewer key={runQuery.data?.id} run={runQuery.data} /> : null}

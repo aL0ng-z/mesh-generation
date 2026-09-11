@@ -213,6 +213,18 @@
   font-style: italic;
 }
 
+.numericField {
+  display: grid;
+  flex: 1;
+  min-width: 80px;
+  gap: 3px;
+}
+
+.inputIssue {
+  color: var(--red);
+  font-size: 0.59rem;
+}
+
 .loading,
 .error,
 .placeholder {

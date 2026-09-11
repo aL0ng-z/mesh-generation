@@ -2,12 +2,14 @@ import { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, newRequestId } from '../../api/client';
 import type {
+  ControlAvailability,
   ControlChange,
   ControlItem,
   ControlPriority,
   RunSummary,
 } from '../../api/types';
 import { clearDraftValue, findDraftChange, removeDraftChange, setDraftValue } from './draft';
+import { parseNumericText } from './numericInput';
 import { useDebouncedValue } from './useDebouncedValue';
 import styles from './ControlEditor.module.css';
 
@@ -26,11 +28,15 @@ const availabilityText = {
   NOT_APPLICABLE: '不适用',
 } as const;
 
-function parseInputValue(item: ControlItem, raw: string | boolean): unknown {
-  if (item.value_type === 'boolean') return Boolean(raw);
-  if (item.value_type === 'integer') return Number.parseInt(String(raw), 10);
-  if (item.value_type === 'number') return Number(raw);
-  return raw;
+interface EffectiveAvailability {
+  availability: ControlAvailability;
+  reason?: string | null;
+}
+
+// 数值输入保留的编辑态：用户原始文本 + 本地校验提示。
+interface NumericInputState {
+  text: string;
+  issue?: string | null;
 }
 
 function ControlInput({
@@ -38,11 +44,15 @@ function ControlInput({
   change,
   disabled,
   onSet,
+  numeric,
+  onNumericText,
 }: {
   item: ControlItem;
   change?: ControlChange;
   disabled: boolean;
   onSet: (value: unknown) => void;
+  numeric?: NumericInputState;
+  onNumericText: (raw: string) => void;
 }) {
   const visibleValue = change?.op === 'set' ? change.value : item.value ?? (item.explicit ? item.inherited_value : '') ?? '';
   if (item.value_type === 'boolean') {
@@ -61,22 +71,38 @@ function ControlInput({
   }
   if (item.value_type === 'enum' && item.options?.length) {
     return (
-      <select value={String(visibleValue)} disabled={disabled} onChange={(event) => onSet(parseInputValue(item, event.target.value))}>
+      <select value={String(visibleValue)} disabled={disabled} onChange={(event) => onSet(event.target.value)}>
         <option value="" disabled>请选择</option>
         {item.options.map((option) => <option key={String(option.value)} value={String(option.value)}>{option.label}</option>)}
       </select>
     );
   }
+  // 数值输入用文本状态保存中间态：输入框始终显示用户原始文本（粘贴与输入法
+  // 组合过程不被解析改写），每次变化时解析，可解析时才更新草稿。
+  if (item.value_type === 'integer' || item.value_type === 'number') {
+    const value = numeric ? numeric.text : String(visibleValue);
+    return (
+      <div className={styles.numericField}>
+        <input
+          type="text"
+          inputMode="decimal"
+          aria-label={`${item.key} · ${item.selector}`}
+          value={value}
+          disabled={disabled}
+          placeholder={item.explicit ? '' : '由 AutoGrid 默认决定'}
+          onChange={(event) => onNumericText(event.target.value)}
+        />
+        {numeric?.issue ? <small className={styles.inputIssue}>{numeric.issue}</small> : null}
+      </div>
+    );
+  }
   return (
     <input
-      type={item.value_type === 'integer' || item.value_type === 'number' ? 'number' : 'text'}
+      type="text"
       value={String(visibleValue)}
-      min={item.minimum ?? undefined}
-      max={item.maximum ?? undefined}
-      step={item.step ?? (item.value_type === 'integer' ? 1 : undefined)}
       disabled={disabled}
       placeholder={item.explicit ? '' : '由 AutoGrid 默认决定'}
-      onChange={(event) => onSet(parseInputValue(item, event.target.value))}
+      onChange={(event) => onSet(event.target.value)}
     />
   );
 }
@@ -85,38 +111,58 @@ function ControlRow({
   item,
   draft,
   frozen,
+  effective,
   onChange,
+  numeric,
+  onNumericText,
+  onResetNumeric,
 }: {
   item: ControlItem;
   draft: readonly ControlChange[];
   frozen: boolean;
+  effective?: EffectiveAvailability;
   onChange: (next: ControlChange[]) => void;
+  numeric?: NumericInputState;
+  onNumericText: (raw: string) => void;
+  onResetNumeric: () => void;
 }) {
   const change = findDraftChange(draft, item.key, item.selector);
-  const disabled = frozen || item.availability !== 'EDITABLE';
+  // 行可编辑性优先取与当前草稿匹配的预检结果（服务端是规则的唯一来源）；
+  // 预检未返回或与草稿不匹配时不消费过期预检，仅回退到父快照目录状态。
+  // 正在编辑的行在预检过渡期保持可编辑，避免输入中途被禁用。
+  const availability = effective?.availability ?? item.availability;
+  const reason = effective ? effective.reason : item.reason;
+  const disabled = frozen || (effective
+    ? effective.availability !== 'EDITABLE'
+    : change ? false : item.availability !== 'EDITABLE');
   return (
-    <article className={styles.control} data-availability={item.availability}>
+    <article className={styles.control} data-availability={availability}>
       <div className={styles.controlHead}>
         <div>
           <strong>{item.label}</strong>
           <code>{item.key} · {item.selector}</code>
         </div>
-        <span>{availabilityText[item.availability]}</span>
+        <span>{availabilityText[availability]}</span>
       </div>
       {item.description ? <p>{item.description}</p> : null}
-      {item.reason ? <p className={styles.reason}>{item.reason}</p> : null}
+      {reason ? <p className={styles.reason}>{reason}</p> : null}
       <div className={styles.valueRow}>
         <ControlInput
           item={item}
           change={change}
           disabled={disabled}
           onSet={(value) => onChange(setDraftValue(draft, item.key, item.selector, value))}
+          numeric={numeric}
+          onNumericText={onNumericText}
         />
         {!disabled && item.explicit ? (
           <button
             type="button"
             title="清除显式设置，恢复继承或默认值"
-            onClick={() => onChange(clearDraftValue(draft, item.key, item.selector))}
+            onClick={() => {
+              onChange(clearDraftValue(draft, item.key, item.selector));
+              onResetNumeric();
+            }}
           >
             清除
           </button>
@@ -125,7 +171,10 @@ function ControlRow({
           <button
             type="button"
             title="撤销这项草稿"
-            onClick={() => onChange(removeDraftChange(draft, item.key, item.selector))}
+            onClick={() => {
+              onChange(removeDraftChange(draft, item.key, item.selector));
+              onResetNumeric();
+            }}
           >
             撤销
           </button>
@@ -151,6 +200,9 @@ export function ControlEditor({
   const [target, setTarget] = useState('ALL');
   const [stage, setStage] = useState('ALL');
   const [topology, setTopology] = useState('ALL');
+  // 数值输入的中间态文本按 key -> selector 保存，与草稿分离：
+  // 草稿只存解析后的数值，原始文本保留在输入框中直到撤销、清除或提交。
+  const [numericInputs, setNumericInputs] = useState<Record<string, Record<string, NumericInputState>>>({});
   const debouncedDraft = useDebouncedValue(draft, 400);
 
   useEffect(() => onDirtyChange(draft.length > 0), [draft.length, onDirtyChange]);
@@ -179,10 +231,28 @@ export function ControlEditor({
     }),
     onSuccess: async (run) => {
       setDraft([]);
+      setNumericInputs({});
       await queryClient.invalidateQueries({ queryKey: ['session', sessionId] });
       onRunCreated(run.id);
     },
   });
+
+  // 仅消费与当前草稿匹配的预检结果：草稿为空或与防抖草稿不一致时，
+  // 不应用任何预检数据，避免过期预检解锁不应编辑的行。
+  const previewCurrent = JSON.stringify(debouncedDraft) === JSON.stringify(draft);
+  const effectiveByKey = useMemo(() => {
+    const map = new Map<string, Map<string, EffectiveAvailability>>();
+    if (!previewCurrent || !debouncedDraft.length) return map;
+    for (const entry of previewQuery.data?.effective_availability ?? []) {
+      let inner = map.get(entry.key);
+      if (!inner) {
+        inner = new Map();
+        map.set(entry.key, inner);
+      }
+      inner.set(entry.selector, entry);
+    }
+    return map;
+  }, [previewCurrent, debouncedDraft, previewQuery.data]);
 
   const controls = useMemo(() => controlQuery.data?.controls ?? [], [controlQuery.data?.controls]);
   const filtered = useMemo(() => {
@@ -206,6 +276,48 @@ export function ControlEditor({
     return filtered.filter((item) => item.priority === priority);
   }
 
+  const blockedCount = useMemo(
+    () => Object.values(numericInputs).reduce(
+      (count, bySelector) => count + Object.values(bySelector).filter((state) => state.issue).length,
+      0,
+    ),
+    [numericInputs],
+  );
+
+  // 数值输入变化：文本原样保留；解析成功才更新草稿，
+  // 未完成/非法输入仅显示提示并阻止提交，不修改也不自动清除草稿。
+  function handleNumericText(item: ControlItem, raw: string) {
+    const parsed = parseNumericText(raw, item.value_type === 'integer');
+    if (parsed.status === 'ok') {
+      setNumericInputs((prev) => ({
+        ...prev,
+        [item.key]: { ...(prev[item.key] ?? {}), [item.selector]: { text: raw } },
+      }));
+      setDraft(setDraftValue(draft, item.key, item.selector, parsed.value));
+    } else {
+      setNumericInputs((prev) => ({
+        ...prev,
+        [item.key]: { ...(prev[item.key] ?? {}), [item.selector]: { text: raw, issue: parsed.message } },
+      }));
+    }
+  }
+
+  function resetNumericInput(key: string, selector: string) {
+    setNumericInputs((prev) => {
+      const bySelector = prev[key];
+      if (!bySelector || !(selector in bySelector)) return prev;
+      const nextBySelector = { ...bySelector };
+      delete nextBySelector[selector];
+      const next = { ...prev };
+      if (Object.keys(nextBySelector).length) {
+        next[key] = nextBySelector;
+      } else {
+        delete next[key];
+      }
+      return next;
+    });
+  }
+
   function submit() {
     const preview = previewQuery.data;
     if (!preview?.valid || previewQuery.isFetching || !draft.length) return;
@@ -225,7 +337,6 @@ export function ControlEditor({
   if (!parentRun) return <div className={styles.placeholder}>请先从左侧选择运行节点。</div>;
 
   const canBranch = parentRun.status === 'SUCCEEDED' && !frozen;
-  const previewCurrent = JSON.stringify(debouncedDraft) === JSON.stringify(draft);
 
   return (
     <section className={styles.editor} aria-labelledby="controls-title">
@@ -270,12 +381,12 @@ export function ControlEditor({
       <div className={styles.controlList}>
         <section>
           <h3>P0 · 常用控制 <span>{group('P0').length}</span></h3>
-          {group('P0').map((item) => <ControlRow key={`${item.key}:${item.selector}`} item={item} draft={draft} frozen={!canBranch} onChange={setDraft} />)}
+          {group('P0').map((item) => <ControlRow key={`${item.key}:${item.selector}`} item={item} draft={draft} frozen={!canBranch} effective={effectiveByKey.get(item.key)?.get(item.selector)} onChange={setDraft} numeric={numericInputs[item.key]?.[item.selector]} onNumericText={(raw) => handleNumericText(item, raw)} onResetNumeric={() => resetNumericInput(item.key, item.selector)} />)}
         </section>
         {(['P1', 'P2'] as const).map((priority) => (
           <details key={priority} open={Boolean(search)}>
             <summary>{priority} · {priority === 'P1' ? '进阶控制' : '专家控制'} <span>{group(priority).length}</span></summary>
-            {group(priority).map((item) => <ControlRow key={`${item.key}:${item.selector}`} item={item} draft={draft} frozen={!canBranch} onChange={setDraft} />)}
+            {group(priority).map((item) => <ControlRow key={`${item.key}:${item.selector}`} item={item} draft={draft} frozen={!canBranch} effective={effectiveByKey.get(item.key)?.get(item.selector)} onChange={setDraft} numeric={numericInputs[item.key]?.[item.selector]} onNumericText={(raw) => handleNumericText(item, raw)} onResetNumeric={() => resetNumericInput(item.key, item.selector)} />)}
           </details>
         ))}
         {!controlQuery.isPending && !filtered.length ? <p className={styles.loading}>没有符合筛选条件的控制项。</p> : null}
@@ -283,9 +394,10 @@ export function ControlEditor({
 
       <footer>
         <div className={styles.preview} aria-live="polite">
+          {blockedCount > 0 ? `有 ${blockedCount} 项数值输入未完成或无效，请修正后再提交。` : null}
           {!draft.length ? '修改控制后，服务端会自动预检依赖与拓扑。' : null}
           {draft.length && (!previewCurrent || previewQuery.isFetching) ? '正在进行服务端预检…' : null}
-          {previewQuery.data && previewCurrent ? (
+          {draft.length && previewQuery.data && previewCurrent ? (
             previewQuery.data.valid
               ? `预检通过${previewQuery.data.required_clears?.length ? `，需确认清除 ${previewQuery.data.required_clears.length} 项覆盖` : ''}`
               : `预检未通过：${previewQuery.data.errors?.map((issue) => issue.message).join('；') || '请检查草稿'}`
@@ -294,11 +406,11 @@ export function ControlEditor({
           {createMutation.isError ? `创建分支失败：${(createMutation.error as Error).message}` : null}
         </div>
         <div className={styles.actions}>
-          <button type="button" disabled={!draft.length || createMutation.isPending} onClick={() => setDraft([])}>放弃草稿</button>
+          <button type="button" disabled={!draft.length || createMutation.isPending} onClick={() => { setDraft([]); setNumericInputs({}); }}>放弃草稿</button>
           <button
             className={styles.submit}
             type="button"
-            disabled={!canBranch || !draft.length || !previewCurrent || !previewQuery.data?.valid || previewQuery.isFetching || createMutation.isPending}
+            disabled={!canBranch || !draft.length || !previewCurrent || !previewQuery.data?.valid || previewQuery.isFetching || createMutation.isPending || blockedCount > 0}
             onClick={submit}
           >
             {createMutation.isPending ? '正在创建…' : '创建不可变分支'}

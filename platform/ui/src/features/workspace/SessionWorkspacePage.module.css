@@ -186,8 +186,22 @@
 
 .center {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
 }
+
+.runFacts {
+  display: flex;
+  gap: 18px;
+  align-items: center;
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--line);
+  color: #5f707b;
+  background: #f7f9fa;
+  font-size: 0.6rem;
+}
+
+.runFacts span[data-eligible="true"] { color: #1d615e; }
+.runFacts span[data-eligible="false"] { color: #8a5a1c; }
 
 .tabs {
   display: flex;

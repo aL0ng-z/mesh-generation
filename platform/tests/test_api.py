@@ -360,6 +360,12 @@ def test_branch_idempotency_retry_note_version_conflict_and_freeze(tmp_path: Pat
         )
         assert frozen_branch.status_code == 409
         assert frozen_branch.json()["error"]["code"] == "SESSION_FROZEN"
+        frozen_preview = client.post(
+            f"/api/v1/sessions/{session_id}/control-preview",
+            json={"parent_run_id": baseline_id, "changes": []},
+        )
+        assert frozen_preview.status_code == 409
+        assert frozen_preview.json()["error"]["code"] == "SESSION_FROZEN"
 
 
 def test_control_preview_events_preview_degradation_and_path_safety(tmp_path: Path) -> None:
@@ -388,6 +394,18 @@ def test_control_preview_events_preview_degradation_and_path_safety(tmp_path: Pa
         assert invalid_preview.status_code == 200
         assert invalid_preview.json()["valid"] is False
         assert invalid_preview.json()["errors"][0]["code"] == "CONTROL_PREREQUISITE_NOT_MET"
+        effective_items = invalid_preview.json()["effective_availability"]
+        target_effective = next(
+            item
+            for item in effective_items
+            if item["key"] == "row/target_points" and item["selector"] == "row:#1"
+        )
+        assert target_effective == {
+            "key": "row/target_points",
+            "selector": "row:#1",
+            "availability": "LOCKED",
+            "reason": "需先显式设置 row/mesh_level=user",
+        }
 
         with database.transaction(immediate=True) as connection:
             # 创建会话时已写入入队来源快照事件，测试事件使用下一个可用序号。

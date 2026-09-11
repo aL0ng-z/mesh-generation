@@ -1801,6 +1801,9 @@ GENERAL_API_ONLY_EXCLUSIONS: dict[str, str] = {
 # 仅描述“已显式提供多个控制时”的依赖和值要求；除 B2B topology 外，
 # 普通 CLI 不会据此自动注入控制。campaign runner 使用该映射构造匹配上下文，
 # resolve_control_requests() 则使用键依赖保证同阶段调用顺序正确。
+# 值为 ">N" 字符串时表示启用谓词（显式值大于 N 才满足，如 optimization.steps
+# 必须为正），其余值按等值判断；具体实验取值（200 步、9 个喉部点等）由
+# campaign 采样矩阵决定，不作为通用前置条件。
 CONTROL_PREREQUISITES: dict[str, tuple[tuple[str, Any], ...]] = {
     "blade/edge_treatment.leading_blend": (
         ("blade/edge_treatment.leading_blunt", True),
@@ -1811,17 +1814,17 @@ CONTROL_PREREQUISITES: dict[str, tuple[tuple[str, Any], ...]] = {
     "row/downstream.untwist_location": (("row/downstream.untwist", True),),
     "row/upstream.untwist_location": (("row/upstream.untwist", True),),
     "row/target_points": (("row/mesh_level", "user"),),
-    "row/optimization.freeze_skin": (("row/optimization.steps", 200),),
+    "row/optimization.freeze_skin": (("row/optimization.steps", ">0"),),
     "row/optimization.full_multigrid_steps": (("row/optimization.multigrid", True),),
     "row/optimization.nmb": (
         ("blade/b2b.default.periodicity", "non_matching"),
-        ("row/optimization.steps", 200),
+        ("row/optimization.steps", ">0"),
     ),
-    "row/optimization.orthogonality": (("row/optimization.steps", 200),),
-    "row/optimization.skewness": (("row/optimization.steps", 200),),
+    "row/optimization.orthogonality": (("row/optimization.steps", ">0"),),
+    "row/optimization.skewness": (("row/optimization.steps", ">0"),),
     "row/optimization.wake": (
         ("blade/b2b.default.wake_control", True),
-        ("row/optimization.steps", 200),
+        ("row/optimization.steps", ">0"),
     ),
     "blade/b2b.default.azimuthal_inlet_down_points": (
         ("blade/b2b.default.type", "rounded_azimuthal"),
@@ -1894,15 +1897,15 @@ CONTROL_PREREQUISITES: dict[str, tuple[tuple[str, Any], ...]] = {
     "blade/b2b.default.throat_points": (("blade/b2b.default.type", "streamwise"),),
     "blade/b2b.default.throat_projection_type": (
         ("blade/b2b.default.type", "streamwise"),
-        ("blade/b2b.default.throat_points", 9),
+        ("blade/b2b.default.throat_points", ">0"),
     ),
     "blade/b2b.default.throat_inlet_relaxation": (
         ("blade/b2b.default.type", "streamwise"),
-        ("blade/b2b.default.throat_points", 9),
+        ("blade/b2b.default.throat_points", ">0"),
     ),
     "blade/b2b.default.throat_outlet_relaxation": (
         ("blade/b2b.default.type", "streamwise"),
-        ("blade/b2b.default.throat_points", 9),
+        ("blade/b2b.default.throat_points", ">0"),
     ),
     "blade/b2b.default.wake_control": (("blade/b2b.default.type", "streamwise"),),
     "blade/b2b.default.wake_deviation_angle": (
@@ -1994,6 +1997,21 @@ CONTROL_PREREQUISITES: dict[str, tuple[tuple[str, Any], ...]] = {
         ("stagnation-point/distribution_from_expansion_ratio", False),
     ),
 }
+
+
+def prerequisite_satisfied(expected: Any, value: Any) -> bool:
+    """判断显式控制值是否满足前置条件。
+
+    expected 为 ``">N"`` 字符串时按数值比较，表示启用谓词（如
+    ``optimization.steps > 0``、``throat_points > 0``）；其余值（布尔、
+    枚举、具体数值）按等值判断。缺失或已清除的值（None）不满足任何前置条件。
+    """
+
+    if value is None:
+        return False
+    if isinstance(expected, str) and expected.startswith(">"):
+        return value > int(expected[1:])
+    return value == expected
 
 
 def _control_dependency_depth(key: str, trail: tuple[str, ...] = ()) -> int:
@@ -2832,6 +2850,7 @@ __all__ = [
     "parse_control_assignment",
     "parse_control_assignments",
     "parse_control_value",
+    "prerequisite_satisfied",
     "resolve_control_requests",
     "validate_wizard_compatibility",
 ]

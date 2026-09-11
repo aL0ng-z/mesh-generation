@@ -18,6 +18,7 @@ from controls import (
     enumerate_control_targets,
     list_control_specs,
     parse_control_assignment,
+    prerequisite_satisfied,
     resolve_control_requests,
 )
 from geomturbo import GeomTurboParseError, parse_geomturbo
@@ -113,6 +114,7 @@ class ControlService:
                 )
 
         if errors:
+            working = _apply_changes(base, normalized)
             return {
                 "valid": False,
                 "normalized_changes": normalized,
@@ -120,15 +122,10 @@ class ControlService:
                 "required_clears": [],
                 "warnings": [],
                 "errors": errors,
+                "effective_availability": _effective_availability(session, parent, geometry, working),
             }
 
-        working = dict(base)
-        for change in normalized:
-            identity = (change["key"], change["selector"])
-            if change["op"] == "clear":
-                working.pop(identity, None)
-            else:
-                working[identity] = change["value"]
+        working = _apply_changes(base, normalized)
 
         required_clears = _required_clears(base, working, normalized)
         explicitly_cleared = {
@@ -152,6 +149,7 @@ class ControlService:
                 "required_clears": required_clears,
                 "warnings": [],
                 "errors": prerequisite_errors,
+                "effective_availability": _effective_availability(session, parent, geometry, effective),
             }
 
         try:
@@ -168,6 +166,7 @@ class ControlService:
                 "required_clears": required_clears,
                 "warnings": [],
                 "errors": [{"code": "CONTROL_VALIDATION_FAILED", "message": str(exc)}],
+                "effective_availability": _effective_availability(session, parent, geometry, effective),
             }
 
         snapshot = _snapshot_from_map(effective)
@@ -189,6 +188,7 @@ class ControlService:
             "required_clears": required_clears,
             "warnings": warnings,
             "errors": [],
+            "effective_availability": _effective_availability(session, parent, geometry, effective),
             "resolved_controls": [item.to_dict() for item in resolved],
             "snapshot": snapshot,
             "delta": delta,
@@ -387,7 +387,7 @@ def _availability(
     missing_prerequisites = _missing_prerequisites(spec.key, selector, values)
     if missing_prerequisites:
         requirements = "、".join(
-            f"{key}={_render_value(expected)}" for key, expected in missing_prerequisites
+            _render_requirement(key, expected) for key, expected in missing_prerequisites
         )
         return "LOCKED", f"需先显式设置 {requirements}"
     if spec.topologies:
@@ -422,6 +422,44 @@ def _snapshot_from_map(values: Mapping[tuple[str, str], Any]) -> dict[str, Any]:
     }
 
 
+def _apply_changes(
+    base: Mapping[tuple[str, str], Any],
+    changes: Sequence[Mapping[str, Any]],
+) -> dict[tuple[str, str], Any]:
+    working = dict(base)
+    for change in changes:
+        identity = (change["key"], change["selector"])
+        if change["op"] == "clear":
+            working.pop(identity, None)
+        else:
+            working[identity] = change["value"]
+    return working
+
+
+def _effective_availability(
+    session: sqlite3.Row,
+    parent: sqlite3.Row,
+    geometry: Any,
+    values: Mapping[tuple[str, str], Any],
+) -> list[dict[str, Any]]:
+    """按「父快照 + 草稿 + 必要清除」生效后的取值计算逐项可编辑状态。"""
+
+    items: list[dict[str, Any]] = []
+    for spec in list_control_specs():
+        for target in enumerate_control_targets(geometry, control_key=spec.key):
+            selector = target_to_selector(target)
+            availability, reason = _availability(session, parent, spec, selector, values)
+            items.append(
+                {
+                    "key": spec.key,
+                    "selector": selector,
+                    "availability": availability,
+                    "reason": reason,
+                }
+            )
+    return items
+
+
 def _required_clears(
     base: Mapping[tuple[str, str], Any],
     working: Mapping[tuple[str, str], Any],
@@ -440,7 +478,10 @@ def _required_clears(
             for prerequisite_key, expected in prerequisites:
                 if prerequisite_key != changed_key:
                     continue
-                if _selectors_compatible(changed_selector, dependent_selector) and changed_value != expected:
+                if (
+                    _selectors_compatible(changed_selector, dependent_selector)
+                    and not prerequisite_satisfied(expected, changed_value)
+                ):
                     invalidated.add((dependent_key, dependent_selector))
         if changed_key == "blade/b2b.topology":
             for (dependent_key, dependent_selector), _dependent_value in base.items():
@@ -467,7 +508,7 @@ def _validate_prerequisites(
         if not missing:
             continue
         requirements = "、".join(
-            f"{prerequisite_key}={_render_value(expected)}"
+            _render_requirement(prerequisite_key, expected)
             for prerequisite_key, expected in missing
         )
         errors.append(
@@ -494,7 +535,7 @@ def _missing_prerequisites(
             if candidate_key == prerequisite_key
             and _selectors_compatible(candidate_selector, selector)
         ]
-        if not candidates or not any(value == expected for value in candidates):
+        if not candidates or not any(prerequisite_satisfied(expected, value) for value in candidates):
             missing.append((prerequisite_key, expected))
     return missing
 
@@ -524,6 +565,14 @@ def _assignment_text(key: str, selector: str, value: Any) -> str:
     else:
         path = f"{selector}/{local_key}"
     return f"{path}={_render_value(value)}"
+
+
+def _render_requirement(key: str, expected: Any) -> str:
+    """渲染前置条件文本；启用谓词 ``">N"`` 显示为 ``key>N``。"""
+
+    if isinstance(expected, str) and expected.startswith(">"):
+        return f"{key}{expected}"
+    return f"{key}={_render_value(expected)}"
 
 
 def _render_value(value: Any) -> str:

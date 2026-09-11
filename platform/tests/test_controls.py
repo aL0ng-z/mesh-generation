@@ -82,6 +82,16 @@ def create_ready_baseline(
     return detail, baseline_id
 
 
+def _promote_to_succeeded(database: Database, run_id: str) -> None:
+    with database.transaction(immediate=True) as connection:
+        connection.execute("UPDATE runs SET status = 'RUNNING' WHERE id = ?", (run_id,))
+    with database.transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE runs SET status = 'SUCCEEDED', updated_at = ?, finished_at = ? WHERE id = ?",
+            (utc_now(), utc_now(), run_id),
+        )
+
+
 def test_public_target_enumeration_uses_precise_geometry_entities() -> None:
     geometry = GeomTurboSummary(
         path="synthetic.geomTurbo",
@@ -167,7 +177,7 @@ def test_control_state_and_preview_enforce_prerequisites_and_clear_dependencies(
         if item["key"] == "row/optimization.skewness" and item["selector"] == "row:#1"
     )
     assert skewness["availability"] == "LOCKED"
-    assert "row/optimization.steps=200" in skewness["reason"]
+    assert "row/optimization.steps>0" in skewness["reason"]
 
     target_only = controls.preview(
         session_id,
@@ -189,11 +199,28 @@ def test_control_state_and_preview_enforce_prerequisites_and_clear_dependencies(
     )
     assert target_valid["valid"] is True
 
-    wrong_steps = controls.preview(
+    # 启用规则只要求优化步数为正：100/300 不再被判缺依赖。
+    for steps_value in (100, 300):
+        positive_steps = controls.preview(
+            session_id,
+            parent_run_id=baseline_id,
+            changes=[
+                {"key": "row/optimization.steps", "selector": "row:#1", "op": "set", "value": steps_value},
+                {
+                    "key": "row/optimization.skewness",
+                    "selector": "row:#1",
+                    "op": "set",
+                    "value": "yes",
+                },
+            ],
+        )
+        assert positive_steps["valid"] is True
+
+    zero_steps = controls.preview(
         session_id,
         parent_run_id=baseline_id,
         changes=[
-            {"key": "row/optimization.steps", "selector": "row:#1", "op": "set", "value": 100},
+            {"key": "row/optimization.steps", "selector": "row:#1", "op": "set", "value": 0},
             {
                 "key": "row/optimization.skewness",
                 "selector": "row:#1",
@@ -202,8 +229,8 @@ def test_control_state_and_preview_enforce_prerequisites_and_clear_dependencies(
             },
         ],
     )
-    assert wrong_steps["valid"] is False
-    assert "steps=200" in wrong_steps["errors"][0]["message"]
+    assert zero_steps["valid"] is False
+    assert "steps>0" in zero_steps["errors"][0]["message"]
 
     valid_optimization = controls.preview(
         session_id,
@@ -233,16 +260,263 @@ def test_control_state_and_preview_enforce_prerequisites_and_clear_dependencies(
     with database.transaction(immediate=True) as connection:
         connection.execute("UPDATE runs SET status = 'SUCCEEDED' WHERE id = ?", (child_id,))
 
-    clearing = controls.preview(
+    # 200→100 仍满足启用规则，不清除子项。
+    preserved = controls.preview(
         session_id,
         parent_run_id=child_id,
         changes=[
             {"key": "row/optimization.steps", "selector": "row:#1", "op": "set", "value": 100}
         ],
     )
-    assert clearing["valid"] is True
-    assert clearing["required_clears"] == [
+    assert preserved["valid"] is True
+    assert preserved["required_clears"] == []
+
+    # 变为零才触发清除。
+    zeroed = controls.preview(
+        session_id,
+        parent_run_id=child_id,
+        changes=[
+            {"key": "row/optimization.steps", "selector": "row:#1", "op": "set", "value": 0}
+        ],
+    )
+    assert zeroed["valid"] is True
+    assert zeroed["required_clears"] == [
         {"key": "row/optimization.skewness", "selector": "row:#1", "op": "clear"}
+    ]
+
+    # 清除前置项同样触发清除。
+    cleared = controls.preview(
+        session_id,
+        parent_run_id=child_id,
+        changes=[
+            {"key": "row/optimization.steps", "selector": "row:#1", "op": "clear"}
+        ],
+    )
+    assert cleared["valid"] is True
+    assert cleared["required_clears"] == [
+        {"key": "row/optimization.skewness", "selector": "row:#1", "op": "clear"}
+    ]
+
+
+def test_effective_availability_unlocks_in_draft_and_relocks_on_revoke(tmp_path: Path) -> None:
+    settings, database, sessions, controls = make_services(tmp_path)
+    detail, baseline_id = create_ready_baseline(settings, database, sessions)
+    session_id = str(detail["id"])
+
+    def entry_of(preview: dict[str, object], key: str, selector: str) -> dict[str, object]:
+        for item in preview["effective_availability"]:
+            if item["key"] == key and item["selector"] == selector:
+                return item
+        raise AssertionError(f"effective_availability 缺少 {key} / {selector}")
+
+    # 空草稿：与父快照目录一致，子项保持锁定。
+    empty = controls.preview(session_id, parent_run_id=baseline_id, changes=[])
+    assert empty["valid"] is True
+    assert entry_of(empty, "row/mesh_level", "row:#1")["availability"] == "EDITABLE"
+    assert entry_of(empty, "row/target_points", "row:#1")["availability"] == "LOCKED"
+
+    # 同一草稿内设置前置项即解锁子项。
+    unlocked = controls.preview(
+        session_id,
+        parent_run_id=baseline_id,
+        changes=[{"key": "row/mesh_level", "selector": "row:#1", "op": "set", "value": "user"}],
+    )
+    assert unlocked["valid"] is True
+    assert entry_of(unlocked, "row/target_points", "row:#1")["availability"] == "EDITABLE"
+    assert entry_of(unlocked, "row/target_points", "row:#1")["reason"] is None
+
+    # 可定位的预检错误响应同样返回有效可编辑状态，便于修正草稿。
+    invalid = controls.preview(
+        session_id,
+        parent_run_id=baseline_id,
+        changes=[{"key": "row/target_points", "selector": "row:#1", "op": "set", "value": 500000}],
+    )
+    assert invalid["valid"] is False
+    assert invalid["errors"][0]["code"] == "CONTROL_PREREQUISITE_NOT_MET"
+    target_invalid = entry_of(invalid, "row/target_points", "row:#1")
+    assert target_invalid["availability"] == "LOCKED"
+    assert "row/mesh_level=user" in target_invalid["reason"]
+
+    # 把解锁后的组合落成一个父运行，再撤销前置项验证重新锁定与必要清除。
+    seeded = controls.preview(
+        session_id,
+        parent_run_id=baseline_id,
+        changes=[
+            {"key": "row/mesh_level", "selector": "row:#1", "op": "set", "value": "user"},
+            {"key": "row/target_points", "selector": "row:#1", "op": "set", "value": 500000},
+        ],
+    )
+    assert seeded["valid"] is True
+    child = sessions.create_child_run(
+        session_id=session_id,
+        parent_run_id=baseline_id,
+        request_id="availability-child",
+        expected_version=1,
+        control_snapshot=seeded["snapshot"],
+        control_delta=seeded["delta"],
+    )
+    child_id = str(child["id"])
+    _promote_to_succeeded(database, child_id)
+
+    revoked = controls.preview(
+        session_id,
+        parent_run_id=child_id,
+        changes=[{"key": "row/mesh_level", "selector": "row:#1", "op": "clear"}],
+    )
+    assert revoked["valid"] is True
+    assert revoked["required_clears"] == [
+        {"key": "row/target_points", "selector": "row:#1", "op": "clear"}
+    ]
+    assert entry_of(revoked, "row/mesh_level", "row:#1")["availability"] == "EDITABLE"
+    target_revoked = entry_of(revoked, "row/target_points", "row:#1")
+    assert target_revoked["availability"] == "LOCKED"
+    assert "row/mesh_level=user" in target_revoked["reason"]
+
+
+def test_throat_points_predicate_preserves_children(tmp_path: Path) -> None:
+    settings, database, sessions, controls = make_services(tmp_path)
+    detail, baseline_id = create_ready_baseline(settings, database, sessions)
+    session_id = str(detail["id"])
+    throat = controls.preview(
+        session_id,
+        parent_run_id=baseline_id,
+        changes=[
+            {
+                "key": "blade/b2b.default.type",
+                "selector": "row:#1/blade:#1",
+                "op": "set",
+                "value": "streamwise",
+            },
+            {
+                "key": "blade/b2b.default.throat_points",
+                "selector": "row:#1/blade:#1",
+                "op": "set",
+                "value": 9,
+            },
+            {
+                "key": "blade/b2b.default.throat_projection_type",
+                "selector": "row:#1/blade:#1",
+                "op": "set",
+                "value": 1,
+            },
+        ],
+    )
+    assert throat["valid"] is True
+    child = sessions.create_child_run(
+        session_id=session_id,
+        parent_run_id=baseline_id,
+        request_id="throat-child",
+        expected_version=1,
+        control_snapshot=throat["snapshot"],
+        control_delta=throat["delta"],
+    )
+    child_id = str(child["id"])
+    _promote_to_succeeded(database, child_id)
+
+    # 9→7/11 仍满足启用规则，保留子项。
+    for points in (7, 11):
+        kept = controls.preview(
+            session_id,
+            parent_run_id=child_id,
+            changes=[
+                {
+                    "key": "blade/b2b.default.throat_points",
+                    "selector": "row:#1/blade:#1",
+                    "op": "set",
+                    "value": points,
+                },
+            ],
+        )
+        assert kept["valid"] is True
+        assert kept["required_clears"] == []
+
+    # 变为零才触发清除。
+    removed = controls.preview(
+        session_id,
+        parent_run_id=child_id,
+        changes=[
+            {
+                "key": "blade/b2b.default.throat_points",
+                "selector": "row:#1/blade:#1",
+                "op": "set",
+                "value": 0,
+            },
+        ],
+    )
+    assert removed["valid"] is True
+    assert removed["required_clears"] == [
+        {
+            "key": "blade/b2b.default.throat_projection_type",
+            "selector": "row:#1/blade:#1",
+            "op": "clear",
+        }
+    ]
+
+
+def test_topology_switch_clears_conditional_children(tmp_path: Path) -> None:
+    settings, database, sessions, controls = make_services(tmp_path)
+    detail, baseline_id = create_ready_baseline(settings, database, sessions)
+    session_id = str(detail["id"])
+    seeded = controls.preview(
+        session_id,
+        parent_run_id=baseline_id,
+        changes=[
+            {
+                "key": "blade/b2b.topology",
+                "selector": "row:#1/blade:#1",
+                "op": "set",
+                "value": "default",
+            },
+            {
+                "key": "blade/b2b.default.type",
+                "selector": "row:#1/blade:#1",
+                "op": "set",
+                "value": "streamwise",
+            },
+            {
+                "key": "blade/b2b.default.throat_points",
+                "selector": "row:#1/blade:#1",
+                "op": "set",
+                "value": 9,
+            },
+        ],
+    )
+    assert seeded["valid"] is True
+    child = sessions.create_child_run(
+        session_id=session_id,
+        parent_run_id=baseline_id,
+        request_id="topology-child",
+        expected_version=1,
+        control_snapshot=seeded["snapshot"],
+        control_delta=seeded["delta"],
+    )
+    child_id = str(child["id"])
+    _promote_to_succeeded(database, child_id)
+
+    switched = controls.preview(
+        session_id,
+        parent_run_id=child_id,
+        changes=[
+            {
+                "key": "blade/b2b.topology",
+                "selector": "row:#1/blade:#1",
+                "op": "set",
+                "value": "hi",
+            },
+        ],
+    )
+    assert switched["valid"] is True
+    assert switched["required_clears"] == [
+        {
+            "key": "blade/b2b.default.throat_points",
+            "selector": "row:#1/blade:#1",
+            "op": "clear",
+        },
+        {
+            "key": "blade/b2b.default.type",
+            "selector": "row:#1/blade:#1",
+            "op": "clear",
+        },
     ]
 
 

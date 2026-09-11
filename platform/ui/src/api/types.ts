@@ -2,6 +2,12 @@ export type SessionStatus = 'ACTIVE' | 'COMPLETED';
 export type RunStatus = 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED';
 export type QualityStatus = 'PASS' | 'WARN' | 'FAIL' | 'UNKNOWN';
 export type PreviewStatus = 'PENDING' | 'READY' | 'UNAVAILABLE' | 'FAILED';
+export type PostprocessStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+
+export interface SampleEligibility {
+  eligible: boolean;
+  reasons: string[];
+}
 
 export interface SessionSummary {
   id: string;
@@ -25,6 +31,10 @@ export interface RunSummary {
   status: RunStatus;
   quality_status: QualityStatus;
   preview_status?: PreviewStatus;
+  postprocess_status?: PostprocessStatus;
+  postprocess_started_at?: string | null;
+  postprocess_finished_at?: string | null;
+  postprocess_error?: string | null;
   progress?: number | null;
   created_at: string;
   finished_at?: string | null;
@@ -85,6 +95,7 @@ export interface RunDetail extends RunSummary {
   controls?: Record<string, unknown> | null;
   control_changes?: ControlChange[];
   quality?: QualityReport | null;
+  sample_eligibility?: SampleEligibility | null;
   experience_note?: string | null;
   note_version?: number;
   events?: RunEvent[];
@@ -141,6 +152,13 @@ export interface PreviewIssue {
   message: string;
 }
 
+export interface EffectiveAvailabilityEntry {
+  key: string;
+  selector: string;
+  availability: ControlAvailability;
+  reason?: string | null;
+}
+
 export interface ControlPreview {
   valid: boolean;
   normalized_changes?: ControlChange[];
@@ -148,6 +166,7 @@ export interface ControlPreview {
   required_clears?: ControlChange[];
   warnings?: PreviewIssue[];
   errors?: PreviewIssue[];
+  effective_availability?: EffectiveAvailabilityEntry[];
 }
 
 export interface MeshBlock {

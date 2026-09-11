@@ -57,6 +57,7 @@ from controls import (  # noqa: E402
     ControlSpec,
     audit_autogrid_source,
     audit_control_bindings,
+    prerequisite_satisfied,
 )
 from mesh import source_signature  # noqa: E402
 
@@ -387,6 +388,14 @@ def write_inventory(campaign_dir: Path) -> dict[str, Any]:
     return summary
 
 
+# 启用谓词前置项（">N"）在 campaign 依赖上下文中的具体实验取值。
+# 仅用于构造采样矩阵，不作为通用前置条件。
+CAMPAIGN_PREREQUISITE_VALUES: dict[str, Any] = {
+    "row/optimization.steps": 200,
+    "blade/b2b.default.throat_points": 9,
+}
+
+
 VALUE_OVERRIDES: dict[str, list[Any]] = {
     "configuration/grid_levels": [3, 4],
     "configuration/support_curve_control_points": [101, 201],
@@ -511,6 +520,14 @@ def _topology_for_key(key: str) -> str | None:
     return None
 
 
+def _campaign_prerequisite_value(key: str, expected: Any) -> Any:
+    """将启用谓词具体化为 campaign 依赖上下文的实验取值。"""
+
+    if isinstance(expected, str) and expected.startswith(">"):
+        return CAMPAIGN_PREREQUISITE_VALUES[key]
+    return expected
+
+
 def _add_dependency(
     dependencies: dict[str, Any],
     key: str,
@@ -523,6 +540,7 @@ def _add_dependency(
         return
     if key in trail:
         raise RuntimeError("campaign 前置条件存在循环：" + " -> ".join(trail + (key,)))
+    value = _campaign_prerequisite_value(key, value)
     for prerequisite_key, prerequisite_value in CONTROL_PREREQUISITES.get(key, ()):
         _add_dependency(
             dependencies,
@@ -1722,6 +1740,24 @@ class CampaignRunnerUnitTests(unittest.TestCase):
             "row:#1/blade:#1/b2b.default.streamwise_inlet_points=17",
             command,
         )
+
+    def test_predicate_prerequisite_uses_campaign_matrix_values(self) -> None:
+        skewness_deps = dict(build_dependency_controls("row/optimization.skewness", "yes"))
+        self.assertEqual(skewness_deps.get("row/optimization.steps"), 200)
+        wake_deps = dict(build_dependency_controls("row/optimization.wake", "yes"))
+        self.assertEqual(wake_deps.get("row/optimization.steps"), 200)
+        throat_deps = dict(
+            build_dependency_controls("blade/b2b.default.throat_projection_type", 1)
+        )
+        self.assertEqual(throat_deps.get("blade/b2b.default.throat_points"), 9)
+
+    def test_prerequisite_predicate_accepts_any_positive_value(self) -> None:
+        self.assertTrue(prerequisite_satisfied(">0", 100))
+        self.assertTrue(prerequisite_satisfied(">0", 300))
+        self.assertFalse(prerequisite_satisfied(">0", 0))
+        self.assertFalse(prerequisite_satisfied(">0", None))
+        self.assertTrue(prerequisite_satisfied("streamwise", "streamwise"))
+        self.assertFalse(prerequisite_satisfied(True, False))
 
     def test_hoh_rescue_overrides_core_controls_default_topology(self) -> None:
         dependencies = force_topology_dependency(

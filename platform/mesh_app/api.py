@@ -705,6 +705,7 @@ def _public_preview(preview: dict[str, Any]) -> dict[str, Any]:
             "required_clears",
             "warnings",
             "errors",
+            "effective_availability",
         )
     }
 
