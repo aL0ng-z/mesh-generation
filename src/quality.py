@@ -326,17 +326,29 @@ def parse_quality_report(
     return model
 
 
-def parse_embedded_cgns_quality(path: str | Path) -> dict[str, Any]:
-    """从 CGNS 文本片段中提取内嵌的 AutoGrid 质量指标。"""
+_QUALITY_SCAN_CHUNK_BYTES = 1 << 20  # 每次读取 1 MiB
+_QUALITY_MARKER_TAIL = 256  # 跨块标记保留的尾部长度
 
-    text = Path(path).read_bytes().decode("latin1", errors="ignore")
-    if "NIGridQuality" not in text:
+
+def parse_embedded_cgns_quality(
+    path: str | Path,
+    *,
+    _chunk_bytes: int = _QUALITY_SCAN_CHUNK_BYTES,
+) -> dict[str, Any]:
+    """从 CGNS 文本片段中提取内嵌的 AutoGrid 质量指标。
+
+    以分块流式扫描代替整文件 ``read_bytes``：按块读取并仅保留外层
+    NIGridQuality 片段与所需计数，跨块标记通过尾部重叠正确处理。
+    """
+
+    marker_seen, text, counts = _stream_quality_fragments(Path(path), chunk_bytes=_chunk_bytes)
+    if not marker_seen:
         raise ValueError(f"No embedded NIGridQuality data found: {path}")
 
     metrics: dict[str, Any] = {
-        "negative_cells": _last_count(text, rf"NEGATIVE_CELLS\s+{NUMBER}"),
-        "number_of_points": _last_count(text, rf"NUMBER_OF_POINTS\s+{NUMBER}"),
-        "grid_levels": _last_count(text, rf"MULTIGRID_LEVEL\s+{NUMBER}"),
+        "negative_cells": counts[0],
+        "number_of_points": counts[1],
+        "grid_levels": counts[2],
     }
     quality_map = {
         "NIGridQuality_skewness": ("skewness_angle", "min_skewness_angle", "max_skewness_angle", "avg_skewness_angle"),
@@ -720,6 +732,128 @@ def _discover_project_units(source_path: Path) -> tuple[str | None, float | None
         factor = float(factor_match.group(1)) if factor_match else None
         return units, factor
     return None, None
+
+
+def _stream_quality_fragments(
+    path: Path,
+    *,
+    chunk_bytes: int = _QUALITY_SCAN_CHUNK_BYTES,
+) -> tuple[bool, str, tuple[int | float | None, int | float | None, int | float | None]]:
+    """按块流式扫描 CGNS 文本，仅保留外层 NIGridQuality 片段与所需计数。
+
+    返回 ``(是否出现 NIGridQuality 标记, 拼接后的质量片段文本, 三项计数)``，
+    三项计数按 NEGATIVE_CELLS / NUMBER_OF_POINTS / MULTIGRID_LEVEL 顺序，
+    取全文件最后一次匹配（与旧整读实现的 ``_last_count`` 一致）。
+    外层片段从独立的 ``NI_BEGIN NIGridQuality`` 开始，按嵌套深度在匹配的
+    ``NI_END NIGridQuality`` 处结束；跨块标记通过保留尾部重叠处理，
+    未闭合片段在文件结束时按原文保留。
+    """
+
+    outer_begin = re.compile(r"NI_BEGIN\s+NIGridQuality(?![A-Za-z0-9_])", re.IGNORECASE)
+    begin_marker = re.compile(r"NI_BEGIN\s+NIGridQuality", re.IGNORECASE)
+    end_marker = re.compile(r"NI_END\s+NIGridQuality", re.IGNORECASE)
+    count_patterns = (
+        re.compile(rf"NEGATIVE_CELLS\s+{NUMBER}", re.IGNORECASE),
+        re.compile(rf"NUMBER_OF_POINTS\s+{NUMBER}", re.IGNORECASE),
+        re.compile(rf"MULTIGRID_LEVEL\s+{NUMBER}", re.IGNORECASE),
+    )
+
+    fragments: list[str] = []
+    pending: list[str] = []
+    last_counts: list[tuple[int, str] | None] = [None, None, None]
+    depth = 0
+    carry = ""
+    handled = 0
+    count_carry = ""
+    marker_seen = False
+    absolute = 0
+
+    def hold(part: str) -> None:
+        """把文本并入当前片段；始终扣留尾部字符等待下一块判定跨块标记。"""
+
+        nonlocal carry
+        combined = carry + part
+        if len(combined) > _QUALITY_MARKER_TAIL:
+            pending.append(combined[:-_QUALITY_MARKER_TAIL])
+            carry = combined[-_QUALITY_MARKER_TAIL:]
+        else:
+            carry = combined
+
+    with path.open("rb") as stream:
+        while True:
+            raw = stream.read(chunk_bytes)
+            if not raw:
+                break
+            decoded = raw.decode("latin1", errors="ignore")
+            count_text = count_carry + decoded
+            count_base = absolute - len(count_carry)
+            count_carry = count_text[-64:]
+            for pattern_index, pattern in enumerate(count_patterns):
+                matches = list(pattern.finditer(count_text))
+                if not matches:
+                    continue
+                last = matches[-1]
+                current = last_counts[pattern_index]
+                if current is None or count_base + last.start() >= current[0]:
+                    last_counts[pattern_index] = (count_base + last.start(), last.group(1))
+            text = carry + decoded
+            base = absolute - len(carry)
+            carry = ""
+            if not marker_seen and "NIGridQuality" in text:
+                marker_seen = True
+            cursor = 0
+            limit = len(text)
+            while cursor < limit:
+                if depth == 0:
+                    match = outer_begin.search(text, cursor)
+                    if match is None:
+                        break
+                    if base + match.end() <= handled:
+                        # 扣留尾部中已被处理过的标记，跳过。
+                        cursor = match.end()
+                        continue
+                    hold(text[match.start():])
+                    depth = 1
+                    handled = base + limit
+                    cursor = limit
+                    continue
+                begin_match = begin_marker.search(text, cursor)
+                end_match = end_marker.search(text, cursor)
+                while begin_match is not None and base + begin_match.end() <= handled:
+                    begin_match = begin_marker.search(text, begin_match.end())
+                while end_match is not None and base + end_match.end() <= handled:
+                    end_match = end_marker.search(text, end_match.end())
+                if begin_match is None and end_match is None:
+                    hold(text[cursor:])
+                    handled = base + limit
+                    cursor = limit
+                    continue
+                if end_match is not None and (
+                    begin_match is None or end_match.start() < begin_match.start()
+                ):
+                    hold(text[cursor:end_match.end()])
+                    depth -= 1
+                    handled = base + end_match.end()
+                    cursor = end_match.end()
+                    if depth == 0:
+                        fragments.append("".join(pending) + carry)
+                        pending = []
+                        carry = ""
+                    continue
+                hold(text[cursor:begin_match.end()])
+                depth += 1
+                handled = base + begin_match.end()
+                cursor = begin_match.end()
+            if depth == 0 and cursor < limit:
+                # 尚未进入片段：保留可能含跨块标记的尾部。
+                carry = text[cursor:][-_QUALITY_MARKER_TAIL:]
+            absolute += len(raw)
+        if depth > 0:
+            fragments.append("".join(pending) + carry)
+    counts = tuple(
+        _strict_count(value[1]) if value is not None else None for value in last_counts
+    )
+    return marker_seen, "".join(fragments), counts
 
 
 def _quality_blocks(text: str, name: str) -> list[str]:

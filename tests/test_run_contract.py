@@ -159,7 +159,13 @@ class RunContractTests(unittest.TestCase):
         lock_data = json.loads((out / LOCK_FILE_NAME).read_text(encoding="utf-8"))
         self.assertEqual(lock_data["run_id"], winner_summary["run_id"])
         loser_err = first_err if first.returncode == 2 else second_err
-        self.assertIn("占用", loser_err.decode(errors="replace"))
+        loser_text = loser_err.decode(errors="replace")
+        # 竞争窗口内既可能是锁文件存在（“占用”），也可能是快照检查恰好
+        # 观察到刚创建的占用标记（“拒绝复用”）；两者都是并发复用的拒绝。
+        self.assertTrue(
+            "占用" in loser_text or "拒绝复用" in loser_text,
+            loser_text,
+        )
 
     def test_protocol_violations_fail_the_run(self):
         cases = {

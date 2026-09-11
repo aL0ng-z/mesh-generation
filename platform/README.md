@@ -54,6 +54,8 @@ Copy-Item .env.example .env
 | `MESH_JOB_TIMEOUT_SECONDS` | `1800` | 单任务超时 |
 | `MESH_AUTH_USERNAME` | 空 | 共享登录用户名；必须与密码哈希同时设置 |
 | `MESH_AUTH_PASSWORD_HASH` | 空 | `python -m mesh_app.auth` 生成的 scrypt 编码串 |
+| `MESH_SCRYPT_MAX_CONCURRENCY` | `2` | 并发 scrypt 密码校验上限；等待的登录请求在异步层排队 |
+| `MESH_COOKIE_SECURE` | `false` | 会话 Cookie 的 `Secure` 标志；HTTPS 部署设 `true`，本机 HTTP 开发保持 `false` |
 | `MESH_PYTHON` | 自动发现 | 部署脚本使用的 Python 路径 |
 
 除总上传大小外，解析器还限制单条 geomTurbo 物理行、token/名称长度、嵌套深度、叶排数和每叶排叶片实体数，校验显式块配对，并对重复侧别去重；超过任一安全边界会返回 `422 INVALID_GEOMTURBO`，避免异常输入无界扩张内存状态。
@@ -85,6 +87,8 @@ platform\.venv\Scripts\python.exe -m mesh_app.auth
 - `/api/health` 保持匿名可访问（供启动脚本就绪探测），但匿名请求不返回 Worker 主机名与 IGG 安装路径；FastAPI 自动文档端点（`/docs`、`/redoc`、`/openapi.json`）在鉴权部署中已关闭。Worker 走 SQLite 队列，不经 HTTP，不受影响。
 - 仅依赖 Python 标准库（scrypt/hmac），不新增任何包。
 - 明文 HTTP 下密码会以明文经过内网链路；如需加密，按下方 Caddy 路径升级 HTTPS。
+- scrypt 校验在事件循环外的线程池执行，并用 `MESH_SCRYPT_MAX_CONCURRENCY`（默认 2）限制并发，登录高峰不会阻塞 `/api/health` 等普通请求。
+- 会话 Cookie 默认不带 `Secure`，保持 `http://127.0.0.1:8000` 本机开发可用；经 Caddy 提供 HTTPS 的生产部署必须设置 `MESH_COOKIE_SECURE=true`（写入 `.env` 或 API 进程环境）。启用后浏览器只在 HTTPS 连接上携带会话 Cookie，避免令牌经明文 HTTP 泄露；此时纯 HTTP 访问无法保持登录态。
 - 明确不做：按用户账号、角色权限、注册/改密页面、登录限速、服务端可吊销会话表。
 
 ## 本机启动与开发

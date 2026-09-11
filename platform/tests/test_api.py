@@ -143,7 +143,7 @@ def test_upload_list_detail_artifact_range_and_uniform_errors(tmp_path: Path) ->
 
         health = client.get("/api/health")
         assert health.status_code == 200
-        assert health.json()["database"] == {"status": "ok", "version": 1}
+        assert health.json()["database"] == {"status": "ok", "version": 2}
         assert health.json()["queue"]["queued"] == 1
 
 

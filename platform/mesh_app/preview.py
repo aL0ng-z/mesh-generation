@@ -89,8 +89,24 @@ class PreviewService:
             raise PreviewUnavailableError("PREVIEW_ASSET_MISSING", f"预览缓存不存在：{relative}")
         return path
 
-    def slice_asset(self, block: str | int, axis: str, index: int) -> Path:
-        return get_or_create_slice(self.cgns_path, self.cache_dir, block, axis, index)
+    def slice_asset(
+        self,
+        block: str | int,
+        axis: str,
+        index: int,
+        *,
+        memory_budget_mb: int | None = None,
+        cache_limit_mb: int | None = None,
+    ) -> Path:
+        return get_or_create_slice(
+            self.cgns_path,
+            self.cache_dir,
+            block,
+            axis,
+            index,
+            memory_budget_mb=memory_budget_mb,
+            cache_limit_mb=cache_limit_mb,
+        )
 
 
 def detect_cgns_format(path: str | os.PathLike[str]) -> str:
@@ -131,19 +147,7 @@ def build_manifest(path: str | os.PathLike[str]) -> dict[str, Any]:
             descriptors = _discover_blocks(handle)
             blocks: list[dict[str, Any]] = []
             for descriptor in descriptors:
-                bounds = []
-                for dataset_path in descriptor.coordinate_paths:
-                    values = np.asarray(handle[dataset_path][()])
-                    if values.size == 0:
-                        raise PreviewError(
-                            "EMPTY_COORDINATES", f"{descriptor.name} 包含空坐标数组"
-                        )
-                    finite = values[np.isfinite(values)]
-                    if finite.size == 0:
-                        raise PreviewError(
-                            "INVALID_COORDINATES", f"{descriptor.name} 坐标全部为非有限值"
-                        )
-                    bounds.append([float(np.min(finite)), float(np.max(finite))])
+                bounds = _coordinate_bounds(handle, descriptor)
                 size = list(descriptor.size)
                 blocks.append(
                     {
@@ -223,12 +227,11 @@ def prepare_preview(
             by_id = {descriptor.block_id: descriptor for descriptor in descriptors}
             for block in manifest["blocks"]:
                 descriptor = by_id[block["id"]]
-                points = _read_points(handle, descriptor)
                 relative_dir = Path("blocks") / descriptor.block_id
                 surface_relative = relative_dir / "surface.vtp"
                 wireframe_relative = relative_dir / "wireframe.vtp"
-                _write_surface_vtp_atomic(cache / surface_relative, points)
-                _write_wireframe_vtp_atomic(cache / wireframe_relative, points)
+                _write_surface_vtp_atomic(cache / surface_relative, handle, descriptor)
+                _write_wireframe_vtp_atomic(cache / wireframe_relative, handle, descriptor)
                 block["assets"] = {
                     "surface": surface_relative.as_posix(),
                     "wireframe": wireframe_relative.as_posix(),
@@ -265,17 +268,16 @@ def generate_block_vtp(
     if detect_cgns_format(source) != "HDF5":
         raise PreviewUnavailableError("ADF_UNSUPPORTED", "ADF CGNS 不支持三维预览")
     h5py, _ = _preview_dependencies()
-    with h5py.File(source, "r") as handle:
-        descriptor = _select_descriptor(_discover_blocks(handle), block)
-        points = _read_points(handle, descriptor)
     destination = Path(output_path).resolve()
     normalized_mode = mode.lower()
-    if normalized_mode == "surface":
-        _write_surface_vtp_atomic(destination, points)
-    elif normalized_mode == "wireframe":
-        _write_wireframe_vtp_atomic(destination, points)
-    else:
-        raise PreviewError("INVALID_PREVIEW_MODE", "预览模式仅支持 surface 或 wireframe")
+    with h5py.File(source, "r") as handle:
+        descriptor = _select_descriptor(_discover_blocks(handle), block)
+        if normalized_mode == "surface":
+            _write_surface_vtp_atomic(destination, handle, descriptor)
+        elif normalized_mode == "wireframe":
+            _write_wireframe_vtp_atomic(destination, handle, descriptor)
+        else:
+            raise PreviewError("INVALID_PREVIEW_MODE", "预览模式仅支持 surface 或 wireframe")
     return destination
 
 
@@ -285,8 +287,16 @@ def get_or_create_slice(
     block: str | int,
     axis: str,
     index: int,
+    *,
+    memory_budget_mb: int | None = None,
+    cache_limit_mb: int | None = None,
 ) -> Path:
-    """按 0 基 I/J/K 索引生成切片；写入完成前缓存路径不可见。"""
+    """按 0 基 I/J/K 索引生成切片；写入完成前缓存路径不可见。
+
+    只通过 HDF5 hyperslab 读取请求平面，不载入全部体坐标。``memory_budget_mb``
+    为切片工作内存预算（估计的可计算数组大小），``cache_limit_mb`` 为本运行
+    切片磁盘缓存累计上限；超限拒绝新生成，已存在缓存继续可读。
+    """
 
     source = Path(cgns_path).resolve()
     cache = Path(cache_dir).resolve()
@@ -313,8 +323,11 @@ def get_or_create_slice(
         _ensure_within(destination, cache)
         if destination.is_file() and destination.stat().st_size > 0:
             return destination
-        points = _read_points(handle, descriptor)
-    slice_points, polygons = _slice_geometry(points, axis_number, index)
+        point_count, quad_count = _slice_plane_sizes(descriptor.size, axis_number)
+        _check_slice_budget(point_count, quad_count, memory_budget_mb=memory_budget_mb)
+        _check_slice_cache_limit(cache, point_count, quad_count, cache_limit_mb=cache_limit_mb)
+        plane = _read_slice_plane(handle, descriptor, axis_number, index)
+    slice_points, polygons = _slice_geometry(plane)
     _write_polydata_atomic(destination, slice_points, polygons=polygons)
     return destination
 
@@ -422,6 +435,94 @@ def _coordinate_dataset(group: Any, coordinate_name: str) -> Any | None:
     return None
 
 
+_BOUNDS_SCAN_ELEMENTS = 4 * 1024 * 1024  # 包围盒分块归约的单块元素数
+
+
+def _coordinate_bounds(handle: Any, descriptor: _BlockDescriptor) -> list[list[float]]:
+    """分块归约各坐标数据集的范围，不一次性载入整个数组。"""
+
+    _, np = _preview_dependencies()
+    bounds: list[list[float]] = []
+    for dataset_path in descriptor.coordinate_paths:
+        dataset = handle[dataset_path]
+        shape = tuple(int(value) for value in dataset.shape)
+        if not shape:
+            raise PreviewError("EMPTY_COORDINATES", f"{descriptor.name} 包含空坐标数组")
+        row_elements = math.prod(shape[1:])
+        rows_per_chunk = max(1, _BOUNDS_SCAN_ELEMENTS // max(row_elements, 1))
+        minimum = math.inf
+        maximum = -math.inf
+        finite_found = False
+        for start in range(0, shape[0], rows_per_chunk):
+            values = np.asarray(dataset[start : start + rows_per_chunk], dtype=np.float64)
+            finite = values[np.isfinite(values)]
+            if finite.size == 0:
+                continue
+            finite_found = True
+            minimum = min(minimum, float(np.min(finite)))
+            maximum = max(maximum, float(np.max(finite)))
+        if not finite_found:
+            raise PreviewError(
+                "INVALID_COORDINATES", f"{descriptor.name} 坐标全部为非有限值"
+            )
+        bounds.append([minimum, maximum])
+    return bounds
+
+
+def _slice_plane_sizes(size: tuple[int, int, int], axis_number: int) -> tuple[int, int]:
+    """返回 (平面点数, 平面四边形数)。"""
+
+    others = [value for position, value in enumerate(size) if position != axis_number]
+    first, second = others
+    return first * second, max(first - 1, 0) * max(second - 1, 0)
+
+
+def _slice_memory_estimate(point_count: int, quad_count: int) -> int:
+    """估计切片转换的工作内存（可计算数组大小）：三个坐标平面、
+    组装后的 (N,3) 输出及 Python 多边形索引对象。"""
+
+    return point_count * 8 * 6 + quad_count * 4 * 28
+
+
+def _slice_file_estimate(point_count: int, quad_count: int) -> int:
+    """估计切片 VTP 的 ASCII 文本大小：坐标约 26 字节/分量，拓扑约 60 字节/四边形。"""
+
+    return point_count * 3 * 26 + quad_count * 60
+
+
+def _check_slice_budget(
+    point_count: int, quad_count: int, *, memory_budget_mb: int | None
+) -> None:
+    if memory_budget_mb is None:
+        return
+    estimated = _slice_memory_estimate(point_count, quad_count)
+    limit_bytes = memory_budget_mb * 1024 * 1024
+    if estimated > limit_bytes:
+        raise PreviewError(
+            "PREVIEW_MEMORY_BUDGET_EXCEEDED",
+            f"切片估计工作内存 {estimated} 字节超过预算 {limit_bytes} 字节，拒绝生成",
+        )
+
+
+def _check_slice_cache_limit(
+    cache: Path, point_count: int, quad_count: int, *, cache_limit_mb: int | None
+) -> None:
+    if cache_limit_mb is None:
+        return
+    existing = sum(
+        path.stat().st_size
+        for path in cache.glob("blocks/*/slices/**/*.vtp")
+        if path.is_file()
+    )
+    projected = existing + _slice_file_estimate(point_count, quad_count)
+    limit_bytes = cache_limit_mb * 1024 * 1024
+    if projected > limit_bytes:
+        raise PreviewError(
+            "PREVIEW_CACHE_LIMIT_EXCEEDED",
+            f"本运行切片磁盘缓存 {existing} 字节加本次生成将超过上限 {limit_bytes} 字节，拒绝生成新切片",
+        )
+
+
 def _attribute_text(value: Any) -> str:
     if value is None:
         return ""
@@ -435,76 +536,140 @@ def _attribute_text(value: Any) -> str:
     return str(value)
 
 
-def _read_points(handle: Any, descriptor: _BlockDescriptor) -> Any:
+def _read_points_at(
+    handle: Any, descriptor: _BlockDescriptor, triples: Sequence[tuple[int, int, int]]
+) -> Any:
+    """只读取指定 (i, j, k) 索引处的坐标，不载入其余体坐标。
+
+    每个点归属其所在的一个边界平面，用 hyperslab 读取该平面后在平面内
+    按索引取点（h5py 的逐点索引要求升序，平面内 numpy 索引无此限制）。
+    """
+
+    _, np = _preview_dependencies()
+    if not triples:
+        return np.empty((0, 3), dtype=np.float64)
+    plane_specs: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for axis_number, size in enumerate(descriptor.size):
+        for index in _boundary_indices(size):
+            key = (axis_number, index)
+            if key not in seen:
+                seen.add(key)
+                plane_specs.append(key)
+    by_plane: dict[int, list[tuple[int, tuple[int, int, int]]]] = {}
+    for position, triple in enumerate(triples):
+        for plane_number, (axis_number, index) in enumerate(plane_specs):
+            if triple[axis_number] == index:
+                by_plane.setdefault(plane_number, []).append((position, triple))
+                break
+    output = np.empty((len(triples), 3), dtype=np.float64)
+    for plane_number, entries in by_plane.items():
+        axis_number, index = plane_specs[plane_number]
+        other_axes = [value for value in (0, 1, 2) if value != axis_number]
+        first_axis, second_axis = other_axes
+        positions = [position for position, _ in entries]
+        first_values = np.asarray(
+            [triple[first_axis] for _, triple in entries], dtype=np.int64
+        )
+        second_values = np.asarray(
+            [triple[second_axis] for _, triple in entries], dtype=np.int64
+        )
+        axes = []
+        for path in descriptor.coordinate_paths:
+            dataset = handle[path]
+            if axis_number == 0:  # I 边界：存储 [:, :, i] -> (K, J)
+                plane = dataset[:, :, index]
+            elif axis_number == 1:  # J 边界：存储 [:, j, :] -> (K, I)
+                plane = dataset[:, index, :]
+            else:  # K 边界：存储 [k, :, :] -> (J, I)
+                plane = dataset[index, :, :]
+            plane = np.asarray(np.transpose(plane, (1, 0)), dtype=np.float64)
+            axes.append(plane[first_values, second_values])
+        points = np.stack(axes, axis=-1)
+        if not bool(np.all(np.isfinite(points))):
+            raise PreviewError("INVALID_COORDINATES", f"{descriptor.name} 含 NaN 或无穷坐标")
+        output[np.asarray(positions, dtype=np.int64)] = points
+    return output
+
+
+def _read_slice_plane(
+    handle: Any, descriptor: _BlockDescriptor, axis_number: int, index: int
+) -> Any:
+    """用 HDF5 hyperslab 直接读取一个 I/J/K 平面，转换为 (first, second, 3)。
+
+    I 对应存储的 ``[:, :, i]``、J 对应 ``[:, j, :]``、K 对应 ``[k, :, :]``；
+    平面再转置为 I,J,K 顺序坐标（J,K / I,K / I,J 主轴优先）。
+    """
+
     _, np = _preview_dependencies()
     axes = []
     for path in descriptor.coordinate_paths:
-        values = np.asarray(handle[path][()], dtype=np.float64)
-        if tuple(values.shape) != descriptor.storage_shape:
-            raise PreviewError("COORDINATE_SHAPE_CHANGED", f"读取期间坐标维度发生变化：{path}")
-        # storage K,J,I -> internal I,J,K
-        axes.append(np.transpose(values, (2, 1, 0)))
-    points = np.stack(axes, axis=-1)
-    if not bool(np.all(np.isfinite(points))):
+        dataset = handle[path]
+        if axis_number == 0:  # I 平面：存储 [:, :, i] -> (K, J)
+            plane = dataset[:, :, index]
+        elif axis_number == 1:  # J 平面：存储 [:, j, :] -> (K, I)
+            plane = dataset[:, index, :]
+        else:  # K 平面：存储 [k, :, :] -> (J, I)
+            plane = dataset[index, :, :]
+        axes.append(np.asarray(np.transpose(plane, (1, 0)), dtype=np.float64))
+    plane_points = np.stack(axes, axis=-1)
+    if not bool(np.all(np.isfinite(plane_points))):
         raise PreviewError("INVALID_COORDINATES", f"{descriptor.name} 含 NaN 或无穷坐标")
-    return points
+    return plane_points
 
 
-def _write_surface_vtp_atomic(path: Path, points: Any) -> None:
-    selected_points, polygons = _surface_geometry(points)
+def _write_surface_vtp_atomic(path: Path, handle: Any, descriptor: _BlockDescriptor) -> None:
+    used, polygons = _surface_geometry(descriptor.size)
+    selected_points = _read_points_at(handle, descriptor, used)
     _write_polydata_atomic(path, selected_points, polygons=polygons)
 
 
-def _write_wireframe_vtp_atomic(path: Path, points: Any) -> None:
-    selected_points, lines = _wireframe_geometry(points)
+def _write_wireframe_vtp_atomic(path: Path, handle: Any, descriptor: _BlockDescriptor) -> None:
+    used, lines = _wireframe_geometry(descriptor.size)
+    selected_points = _read_points_at(handle, descriptor, used)
     _write_polydata_atomic(path, selected_points, lines=lines)
 
 
-def _surface_geometry(points: Any) -> tuple[Any, list[tuple[int, int, int, int]]]:
-    _, np = _preview_dependencies()
-    size = tuple(int(value) for value in points.shape[:3])
+def _surface_geometry(
+    size: tuple[int, int, int],
+) -> tuple[list[tuple[int, int, int]], list[tuple[int, int, int, int]]]:
+    """返回 (使用的边界点 (i,j,k), 四边形索引)；只枚举边界平面。"""
+
     quads = list(_boundary_quads(size))
-    used = sorted({point for quad in quads for point in quad})
-    mapping = {flat_index: output_index for output_index, flat_index in enumerate(used)}
-    flat_points = points.reshape((-1, 3))
-    selected = flat_points[np.asarray(used, dtype=np.int64)] if used else np.empty((0, 3))
+    used = sorted({triple for quad in quads for triple in quad})
+    mapping = {triple: output_index for output_index, triple in enumerate(used)}
     polygons = [tuple(mapping[value] for value in quad) for quad in quads]
-    return selected, polygons
+    return used, polygons
 
 
-def _wireframe_geometry(points: Any) -> tuple[Any, list[tuple[int, int]]]:
+def _wireframe_geometry(
+    size: tuple[int, int, int],
+) -> tuple[list[tuple[int, int, int]], list[tuple[int, int]]]:
+    """返回 (使用的边界点 (i,j,k), 线索引)；只枚举边界棱边并去重。"""
+
+    ni, nj, nk = size
+    segments: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
+    if ni > 1:
+        for i in range(ni - 1):
+            for j, k in _boundary_pairs(nj, nk):
+                segments.append(((i, j, k), (i + 1, j, k)))
+    if nj > 1:
+        for j in range(nj - 1):
+            for i, k in _boundary_pairs(ni, nk):
+                segments.append(((i, j, k), (i, j + 1, k)))
+    if nk > 1:
+        for k in range(nk - 1):
+            for i, j in _boundary_pairs(ni, nj):
+                segments.append(((i, j, k), (i, j, k + 1)))
+    used = sorted({triple for segment in segments for triple in segment})
+    mapping = {triple: output_index for output_index, triple in enumerate(used)}
+    return used, [(mapping[first], mapping[second]) for first, second in segments]
+
+
+def _slice_geometry(plane: Any) -> tuple[Any, list[tuple[int, int, int, int]]]:
+    """由 (first, second, 3) 平面点阵生成切片四边形拓扑。"""
+
     _, np = _preview_dependencies()
-    ni, nj, nk = (int(value) for value in points.shape[:3])
-
-    def flat(i: int, j: int, k: int) -> int:
-        return (i * nj + j) * nk + k
-
-    segments: list[tuple[int, int]] = []
-    for i in range(max(ni - 1, 0)):
-        for j in range(nj):
-            for k in range(nk):
-                if j in {0, nj - 1} or k in {0, nk - 1}:
-                    segments.append((flat(i, j, k), flat(i + 1, j, k)))
-    for i in range(ni):
-        for j in range(max(nj - 1, 0)):
-            for k in range(nk):
-                if i in {0, ni - 1} or k in {0, nk - 1}:
-                    segments.append((flat(i, j, k), flat(i, j + 1, k)))
-    for i in range(ni):
-        for j in range(nj):
-            for k in range(max(nk - 1, 0)):
-                if i in {0, ni - 1} or j in {0, nj - 1}:
-                    segments.append((flat(i, j, k), flat(i, j, k + 1)))
-    used = sorted({point for segment in segments for point in segment})
-    mapping = {flat_index: output_index for output_index, flat_index in enumerate(used)}
-    flat_points = points.reshape((-1, 3))
-    selected = flat_points[np.asarray(used, dtype=np.int64)] if used else np.empty((0, 3))
-    return selected, [(mapping[first], mapping[second]) for first, second in segments]
-
-
-def _slice_geometry(points: Any, axis: int, index: int) -> tuple[Any, list[tuple[int, int, int, int]]]:
-    _, np = _preview_dependencies()
-    plane = np.take(points, index, axis=axis)
     first_size, second_size = (int(value) for value in plane.shape[:2])
     selected = np.asarray(plane, dtype=np.float64).reshape((-1, 3))
     polygons: list[tuple[int, int, int, int]] = []
@@ -517,30 +682,41 @@ def _slice_geometry(points: Any, axis: int, index: int) -> tuple[Any, list[tuple
     return selected, polygons
 
 
-def _boundary_quads(size: tuple[int, int, int]) -> Iterator[tuple[int, int, int, int]]:
+def _boundary_quads(
+    size: tuple[int, int, int],
+) -> Iterator[tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]]:
+    """枚举边界平面上的四边形（顶点为 (i,j,k) 三元组），只遍历边界。"""
+
     ni, nj, nk = size
-
-    def flat(i: int, j: int, k: int) -> int:
-        return (i * nj + j) * nk + k
-
     for i in _boundary_indices(ni):
         for j in range(max(nj - 1, 0)):
             for k in range(max(nk - 1, 0)):
-                yield (flat(i, j, k), flat(i, j + 1, k), flat(i, j + 1, k + 1), flat(i, j, k + 1))
+                yield ((i, j, k), (i, j + 1, k), (i, j + 1, k + 1), (i, j, k + 1))
     for j in _boundary_indices(nj):
         for i in range(max(ni - 1, 0)):
             for k in range(max(nk - 1, 0)):
-                yield (flat(i, j, k), flat(i + 1, j, k), flat(i + 1, j, k + 1), flat(i, j, k + 1))
+                yield ((i, j, k), (i + 1, j, k), (i + 1, j, k + 1), (i, j, k + 1))
     for k in _boundary_indices(nk):
         for i in range(max(ni - 1, 0)):
             for j in range(max(nj - 1, 0)):
-                yield (flat(i, j, k), flat(i + 1, j, k), flat(i + 1, j + 1, k), flat(i, j + 1, k))
+                yield ((i, j, k), (i + 1, j, k), (i + 1, j + 1, k), (i, j + 1, k))
 
 
 def _boundary_indices(size: int) -> tuple[int, ...]:
     if size <= 0:
         return ()
     return (0,) if size == 1 else (0, size - 1)
+
+
+def _boundary_pairs(first_size: int, second_size: int) -> Iterator[tuple[int, int]]:
+    """枚举 (first, second) 平面中位于边界上的索引对，去重且不遍历内部。"""
+
+    for first in range(first_size):
+        for second in _boundary_indices(second_size):
+            yield (first, second)
+    for first in _boundary_indices(first_size):
+        for second in range(1, second_size - 1):
+            yield (first, second)
 
 
 def _write_polydata_atomic(

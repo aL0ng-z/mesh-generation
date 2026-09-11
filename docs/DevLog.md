@@ -1,5 +1,42 @@
 # 开发日志
 
+## 2026-09-11：批次③ 调度与资源（CR-04、CR-07~09）
+
+### CR-04：后处理进入独立、可终止的子进程
+
+- 新增 `platform/mesh_app/postprocess.py`（`python -m mesh_app.postprocess <run_id>`）：单运行产物散列登记（成功与失败运行均登记）与成功运行的 surface/wireframe + manifest 预览转换；子进程日志写 `data_dir/logs`，不污染 run_dir。
+- Worker 解耦：`_poll_tasks` 主循环内不再同步执行后处理，成功/失败运行仅入队 `_postprocess_queue`；`_dispatch_postprocess` 固定单并发（原子占位 + `spawn_managed_process`），`_supervise_postprocess` 以 monotonic 计时轮询，超时（`MESH_POSTPROCESS_TIMEOUT_SECONDS`，默认 600）→ terminate_tree → FAILED；主循环持续处理网格轮询、超时、心跳、停止与新任务领取。
+- 迁移 `0002_postprocess_status.sql`（user_version=2）：runs 表新增 `postprocess_status`（PENDING/RUNNING/COMPLETED/FAILED）与起止时间、错误字段；历史 `preview_status='PENDING'` 行保留排队，其余置 COMPLETED（不批量重新散列或转换）；网格终态不可变触发器未动。
+- 资源门控：活动后处理额外计入一份现有内存预留（默认 2.5 GiB）。
+- 启动恢复：`_recover_pending_postprocess` 恢复 PENDING/RUNNING 行（RUNNING 重置为 PENDING）重新排队，不同步转换；停止时终止后处理进程树并保留可恢复状态。
+- 移除仅为同步后处理续写心跳的辅助线程 `_heartbeats_during_preview` 及其测试。
+
+### CR-07：按请求规模读取和生成预览
+
+- 切片经 h5py hyperslab 只读请求平面（I 对应 `[:, :, i]`、J 对应 `[:, j, :]`、K 对应 `[k, :, :]`，转置为 I,J,K 平面顺序），不再整块读入体坐标。
+- 表面/线框只枚举边界索引；棱边去重与退化维度行为保留，与旧算法在 5 组小网格（含 (1,1,1)、(1,3,4)）逐点拓扑一致；包围盒改为 4M 元素分块归约。
+- 单飞与并发：API 层 `_PreviewConversionGate`（asyncio.Semaphore(1) + 按键 inflight future 注册表 + run_in_threadpool），同键请求共享一次生成，每 API 进程同时最多一个转换，等待在异步层完成；manifest/block/slice 三路由接入。
+- 预算与缓存上限：切片数组可计算大小生成前对照 `MESH_PREVIEW_MEMORY_BUDGET_MB`（默认 512）；每运行切片缓存累计对照 `MESH_PREVIEW_CACHE_LIMIT_MB`（默认 1024）；超限拒绝并返回 `PREVIEW_MEMORY_BUDGET_EXCEEDED` / `PREVIEW_CACHE_LIMIT_EXCEEDED`，已有缓存继续可读。
+- `src/quality.py` CGNS 降级解析改为分块流式扫描（1 MiB 块、标记尾重叠、深度跟踪 NI_BEGIN/NI_END、滚动窗口计数），解析结果与旧实现逐项一致，未引入 h5py（保持标准库边界）。
+
+### CR-08：卸载密码计算并限制并发
+
+- 登录路由 scrypt 校验经 anyio 线程池执行（run_in_threadpool），配专用 `CapacityLimiter`（`MESH_SCRYPT_MAX_CONCURRENCY`，默认 2），等待在异步层排队，不占用 ASGI 事件循环；用户名不匹配时仍执行 scrypt，保持统一凭据错误与等时性。
+- Cookie 增加 `Secure` 配置（`MESH_COOKIE_SECURE`，默认 False 保持本机 HTTP 开发可用）；平台 README 补充生产 HTTPS（Caddy）部署时启用说明。
+
+### CR-09：按保存的进程组身份清理 POSIX 后代
+
+- `windows_job.py` 保存 start_new_session 建立的 PGID，清理不再依赖对已回收 PID 的 waitpid/getpgid；terminate_tree 统一走 `_cleanup_posix_group`：SIGTERM → 宽限期 → `os.killpg(pgid, 0)` 存活检查（ESRCH/EPERM 幂等）→ 残余成员 SIGKILL → 有界确认；父进程先退出仍到达 SIGKILL 分支。
+- `close()` 在 POSIX 上调用同一幂等清理路径；正常关闭、超时、停止共用，所有权边界不变（只对保存的 pgid 发信号）。
+- Windows Job Object 路径保持原样并通过实机验证：真实子进程树经 terminate_tree 整树消失、Job 句柄关闭兜底清理残余孙进程均以 psutil 断言通过（本机 uses_job_object 为真）。
+- 新增 `test_process_cleanup.py`：Windows 实机 2 项真实执行，POSIX 4 项场景（孙进程忽略 SIGTERM、父先退出、正常结束后残余后代、重复清理幂等）在 Windows 按预期跳过，测试 docstring 注明 Linux 验证方法。
+
+### 配置与验证
+
+- `config.py` 新增 5 个配置项（后处理超时、预览内存预算/缓存上限、scrypt 并发、Cookie Secure）并在 `.env.example` 补充注释说明。
+- 根测试 79 项全部通过（新增 CGNS 分块解析一致性 8 项）；平台测试 100 passed、4 skipped（POSIX 专项），全部通过。
+- 顺带修复 `test_run_contract.py` 并发同目录用例的既有偶发竞争（败者进程在 exists 检查与 iterdir 之间可能报"拒绝复用"而非"占用"，断言放宽为接受两种合法拒绝）。
+
 ## 2026-09-11：批次② 结果契约（CR-01~03、D-02）
 
 ### CR-01：独占运行目录与原子产物清单

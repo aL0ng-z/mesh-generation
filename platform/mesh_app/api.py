@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import time
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import quote
 
+from anyio import CapacityLimiter
 from fastapi import FastAPI, File, Form, Query, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -51,6 +53,37 @@ _MULTIPART_OVERHEAD_BYTES = 64 * 1024
 
 class _UploadBodyTooLarge(Exception):
     pass
+
+
+class _PreviewConversionGate:
+    """预览转换门：同键请求共享一次生成（单飞），且每进程同时只执行一个转换。
+
+    转换在 ``run_in_threadpool`` 中同步执行；等待在异步层完成，
+    不阻塞事件循环。同键的迟到请求直接等待已开始的那次转换结果。
+    """
+
+    def __init__(self) -> None:
+        self._semaphore = asyncio.Semaphore(1)
+        self._inflight: dict[tuple, asyncio.Future] = {}
+
+    async def run(self, key: tuple, function) -> Any:
+        existing = self._inflight.get(key)
+        if existing is not None:
+            return await asyncio.shield(existing)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        self._inflight[key] = future
+        try:
+            async with self._semaphore:
+                result = await run_in_threadpool(function)
+                future.set_result(result)
+        except BaseException as exc:
+            future.set_exception(exc)
+            raise
+        finally:
+            if self._inflight.get(key) is future:
+                del self._inflight[key]
+        return future.result()
 
 
 class _UploadBodyLimitMiddleware:
@@ -172,6 +205,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.sessions = sessions
     application.state.controls = controls
     application.state.artifacts = artifacts
+    preview_gate = _PreviewConversionGate()
+    application.state.preview_gate = preview_gate
+    # 登录 scrypt 校验的专用容量限制器：等待在异步层排队，校验经线程池执行，
+    # 不占用 ASGI 事件循环，也不挤占其他请求的线程池额度。
+    scrypt_limiter = CapacityLimiter(resolved_settings.scrypt_max_concurrency)
 
     @application.exception_handler(ServiceError)
     async def handle_service_error(_request: Request, exc: ServiceError) -> JSONResponse:
@@ -241,7 +279,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload.username.encode(),
             (resolved_settings.auth_username or "").encode(),
         )
-        password_match = verify_password(payload.password, resolved_settings.auth_password_hash)
+        async with scrypt_limiter:
+            password_match = await run_in_threadpool(
+                verify_password, payload.password, resolved_settings.auth_password_hash
+            )
         if not (username_match and password_match):
             raise ServiceError("INVALID_CREDENTIALS", "用户名或密码错误", status_code=401)
         token = sign_session(int(time.time()) + SESSION_TTL, _session_key(resolved_settings))
@@ -252,6 +293,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             httponly=True,
             samesite="lax",
             path="/",
+            secure=resolved_settings.cookie_secure,
         )
         return {"authenticated": True, "username": resolved_settings.auth_username}
 
@@ -458,7 +500,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if service is None:
             return {"status": "UNAVAILABLE", "reason": "该运行尚无 CGNS 产物", "blocks": []}
         try:
-            raw = await run_in_threadpool(service.manifest)
+            raw = await preview_gate.run(("manifest", run_id), service.manifest)
             return _public_manifest(raw)
         except Exception as exc:
             return _preview_failure_manifest(exc)
@@ -469,7 +511,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if service is None:
             raise ServiceError("PREVIEW_UNAVAILABLE", "该运行尚无 CGNS 产物", status_code=409)
         try:
-            path = await run_in_threadpool(service.block_asset, block, mode)
+            path = await preview_gate.run(
+                ("block", run_id, str(block), mode.lower()),
+                lambda: service.block_asset(block, mode),
+            )
         except Exception as exc:
             raise _preview_service_error(exc) from exc
         return FileResponse(path, media_type="application/vnd.vtk")
@@ -485,7 +530,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if service is None:
             raise ServiceError("PREVIEW_UNAVAILABLE", "该运行尚无 CGNS 产物", status_code=409)
         try:
-            path = await run_in_threadpool(service.slice_asset, block, axis, index)
+            path = await preview_gate.run(
+                ("slice", run_id, str(block), axis.upper(), int(index)),
+                lambda: service.slice_asset(
+                    block,
+                    axis,
+                    index,
+                    memory_budget_mb=resolved_settings.preview_memory_budget_mb,
+                    cache_limit_mb=resolved_settings.preview_cache_limit_mb,
+                ),
+            )
         except Exception as exc:
             raise _preview_service_error(exc) from exc
         return FileResponse(path, media_type="application/vnd.vtk")
@@ -690,4 +744,4 @@ if __name__ == "__main__":
     main()
 
 
-__all__ = ["app", "create_app", "main"]
+__all__ = ["_PreviewConversionGate", "app", "create_app", "main"]

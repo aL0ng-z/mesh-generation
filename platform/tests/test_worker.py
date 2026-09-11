@@ -123,6 +123,7 @@ def test_resource_gate_reserves_next_slot_and_checks_disk() -> None:
     )
     assert allowed.allowed is True
     assert allowed.reservation_gb == 5
+    assert allowed.postprocess_active is False
 
     memory_blocked = evaluate_resource_gate(
         available_memory_gb=12.99,
@@ -142,6 +143,21 @@ def test_resource_gate_reserves_next_slot_and_checks_disk() -> None:
     )
     assert disk_blocked.allowed is False
     assert disk_blocked.reason_code == "INSUFFICIENT_DISK"
+
+    # 活动后处理额外计入一份内存预留。
+    postprocess_extra = evaluate_resource_gate(
+        available_memory_gb=15.49,
+        free_disk_gb=100,
+        running_count=1,
+        memory_reservation_gb=2.5,
+        min_free_memory_gb=8,
+        min_free_disk_gb=20,
+        postprocess_active=True,
+    )
+    assert postprocess_extra.postprocess_active is True
+    assert postprocess_extra.reservation_gb == 7.5
+    assert postprocess_extra.allowed is False
+    assert postprocess_extra.reason_code == "INSUFFICIENT_MEMORY"
 
 
 def test_recover_stale_run_writes_failed_terminal_and_event(tmp_path: Path) -> None:
@@ -306,16 +322,17 @@ def test_worker_child_process_quality_fail_still_succeeds_and_heartbeats(tmp_pat
         max_upload_bytes=1024,
     )
     settings.ensure_directories()
-    always_allowed = lambda count: ResourceSnapshot(
+    always_allowed = lambda count, postprocess_active=False: ResourceSnapshot(
         available_memory_gb=100,
         free_disk_gb=100,
         running_count=count,
-        reservation_gb=2.5 * (count + 1),
+        reservation_gb=2.5 * (count + 1 + (1 if postprocess_active else 0)),
         min_free_memory_gb=8,
         min_free_disk_gb=20,
         allowed=True,
         reason_code=None,
         reason=None,
+        postprocess_active=postprocess_active,
     )
     worker = Worker(
         settings,
@@ -323,12 +340,12 @@ def test_worker_child_process_quality_fail_still_succeeds_and_heartbeats(tmp_pat
         worker_id="integration-worker",
         resource_probe=always_allowed,
     )
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         worker.run_once()
         with database.reading() as connection:
             row = connection.execute("SELECT * FROM runs WHERE id = ?", (run_ids[0],)).fetchone()
-        if row["status"] in {"SUCCEEDED", "FAILED"}:
+        if row["status"] in {"SUCCEEDED", "FAILED"} and row["postprocess_status"] == "COMPLETED":
             break
         time.sleep(0.05)
     else:
@@ -337,6 +354,10 @@ def test_worker_child_process_quality_fail_still_succeeds_and_heartbeats(tmp_pat
 
     assert row["status"] == "SUCCEEDED"
     assert row["quality_status"] == "FAIL"
+    assert row["postprocess_status"] == "COMPLETED"
+    assert row["postprocess_started_at"] is not None
+    assert row["postprocess_finished_at"] is not None
+    assert row["postprocess_error"] is None
     assert row["preview_status"] == "UNAVAILABLE"
     assert row["progress"] == 1
     with database.reading() as connection:
@@ -463,6 +484,21 @@ def test_worker_startup_recovers_succeeded_pending_postprocess(tmp_path: Path) -
     assert worker.run_once() is True
     with database.reading() as connection:
         row = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    # 恢复只把未完成后处理重新排队并投递独立子进程，不在启动路径同步转换。
+    assert row["status"] == "SUCCEEDED"
+    assert row["postprocess_status"] == "RUNNING"
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        worker.run_once()
+        with database.reading() as connection:
+            row = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row["postprocess_status"] in {"COMPLETED", "FAILED"}:
+            break
+        time.sleep(0.05)
+    else:
+        worker.shutdown()
+        pytest.fail("恢复的后处理未在期限内完成")
+    with database.reading() as connection:
         stages = [
             event[0]
             for event in connection.execute(
@@ -470,46 +506,11 @@ def test_worker_startup_recovers_succeeded_pending_postprocess(tmp_path: Path) -
             ).fetchall()
         ]
     assert row["status"] == "SUCCEEDED"
+    assert row["postprocess_status"] == "COMPLETED"
     assert row["preview_status"] == "UNAVAILABLE"
     assert "RECOVERY" in stages
     assert "PREVIEW" in stages
-
-
-def test_preview_blocking_section_keeps_other_running_jobs_alive(tmp_path: Path) -> None:
-    database = _database(tmp_path)
-    _, run_ids = _insert_session_and_runs(database, 1)
-    atomic_claim_run(database, "preview-worker", now="2026-08-06T00:00:00.000Z")
-    data_dir = tmp_path / "data"
-    settings = Settings(
-        project_root=PROJECT_ROOT,
-        platform_dir=PROJECT_ROOT / "platform",
-        data_dir=data_dir,
-        database_path=database.path,
-        migrations_dir=MIGRATIONS_DIR,
-        geometry_dir=data_dir / "geometries",
-        artifact_dir=data_dir / "artifacts",
-        preview_dir=data_dir / "previews",
-        ui_dist_dir=data_dir / "ui",
-        igg_path=None,
-        max_concurrency=20,
-        job_timeout_seconds=10,
-        busy_timeout_ms=10_000,
-        worker_stale_seconds=1,
-    )
-    settings.ensure_directories()
-    worker = Worker(settings, database=database, worker_id="preview-worker")
-    with database.reading() as connection:
-        before = connection.execute(
-            "SELECT heartbeat_at FROM runs WHERE id = ?", (run_ids[0],)
-        ).fetchone()[0]
-    with worker._heartbeats_during_preview():
-        time.sleep(0.8)
-    with database.reading() as connection:
-        after = connection.execute(
-            "SELECT heartbeat_at FROM runs WHERE id = ?", (run_ids[0],)
-        ).fetchone()[0]
-    assert after > before
-    assert recover_stale_runs(database, stale_after_seconds=1) == 0
+    assert "POSTPROCESS" in stages
 
 
 def test_online_backup_contains_consistent_database_and_artifact_manifest(tmp_path: Path) -> None:
@@ -558,17 +559,18 @@ def test_online_backup_contains_consistent_database_and_artifact_manifest(tmp_pa
     assert second["manifest"] != result["manifest"]
 
 
-def _always_allowed_probe(count: int) -> ResourceSnapshot:
+def _always_allowed_probe(count: int, postprocess_active: bool = False) -> ResourceSnapshot:
     return ResourceSnapshot(
         available_memory_gb=100,
         free_disk_gb=100,
         running_count=count,
-        reservation_gb=2.5 * (count + 1),
+        reservation_gb=2.5 * (count + 1 + (1 if postprocess_active else 0)),
         min_free_memory_gb=8,
         min_free_disk_gb=20,
         allowed=True,
         reason_code=None,
         reason=None,
+        postprocess_active=postprocess_active,
     )
 
 

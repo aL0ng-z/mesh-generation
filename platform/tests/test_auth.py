@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 import time
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+import mesh_app.api as api_module
 from mesh_app.api import create_app
 from mesh_app.auth import (
     SESSION_COOKIE,
@@ -292,6 +296,116 @@ def test_pairwise_env_rejected() -> None:
             {"MESH_AUTH_USERNAME": "", "MESH_AUTH_PASSWORD_HASH": "scrypt$1$1$1$aa$bb"},
             project_root=PROJECT_ROOT,
         )
+
+
+def install_slow_verify(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[threading.Event, dict[str, int]]:
+    """用可暂停的慢速桩替换 api 模块内的 verify_password，用于并发观测。
+
+    桩函数统计并发校验数与峰值，并阻塞在 release 事件上，由测试控制放行。
+    """
+    release = threading.Event()
+    state = {"active": 0, "peak": 0}
+    lock = threading.Lock()
+
+    def slow_verify(_password: str, _encoded: str) -> bool:
+        with lock:
+            state["active"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+        release.wait(timeout=10)
+        with lock:
+            state["active"] -= 1
+        return True
+
+    monkeypatch.setattr(api_module, "verify_password", slow_verify)
+    return release, state
+
+
+async def _concurrent_login_scenario(
+    application: object,
+    count: int,
+    release: threading.Event,
+    state: dict[str, int],
+    *,
+    measure_health: bool = False,
+) -> tuple[list[int], float]:
+    """在一个事件循环内并发发起 count 个登录，并（可选）测健康接口延迟。"""
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async def attempt() -> int:
+            response = await client.post(
+                "/api/auth/login", json={"username": "shared", "password": "x"}
+            )
+            return response.status_code
+
+        tasks = [asyncio.create_task(attempt()) for _ in range(count)]
+        # 等至少两个 scrypt 校验真正进入执行，确保登录压测已开始。
+        deadline = time.monotonic() + 5
+        while state["active"] < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert state["active"] >= 2
+
+        health_elapsed = 0.0
+        if measure_health:
+            started = time.monotonic()
+            health = await client.get("/api/health")
+            health_elapsed = time.monotonic() - started
+            assert health.status_code == 200
+
+        release.set()
+        statuses = await asyncio.gather(*tasks)
+        return statuses, health_elapsed
+
+
+def test_health_responsive_during_concurrent_logins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """并发登录期间 /api/health 保持快速响应：scrypt 不占用事件循环。"""
+    application = make_auth_app(tmp_path)
+    release, state = install_slow_verify(monkeypatch)
+    try:
+        statuses, health_elapsed = asyncio.run(
+            _concurrent_login_scenario(
+                application, 6, release, state, measure_health=True
+            )
+        )
+    finally:
+        release.set()
+    assert statuses == [200] * 6
+    assert health_elapsed < 1.0
+
+
+def test_scrypt_concurrency_limited_to_two(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """并发登录时 scrypt 校验并发峰值不超过 MESH_SCRYPT_MAX_CONCURRENCY（默认 2）。"""
+    application = make_auth_app(tmp_path, {"MESH_SCRYPT_MAX_CONCURRENCY": "2"})
+    release, state = install_slow_verify(monkeypatch)
+    try:
+        statuses, _health_elapsed = asyncio.run(
+            _concurrent_login_scenario(application, 8, release, state)
+        )
+    finally:
+        release.set()
+    assert statuses == [200] * 8
+    # 出现过并发（否则是串行实现），且峰值恰好被限制在 2。
+    assert state["peak"] == 2
+
+
+def test_login_cookie_secure_flag_follows_settings(tmp_path: Path) -> None:
+    """MESH_COOKIE_SECURE=false 时 Cookie 无 Secure；true 时带 Secure。"""
+    plain_app = make_auth_app(tmp_path, {"MESH_COOKIE_SECURE": "false"})
+    with TestClient(plain_app) as client:
+        response = login(client)
+        assert response.status_code == 200
+        assert "secure" not in response.headers.get("set-cookie", "").lower()
+
+    secure_app = make_auth_app(tmp_path, {"MESH_COOKIE_SECURE": "true"})
+    with TestClient(secure_app) as client:
+        response = login(client)
+        assert response.status_code == 200
+        assert "secure" in response.headers.get("set-cookie", "").lower()
 
 
 def test_unconfigured_auth_keeps_current_behavior(tmp_path: Path) -> None:

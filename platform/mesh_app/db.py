@@ -11,7 +11,7 @@ from typing import Iterator
 from .config import Settings
 
 
-LATEST_SCHEMA_VERSION = 1
+LATEST_SCHEMA_VERSION = 2
 
 
 class DatabaseVersionError(RuntimeError):

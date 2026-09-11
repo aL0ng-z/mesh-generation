@@ -103,7 +103,7 @@ def test_explicit_migration_and_connection_pragmas(tmp_path: Path) -> None:
     with pytest.raises(DatabaseVersionError):
         database.require_current()
 
-    assert database.migrate() == 1
+    assert database.migrate() == 2
     database.require_current()
     with database.reading() as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"

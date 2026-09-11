@@ -2,14 +2,14 @@
 
 Worker 只在资源门控通过后原子领取任务，以独立 Python 子进程调用
 ``src/mesh.py``。进程退出后一次性写入终态；网格质量 FAIL/UNKNOWN 不会被误判为
-执行失败，预览转换失败也只影响 ``preview_status``。
+执行失败。产物登记与预览转换由固定单并发的独立后处理子进程完成，主循环只负责
+监督网格进程、后处理超时、心跳、停止与新任务领取。
 """
 
 from __future__ import annotations
 
 import argparse
 import ctypes
-import hashlib
 import json
 import math
 import mimetypes
@@ -30,7 +30,6 @@ from typing import Any, Callable, IO, Iterator, Mapping, Sequence
 
 from .config import Settings
 from .db import Database, connect_database
-from .preview import prepare_preview
 from .windows_job import ManagedProcess, spawn_managed_process
 
 
@@ -59,6 +58,7 @@ class ResourceSnapshot:
     allowed: bool
     reason_code: str | None
     reason: str | None
+    postprocess_active: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -73,6 +73,20 @@ class _RunningTask:
     run_id: str
     session_id: str
     run_dir: Path
+    process: ManagedProcess
+    stdout_stream: IO[bytes]
+    stderr_stream: IO[bytes]
+    started_monotonic: float
+
+    def close_streams(self) -> None:
+        for stream in (self.stdout_stream, self.stderr_stream):
+            if not stream.closed:
+                stream.close()
+
+
+@dataclass
+class _PostprocessTask:
+    run_id: str
     process: ManagedProcess
     stdout_stream: IO[bytes]
     stderr_stream: IO[bytes]
@@ -132,15 +146,20 @@ def evaluate_resource_gate(
     memory_reservation_gb: float = 2.5,
     min_free_memory_gb: float = 8.0,
     min_free_disk_gb: float = 20.0,
+    postprocess_active: bool = False,
 ) -> ResourceSnapshot:
-    """按“现有槽位 + 下一槽位”的虚拟预留量判定能否领取。"""
+    """按“现有槽位 + 下一槽位”的虚拟预留量判定能否领取。
+
+    活动后处理额外计入一份内存预留，避免网格已 SUCCEEDED 后忽略仍在进行的
+    散列与预览转换占用的资源。
+    """
 
     if running_count < 0:
         raise ValueError("运行任务数不能为负数")
     values = (available_memory_gb, free_disk_gb, memory_reservation_gb, min_free_memory_gb, min_free_disk_gb)
     if any(not math.isfinite(value) or value < 0 for value in values):
         raise ValueError("资源门控参数必须是非负有限数")
-    reserved_for_next = memory_reservation_gb * (running_count + 1)
+    reserved_for_next = memory_reservation_gb * (running_count + 1 + (1 if postprocess_active else 0))
     required_memory = min_free_memory_gb + reserved_for_next
     if available_memory_gb < required_memory:
         allowed = False
@@ -167,6 +186,7 @@ def evaluate_resource_gate(
         allowed=allowed,
         reason_code=reason_code,
         reason=reason,
+        postprocess_active=postprocess_active,
     )
 
 
@@ -177,6 +197,7 @@ def probe_resources(
     memory_reservation_gb: float = 2.5,
     min_free_memory_gb: float = 8.0,
     min_free_disk_gb: float = 20.0,
+    postprocess_active: bool = False,
 ) -> ResourceSnapshot:
     """读取物理资源并套用可测试的纯门控函数。"""
 
@@ -191,6 +212,7 @@ def probe_resources(
         memory_reservation_gb=memory_reservation_gb,
         min_free_memory_gb=min_free_memory_gb,
         min_free_disk_gb=min_free_disk_gb,
+        postprocess_active=postprocess_active,
     )
 
 
@@ -418,7 +440,7 @@ class Worker:
         *,
         database: Database | None = None,
         worker_id: str | None = None,
-        resource_probe: Callable[[int], ResourceSnapshot] | None = None,
+        resource_probe: Callable[[int, bool], ResourceSnapshot] | None = None,
         license_backoff: LicenseBackoff | None = None,
     ) -> None:
         self.settings = settings
@@ -430,6 +452,8 @@ class Worker:
         self.resource_probe = resource_probe or self._default_resource_probe
         self.license_backoff = license_backoff or LicenseBackoff()
         self._tasks: dict[str, _RunningTask] = {}
+        self._postprocess_queue: list[str] = []
+        self._postprocess_task: _PostprocessTask | None = None
         self._started = False
         self._stop_requested = False
         self._last_heartbeat = 0.0
@@ -447,12 +471,15 @@ class Worker:
                 stale_after_seconds=self.settings.worker_stale_seconds,
                 busy_timeout_ms=self.settings.busy_timeout_ms,
             )
-            if self._recover_pending_previews():
+            if self._recover_pending_postprocess():
                 activity = True
             self._started = True
 
         if self._poll_tasks():
             activity = True
+        if self._supervise_postprocess():
+            activity = True
+        self._dispatch_postprocess()
         self._heartbeat(force=not self._last_heartbeat)
         if self._stop_requested or self.license_backoff.blocked():
             self._heartbeat(force=True, extra_status={"license_backoff_seconds": self.license_backoff.remaining()})
@@ -462,7 +489,7 @@ class Worker:
             running_count = _count_running(self.database)
             if running_count >= self.max_concurrency:
                 break
-            snapshot = self.resource_probe(running_count)
+            snapshot = self.resource_probe(running_count, self._postprocess_task is not None)
             self.last_resource_snapshot = snapshot
             if not snapshot.allowed:
                 self._heartbeat(force=True)
@@ -485,12 +512,24 @@ class Worker:
                     error_code="RUN_DIR_UNAVAILABLE",
                     error_message=self._sanitize(f"运行目录不可用：{exc}"),
                 )
+                set_postprocess_terminal(
+                    self.database,
+                    str(claimed["id"]),
+                    "COMPLETED",
+                    message="网格运行未启动，没有本运行的产物需要登记",
+                )
             except Exception as exc:
                 mark_run_failed(
                     self.database,
                     str(claimed["id"]),
                     error_code="WORKER_START_FAILED",
                     error_message=self._sanitize(f"无法启动网格子进程：{type(exc).__name__}: {exc}"),
+                )
+                set_postprocess_terminal(
+                    self.database,
+                    str(claimed["id"]),
+                    "COMPLETED",
+                    message="网格运行未启动，没有本运行的产物需要登记",
                 )
         self._heartbeat(force=activity)
         return activity
@@ -526,12 +565,20 @@ class Worker:
                 error_message="Worker 已停止，运行被安全终止；请创建重试节点。",
             )
             self._tasks.pop(run_id, None)
+        if self._postprocess_task is not None:
+            # 后处理保留 RUNNING 状态，由下次启动恢复重新排队；不写失败终态。
+            task = self._postprocess_task
+            task.process.terminate_tree(exit_code=1)
+            task.close_streams()
+            self._postprocess_task = None
+        self._postprocess_queue.clear()
         self._heartbeat(force=True, extra_status={"stopping": True})
 
-    def _default_resource_probe(self, running_count: int) -> ResourceSnapshot:
+    def _default_resource_probe(self, running_count: int, postprocess_active: bool = False) -> ResourceSnapshot:
         return probe_resources(
             self.settings.data_dir,
             running_count=running_count,
+            postprocess_active=postprocess_active,
             memory_reservation_gb=self.settings.memory_reservation_gb,
             min_free_memory_gb=self.settings.min_free_memory_gb,
             min_free_disk_gb=self.settings.min_free_disk_gb,
@@ -667,14 +714,8 @@ class Worker:
                     error_message=self._sanitize(error_message),
                     run_summary=summary,
                 )
-                with self._heartbeats_during_preview():
-                    _register_run_artifacts(
-                        self.database,
-                        self.settings.data_dir,
-                        task.session_id,
-                        run_id,
-                        task.run_dir,
-                    )
+            # 成功与失败运行的产物登记都进入固定单并发的后处理子进程通道。
+            self._postprocess_queue.append(run_id)
             self._tasks.pop(run_id, None)
         return activity
 
@@ -690,112 +731,136 @@ class Worker:
             quality=dict(quality),
             quality_status=quality_status,
         )
-        self._postprocess_succeeded_run(task.session_id, task.run_id, task.run_dir, summary)
 
-    def _recover_pending_previews(self) -> int:
-        """Worker 重启时继续处理已成功但尚未完成的预览。"""
+    def _recover_pending_postprocess(self) -> int:
+        """Worker 重启时把未完成的后处理重新排队；不在启动路径同步转换。"""
 
         with self.database.reading() as connection:
             rows = connection.execute(
                 """
-                SELECT id, session_id, run_summary_json
+                SELECT id
                 FROM runs
-                WHERE status = 'SUCCEEDED' AND preview_status = 'PENDING'
+                WHERE status IN ('SUCCEEDED', 'FAILED')
+                  AND postprocess_status IN ('PENDING', 'RUNNING')
                 ORDER BY finished_at, sequence
                 """
             ).fetchall()
         for row in rows:
             run_id = str(row["id"])
-            session_id = str(row["session_id"])
-            run_dir = _safe_child_path(self.settings.artifact_dir, session_id, run_id)
-            summary = _load_run_summary(run_dir)
-            if summary is None:
-                try:
-                    stored_summary = json.loads(str(row["run_summary_json"]))
-                except (TypeError, json.JSONDecodeError):
-                    stored_summary = {}
-                summary = stored_summary if isinstance(stored_summary, dict) else {}
-            append_run_event(
-                self.database,
-                run_id,
-                stage="RECOVERY",
-                level="INFO",
-                progress=1.0,
-                message="Worker 启动后恢复未完成的产物登记与预览后处理",
-                data={"preview_status": "PENDING"},
-            )
-            self._postprocess_succeeded_run(session_id, run_id, run_dir, summary)
+            timestamp = _timestamp()
+            with self.database.transaction(immediate=True) as connection:
+                # 上次中断遗留的 RUNNING 重置为 PENDING，稍后由专用通道重新投递。
+                connection.execute(
+                    """
+                    UPDATE runs SET postprocess_status = 'PENDING',
+                        postprocess_started_at = NULL, updated_at = ?
+                    WHERE id = ? AND postprocess_status = 'RUNNING'
+                    """,
+                    (timestamp, run_id),
+                )
+                _append_event_in_transaction(
+                    connection,
+                    run_id,
+                    stage="RECOVERY",
+                    level="INFO",
+                    progress=None,
+                    message="Worker 启动后恢复未完成的后处理，已重新排队",
+                    data={"postprocess_status": "PENDING"},
+                    timestamp=timestamp,
+                )
+            self._postprocess_queue.append(run_id)
         return len(rows)
 
-    def _postprocess_succeeded_run(
-        self,
-        session_id: str,
-        run_id: str,
-        run_dir: Path,
-        summary: Mapping[str, Any],
-    ) -> None:
+    def _dispatch_postprocess(self) -> bool:
+        """从队列投递一个后处理子进程；固定单并发。"""
+
+        if self._stop_requested or self._postprocess_task is not None or not self._postprocess_queue:
+            return False
+        run_id = self._postprocess_queue.pop(0)
+        if not mark_postprocess_running(self.database, run_id):
+            return True
+        log_dir = _safe_child_path(self.settings.data_dir, "logs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        # 后处理诊断不写入 run_dir，避免与产物登记混淆。
+        log_stream = (log_dir / f"postprocess-{run_id}.log").open("wb")
+        command = [sys.executable, "-m", "mesh_app.postprocess", run_id]
+        environment = dict(os.environ)
+        environment["PYTHONUNBUFFERED"] = "1"
+        environment["MESH_DATA_DIR"] = str(self.settings.data_dir)
+        environment["MESH_DATABASE_PATH"] = str(self.settings.database_path)
         try:
-            # 大型产物散列及 CGNS 表面/线框转换都可能持续数分钟。后处理本身保持
-            # 单线程以限制内存峰值，同时由轻量守护线程续写其他 RUNNING 任务心跳。
-            with self._heartbeats_during_preview():
-                _register_run_artifacts(
-                    self.database,
-                    self.settings.data_dir,
-                    session_id,
-                    run_id,
-                    run_dir,
-                )
-                cgns_path = _summary_cgns_path(summary, run_dir)
-                if cgns_path is None:
-                    _update_preview_status(
-                        self.database,
-                        run_id,
-                        "UNAVAILABLE",
-                        reason_code="CGNS_ARTIFACT_MISSING",
-                        message="运行成功，但没有可用于 Viewer 的 CGNS 产物。",
-                    )
-                    return
-                preview_cache = _safe_child_path(self.settings.preview_dir, run_id)
-                manifest = prepare_preview(cgns_path, preview_cache)
-                reason_code = str(manifest.get("reason_code") or "")
-                if manifest.get("available"):
-                    preview_status = "READY"
-                    message = "网格表面与结构线框预览已生成"
-                elif reason_code in {"ADF_UNSUPPORTED", "PREVIEW_DEPENDENCY_MISSING"}:
-                    preview_status = "UNAVAILABLE"
-                    message = str(manifest.get("reason") or "当前网格格式不支持 Viewer")
-                else:
-                    preview_status = "FAILED"
-                    message = str(manifest.get("reason") or "网格预览转换失败")
-                _register_preview_artifacts(
-                    self.database,
-                    self.settings.data_dir,
-                    session_id,
-                    run_id,
-                    preview_cache,
-                )
-                _update_preview_status(
-                    self.database,
-                    run_id,
-                    preview_status,
-                    reason_code=reason_code or None,
-                    message=self._sanitize(message),
-                )
-        except Exception as exc:
-            # 此时网格运行已经进入 SUCCEEDED；任何后处理问题只能降级 Viewer，
-            # 绝不能回写或覆盖网格终态。
-            try:
-                _update_preview_status(
-                    self.database,
-                    run_id,
-                    "FAILED",
-                    reason_code="POSTPROCESS_FAILED",
-                    message=self._sanitize(
-                        f"网格已成功，但产物登记或预览后处理失败：{type(exc).__name__}: {exc}"
-                    ),
-                )
-            except Exception:
-                pass
+            process = spawn_managed_process(
+                command,
+                cwd=self.settings.platform_dir,
+                env=environment,
+                stdout=log_stream,
+                stderr=log_stream,
+            )
+        except BaseException as exc:
+            log_stream.close()
+            set_postprocess_terminal(
+                self.database,
+                run_id,
+                "FAILED",
+                error=self._sanitize(f"无法启动后处理子进程：{type(exc).__name__}: {exc}"),
+                message="后处理子进程启动失败",
+            )
+            return True
+        self._postprocess_task = _PostprocessTask(
+            run_id=run_id,
+            process=process,
+            stdout_stream=log_stream,
+            stderr_stream=log_stream,
+            started_monotonic=time.monotonic(),
+        )
+        return True
+
+    def _supervise_postprocess(self) -> bool:
+        """轮询唯一活动的后处理子进程，执行外层超时与终态登记。"""
+
+        task = self._postprocess_task
+        if task is None:
+            return False
+        elapsed = time.monotonic() - task.started_monotonic
+        timed_out = elapsed > self.settings.postprocess_timeout_seconds
+        returncode = task.process.poll()
+        if returncode is None and not timed_out:
+            return False
+        if timed_out and returncode is None:
+            task.process.terminate_tree(exit_code=1)
+            returncode = task.process.returncode if task.process.returncode is not None else 1
+            set_postprocess_terminal(
+                self.database,
+                task.run_id,
+                "FAILED",
+                error=f"后处理超时：超过 {self.settings.postprocess_timeout_seconds} 秒，进程树已终止。",
+                message="后处理超时，进程树已终止",
+            )
+        elif returncode == 0:
+            task.process.close()
+            set_postprocess_terminal(
+                self.database,
+                task.run_id,
+                "COMPLETED",
+                message="后处理完成",
+            )
+        else:
+            task.process.close()
+            detail = _last_nonempty_line(
+                _read_tail(_safe_child_path(self.settings.data_dir, "logs") / f"postprocess-{task.run_id}.log")
+            )
+            set_postprocess_terminal(
+                self.database,
+                task.run_id,
+                "FAILED",
+                error=self._sanitize(
+                    f"后处理子进程执行失败：{detail}" if detail else "后处理子进程执行失败"
+                ),
+                message="后处理子进程执行失败",
+            )
+        task.close_streams()
+        self._postprocess_task = None
+        return True
 
     def _heartbeat(self, *, force: bool = False, extra_status: Mapping[str, Any] | None = None) -> None:
         with self._heartbeat_lock:
@@ -841,32 +906,6 @@ class Worker:
                     (timestamp, timestamp, self.worker_id),
                 )
             self._last_heartbeat = current
-
-    @contextmanager
-    def _heartbeats_during_preview(self) -> Iterator[None]:
-        stop = threading.Event()
-
-        def keep_alive() -> None:
-            while not stop.wait(self._heartbeat_interval):
-                try:
-                    self._heartbeat(force=True, extra_status={"stage": "POSTPROCESS"})
-                except Exception:
-                    # 预览主线程最终仍会写入终态/错误；一次瞬态数据库忙不应
-                    # 终止转换，下一心跳周期会继续尝试。
-                    continue
-
-        thread = threading.Thread(
-            target=keep_alive,
-            name=f"preview-heartbeat-{self.worker_id}",
-            daemon=True,
-        )
-        thread.start()
-        try:
-            yield
-        finally:
-            stop.set()
-            thread.join(timeout=min(self._heartbeat_interval + 1.0, 10.0))
-            self._heartbeat(force=True)
 
     def _sanitize(self, message: str) -> str:
         result = message.replace(str(self.settings.data_dir), "<DATA_DIR>")
@@ -987,6 +1026,94 @@ def mark_run_failed(
             raise
 
 
+def mark_postprocess_running(
+    database: Database | sqlite3.Connection | str | os.PathLike[str],
+    run_id: str,
+    now: datetime | str | None = None,
+) -> bool:
+    """把 PENDING 的后处理原子推进到 RUNNING 并记录开始时间。"""
+
+    timestamp = _timestamp(now)
+    with _connection(database) as connection:
+        _begin_immediate(connection)
+        try:
+            updated = connection.execute(
+                """
+                UPDATE runs SET postprocess_status = 'RUNNING',
+                    postprocess_started_at = ?, updated_at = ?
+                WHERE id = ? AND postprocess_status = 'PENDING'
+                """,
+                (timestamp, timestamp, run_id),
+            )
+            if updated.rowcount != 1:
+                connection.rollback()
+                return False
+            _append_event_in_transaction(
+                connection,
+                run_id,
+                stage="POSTPROCESS",
+                level="INFO",
+                progress=None,
+                message="已启动独立后处理子进程",
+                data={"postprocess_status": "RUNNING"},
+                timestamp=timestamp,
+            )
+            connection.commit()
+            return True
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
+
+def set_postprocess_terminal(
+    database: Database | sqlite3.Connection | str | os.PathLike[str],
+    run_id: str,
+    status: str,
+    *,
+    error: str | None = None,
+    message: str,
+    now: datetime | str | None = None,
+) -> bool:
+    """写入后处理终态（COMPLETED/FAILED）并追加 POSTPROCESS 事件。"""
+
+    if status not in {"COMPLETED", "FAILED"}:
+        raise ValueError("后处理终态无效")
+    timestamp = _timestamp(now)
+    safe_message = _sanitize_text(message)
+    safe_error = _sanitize_text(error) if error else None
+    with _connection(database) as connection:
+        _begin_immediate(connection)
+        try:
+            updated = connection.execute(
+                """
+                UPDATE runs SET postprocess_status = ?, postprocess_finished_at = ?,
+                    postprocess_error = ?, updated_at = ?
+                WHERE id = ? AND postprocess_status IN ('PENDING', 'RUNNING')
+                """,
+                (status, timestamp, safe_error, timestamp, run_id),
+            )
+            if updated.rowcount != 1:
+                connection.rollback()
+                return False
+            _append_event_in_transaction(
+                connection,
+                run_id,
+                stage="POSTPROCESS",
+                level="INFO" if status == "COMPLETED" else "ERROR",
+                progress=None,
+                message=safe_message,
+                data={"postprocess_status": status},
+                timestamp=timestamp,
+            )
+            connection.commit()
+            return True
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
+
 def append_run_event(
     database: Database | sqlite3.Connection | str | os.PathLike[str],
     run_id: str,
@@ -1019,131 +1146,6 @@ def append_run_event(
             if connection.in_transaction:
                 connection.rollback()
             raise
-
-
-def _update_preview_status(
-    database: Database,
-    run_id: str,
-    status: str,
-    *,
-    reason_code: str | None,
-    message: str,
-) -> None:
-    if status not in {"READY", "UNAVAILABLE", "FAILED"}:
-        raise ValueError("预览状态无效")
-    timestamp = _timestamp()
-    with database.transaction(immediate=True) as connection:
-        connection.execute(
-            "UPDATE runs SET preview_status = ?, updated_at = ? WHERE id = ? AND status = 'SUCCEEDED'",
-            (status, timestamp, run_id),
-        )
-        _append_event_in_transaction(
-            connection,
-            run_id,
-            stage="PREVIEW",
-            level="INFO" if status == "READY" else "WARNING",
-            progress=1.0,
-            message=message,
-            data={"preview_status": status, "reason_code": reason_code},
-            timestamp=timestamp,
-        )
-
-
-def _register_run_artifacts(
-    database: Database,
-    data_dir: Path,
-    session_id: str,
-    run_id: str,
-    run_dir: Path,
-) -> None:
-    kinds = {
-        ".cgns": ("CGNS", "application/x-cgns"),
-        ".trb": ("TRB", "application/octet-stream"),
-        ".igg": ("IGG", "application/octet-stream"),
-        ".bcs": ("BCS", "text/plain; charset=utf-8"),
-        ".info": ("INFO", "text/plain; charset=utf-8"),
-        ".geom": ("GEOM", "application/octet-stream"),
-        ".qualityreport": ("QUALITY_REPORT", "text/plain; charset=utf-8"),
-        ".md": ("REPORT", "text/markdown; charset=utf-8"),
-        ".json": ("RUN_SUMMARY", "application/json"),
-        ".log": ("LOG", "text/plain; charset=utf-8"),
-        ".geomturbo": ("GEOMETRY", "text/plain; charset=utf-8"),
-    }
-    candidates = [path for path in run_dir.iterdir() if path.is_file() and path.suffix.lower() in kinds]
-    _insert_artifacts(database, data_dir, session_id, run_id, candidates, kinds)
-
-
-def _register_preview_artifacts(
-    database: Database,
-    data_dir: Path,
-    session_id: str,
-    run_id: str,
-    preview_dir: Path,
-) -> None:
-    if not preview_dir.is_dir():
-        return
-    candidates = list(preview_dir.rglob("*.vtp"))
-    kind_map: dict[str, tuple[str, str]] = {}
-    for path in candidates:
-        if path.name == "surface.vtp":
-            kind = "PREVIEW_SURFACE"
-        elif path.name == "wireframe.vtp":
-            kind = "PREVIEW_WIREFRAME"
-        else:
-            kind = "PREVIEW_SLICE"
-        kind_map[str(path.resolve())] = (kind, "application/vnd.vtk.vtp+xml")
-    _insert_artifacts(database, data_dir, session_id, run_id, candidates, kind_map, key_by_path=True)
-
-
-def _insert_artifacts(
-    database: Database,
-    data_dir: Path,
-    session_id: str,
-    run_id: str,
-    paths: Sequence[Path],
-    kinds: Mapping[str, tuple[str, str]],
-    *,
-    key_by_path: bool = False,
-) -> None:
-    records = []
-    root = data_dir.resolve()
-    for path in paths:
-        resolved = path.resolve()
-        try:
-            relative = resolved.relative_to(root).as_posix()
-        except ValueError:
-            continue
-        key = str(resolved) if key_by_path else path.suffix.lower()
-        kind_mime = kinds.get(key)
-        if kind_mime is None:
-            continue
-        stat = resolved.stat()
-        records.append(
-            (
-                str(uuid.uuid4()),
-                session_id,
-                run_id,
-                kind_mime[0],
-                path.name,
-                relative,
-                _sha256_file(resolved),
-                stat.st_size,
-                kind_mime[1],
-                _timestamp(),
-            )
-        )
-    if not records:
-        return
-    with database.transaction(immediate=True) as connection:
-        connection.executemany(
-            """
-            INSERT OR IGNORE INTO artifacts (
-                id, session_id, run_id, kind, display_name, relative_path,
-                sha256, size_bytes, mime_type, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            records,
-        )
 
 
 def _append_event_in_transaction(
@@ -1278,22 +1280,6 @@ def _load_run_summary(run_dir: Path) -> dict[str, Any] | None:
     return value if schema_version in {3, 4} else None
 
 
-def _summary_cgns_path(summary: Mapping[str, Any], run_dir: Path) -> Path | None:
-    outputs = ((summary.get("autogrid") or {}).get("outputs") or {}) if isinstance(summary.get("autogrid"), Mapping) else {}
-    raw = outputs.get("cgns") if isinstance(outputs, Mapping) else None
-    candidates = [Path(raw)] if isinstance(raw, str) else []
-    candidates.append(run_dir / "mesh.cgns")
-    for candidate in candidates:
-        resolved = candidate if candidate.is_absolute() else (run_dir / candidate)
-        if resolved.is_file() and resolved.stat().st_size > 0:
-            try:
-                resolved.resolve().relative_to(run_dir.resolve())
-            except ValueError:
-                continue
-            return resolved.resolve()
-    return None
-
-
 def _summary_error(summary: Mapping[str, Any] | None) -> str | None:
     if not summary:
         return None
@@ -1333,14 +1319,6 @@ def _sanitize_text(text: str, max_length: int = 2000) -> str:
 
 def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _available_memory_bytes() -> int:
@@ -1451,9 +1429,11 @@ __all__ = [
     "control_snapshot_to_assignments",
     "evaluate_resource_gate",
     "is_license_failure",
+    "mark_postprocess_running",
     "mark_run_failed",
     "mark_run_succeeded",
     "probe_resources",
     "recover_stale_runs",
     "repair_stale_runs",
+    "set_postprocess_terminal",
 ]

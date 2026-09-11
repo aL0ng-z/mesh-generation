@@ -34,6 +34,18 @@ def _env_float(env: Mapping[str, str], name: str, default: float, *, minimum: fl
     return value
 
 
+def _env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return default
+    lowered = raw.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"环境变量 {name} 必须是布尔值（true/false）")
+
+
 def _path_from_env(env: Mapping[str, str], name: str, default: Path) -> Path:
     raw = env.get(name)
     return Path(raw).expanduser().resolve() if raw and raw.strip() else default.resolve()
@@ -63,6 +75,11 @@ class Settings:
     busy_timeout_ms: int = 5000
     worker_stale_seconds: int = 30
     max_upload_bytes: int = 512 * 1024 * 1024
+    postprocess_timeout_seconds: int = 600
+    preview_memory_budget_mb: int = 512
+    preview_cache_limit_mb: int = 1024
+    scrypt_max_concurrency: int = 2
+    cookie_secure: bool = False
 
     @classmethod
     def from_env(
@@ -121,6 +138,19 @@ class Settings:
                 512 * 1024 * 1024,
                 minimum=1,
             ),
+            postprocess_timeout_seconds=_env_int(
+                env, "MESH_POSTPROCESS_TIMEOUT_SECONDS", 600, minimum=1
+            ),
+            preview_memory_budget_mb=_env_int(
+                env, "MESH_PREVIEW_MEMORY_BUDGET_MB", 512, minimum=1
+            ),
+            preview_cache_limit_mb=_env_int(
+                env, "MESH_PREVIEW_CACHE_LIMIT_MB", 1024, minimum=1
+            ),
+            scrypt_max_concurrency=_env_int(
+                env, "MESH_SCRYPT_MAX_CONCURRENCY", 2, minimum=1
+            ),
+            cookie_secure=_env_bool(env, "MESH_COOKIE_SECURE", False),
         )
 
     def ensure_directories(self) -> None:
