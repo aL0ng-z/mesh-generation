@@ -1,0 +1,46 @@
+GEOMETRY TURBO
+VERSION     5.9
+UNITS       Meters
+UNITS-FACTOR 1
+NI_BEGIN nirow
+  NAME          fan_stage
+  PERIODICITY   11
+  NI_BEGIN NIBlade
+    NAME fan_main
+    NI_BEGIN NITipGap
+      WIDTH_AT_LEADING_EDGE 0.0002
+    NI_END NITipGap
+    NI_BEGIN nibladegeometry
+      number_of_blades 11
+    NI_END nibladegeometry
+  NI_END NIBlade
+  NI_BEGIN NIBlade
+    NAME fan_splitter
+    NI_BEGIN NITipGap
+    NI_END NITipGap
+    NI_BEGIN nibladegeometry
+      number_of_blades 11
+    NI_END nibladegeometry
+  NI_END NIBlade
+NI_END nirow
+NI_BEGIN nirow
+  NAME          vaned_diffuser
+  PERIODICITY   23
+  NI_BEGIN NIBlade
+    NAME diffuser_vane
+    NI_BEGIN nibladegeometry
+      number_of_blades 23
+    NI_END nibladegeometry
+  NI_END NIBlade
+NI_END nirow
+NI_BEGIN nirow
+  NAME          exit_guide_vane
+  PERIODICITY   65
+  NI_BEGIN NIBlade
+    NAME guide_vane
+    NI_BEGIN nibladegeometry
+      number_of_blades 65
+    NI_END nibladegeometry
+  NI_END NIBlade
+NI_END nirow
+NI_END GEOMTURBO

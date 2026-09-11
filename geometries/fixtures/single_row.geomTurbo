@@ -1,0 +1,65 @@
+GEOMETRY TURBO
+VERSION     5.4
+UNITS       Meters
+UNITS-FACTOR 1
+NI_BEGIN CHANNEL
+  NI_BEGIN basic_curve
+    NAME hub
+    DISCRETISATION 5
+    NI_BEGIN zrcurve
+      ZR polyline
+      3
+      0.10   0.30
+      0.20   0.31
+      0.30   0.32
+    NI_END zrcurve
+  NI_END basic_curve
+  NI_BEGIN basic_curve
+    NAME shroud
+    DISCRETISATION 5
+    NI_BEGIN zrcurve
+      ZR polyline
+      3
+      0.10   0.50
+      0.20   0.51
+      0.30   0.52
+    NI_END zrcurve
+  NI_END basic_curve
+NI_END CHANNEL
+NI_BEGIN nirow
+  NAME          axial_fan
+  TYPE          normal
+  PERIODICITY   36
+  ROTATION_SPEED -12000
+  NI_BEGIN NINonAxiSurfaces hub
+    NAME non axisymmetric hub
+    REPETITION 0
+  NI_END NINonAxiSurfaces hub
+  NI_BEGIN NINonAxiSurfaces shroud
+    NAME non axisymmetric shroud
+    REPETITION 0
+  NI_END NINonAxiSurfaces shroud
+  NI_BEGIN NINonAxiSurfaces tip_gap
+    NAME non axisymmetric tip gap
+    REPETITION 0
+  NI_END NINonAxiSurfaces tip_gap
+  NI_BEGIN NIBlade
+    NAME Fan Blade
+    NI_BEGIN NITipGap
+      WIDTH_AT_LEADING_EDGE  0.00035
+      WIDTH_AT_TRAILING_EDGE 0.00035
+    NI_END NITipGap
+    NI_BEGIN nibladegeometry
+      number_of_blades 36
+      NI_BEGIN zrcurve
+        ZR polyline
+        4
+        -0.05   0.30
+        -0.01   0.32
+        0.05    0.38
+        0.10    0.44
+      NI_END zrcurve
+    NI_END nibladegeometry
+  NI_END NIBlade
+NI_END nirow
+NI_END GEOMTURBO

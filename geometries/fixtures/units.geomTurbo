@@ -1,0 +1,15 @@
+GEOMETRY TURBO
+VERSION     5.9
+UNITS       Millimeters
+UNITS-FACTOR 0.001
+NI_BEGIN nirow
+  NAME          unit_probe_row
+  PERIODICITY   4
+  NI_BEGIN NIBlade
+    NAME Probe Blade
+    NI_BEGIN nibladegeometry
+      number_of_blades 4
+    NI_END nibladegeometry
+  NI_END NIBlade
+NI_END nirow
+NI_END GEOMTURBO

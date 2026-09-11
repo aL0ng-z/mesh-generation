@@ -1,0 +1,23 @@
+GEOMETRY TURBO
+VERSION     5.9
+UNITS       Meters
+UNITS-FACTOR 1
+NI_BEGIN nirow
+  NAME          rotor_with_fillets
+  PERIODICITY   16
+  NI_BEGIN NIBlade
+    NAME Rotor Blade
+    NI_BEGIN NITipGap
+    NI_END NITipGap
+    NI_BEGIN NIHubFillet
+      RADIUS 0.002
+    NI_END NIHubFillet
+    NI_BEGIN NIShroudFillet
+      RADIUS 0.001
+    NI_END NIShroudFillet
+    NI_BEGIN nibladegeometry
+      number_of_blades 16
+    NI_END nibladegeometry
+  NI_END NIBlade
+NI_END nirow
+NI_END GEOMTURBO

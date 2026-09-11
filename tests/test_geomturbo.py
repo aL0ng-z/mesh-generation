@@ -12,6 +12,8 @@ SOURCE_DIR = ROOT / "src"
 if str(SOURCE_DIR) not in sys.path:
     sys.path.insert(0, str(SOURCE_DIR))
 
+FIXTURES_DIR = ROOT / "geometries" / "fixtures"
+
 from geomturbo import (  # noqa: E402
     MAX_BLADES_PER_ROW,
     MAX_IDENTIFIER_CHARS,
@@ -24,9 +26,12 @@ from geomturbo import (  # noqa: E402
 
 
 class GeomTurboParserTests(unittest.TestCase):
+    """普通单测只依赖 geometries/fixtures/ 下的小型合成夹具。"""
+
     def test_parser_streams_file_without_read_text(self) -> None:
+        fixture = FIXTURES_DIR / "single_row.geomTurbo"
         with mock.patch.object(Path, "read_text", side_effect=AssertionError("不应整文件读取")) as read_text:
-            summary = parse_geomturbo(ROOT / "geometries" / "Rotor37.geomTurbo")
+            summary = parse_geomturbo(fixture)
 
         read_text.assert_not_called()
         self.assertEqual(summary.version, "5.4")
@@ -81,40 +86,72 @@ NI_END nirow
         self.assertIsNone(summary.rows[0].periodicity)
         self.assertIsNone(summary.rows[0].blades[0].number_of_blades)
 
-    def test_rotor37_summary(self) -> None:
-        summary = parse_geomturbo(ROOT / "geometries" / "Rotor37.geomTurbo")
+    def test_single_row_fixture_summary(self) -> None:
+        summary = parse_geomturbo(FIXTURES_DIR / "single_row.geomTurbo")
 
+        self.assertEqual(summary.version, "5.4")
+        self.assertEqual(summary.units, "Meters")
+        self.assertEqual(summary.units_factor, 1.0)
         self.assertEqual(summary.row_count, 1)
         self.assertFalse(summary.multi_row)
         self.assertFalse(summary.has_splitter)
         self.assertTrue(summary.has_tip_gap)
-        self.assertEqual(summary.rows[0].name, "row 1")
-        self.assertEqual(summary.rows[0].main_blades, 36)
+        self.assertEqual(summary.rows[0].name, "axial_fan")
         self.assertEqual(summary.rows[0].periodicity, 36)
+        self.assertEqual(summary.rows[0].main_blades, 36)
         self.assertEqual(summary.rows[0].blades[0].gap_sides, ("shroud",))
 
-    def test_wp100_summary(self) -> None:
-        summary = parse_geomturbo(ROOT / "geometries" / "WP100_comp.geomTurbo")
+    def test_multi_row_fixture_summary(self) -> None:
+        summary = parse_geomturbo(FIXTURES_DIR / "multi_row.geomTurbo")
 
         self.assertEqual(summary.row_count, 3)
         self.assertTrue(summary.multi_row)
         self.assertTrue(summary.has_splitter)
         self.assertTrue(summary.has_tip_gap)
-        self.assertEqual([row.name for row in summary.rows], ["impeller", "diffuser_radial", "diffuser_axial"])
+        self.assertEqual(
+            [row.name for row in summary.rows],
+            ["fan_stage", "vaned_diffuser", "exit_guide_vane"],
+        )
         self.assertEqual(summary.rows[0].main_blades, 11)
         self.assertTrue(summary.rows[0].has_splitter)
         self.assertEqual(len(summary.rows[0].blades), 2)
         self.assertFalse(summary.rows[1].has_splitter)
-        self.assertEqual(summary.units_factor, 0.001)
         self.assertEqual(summary.rows[0].blades[0].gap_sides, ("shroud",))
+        self.assertEqual(summary.rows[1].main_blades, 23)
 
-    def test_ori1_existing_fillet_side_is_discovered(self) -> None:
-        summary = parse_geomturbo(ROOT / "geometries" / "ori1.geomTurbo")
+    def test_splitter_fixture_detected_by_blade_name(self) -> None:
+        summary = parse_geomturbo(FIXTURES_DIR / "splitter.geomTurbo")
 
-        rotor = summary.rows[1]
-        self.assertEqual(rotor.name, "Rotor")
-        self.assertEqual(rotor.blades[0].gap_sides, ("shroud",))
-        self.assertEqual(rotor.blades[0].fillet_sides, ("hub",))
+        self.assertEqual(summary.row_count, 1)
+        self.assertFalse(summary.multi_row)
+        self.assertTrue(summary.has_splitter)
+        self.assertEqual(len(summary.rows[0].blades), 1)
+        self.assertEqual(summary.rows[0].blades[0].name, "splitter_blade")
+        self.assertFalse(summary.has_tip_gap)
+
+    def test_gap_fixture_sides(self) -> None:
+        summary = parse_geomturbo(FIXTURES_DIR / "gap.geomTurbo")
+
+        blade = summary.rows[0].blades[0]
+        self.assertEqual(blade.gap_sides, ("shroud", "hub"))
+        self.assertEqual(blade.partial_gap_sides, ("shroud", "hub"))
+        self.assertTrue(blade.has_tip_gap)
+        self.assertTrue(summary.rows[0].has_tip_gap)
+        self.assertEqual(blade.fillet_sides, ())
+
+    def test_fillet_fixture_sides(self) -> None:
+        summary = parse_geomturbo(FIXTURES_DIR / "fillet.geomTurbo")
+
+        blade = summary.rows[0].blades[0]
+        self.assertEqual(blade.fillet_sides, ("hub", "shroud"))
+        self.assertEqual(blade.gap_sides, ("shroud",))
+
+    def test_units_fixture_declarations(self) -> None:
+        summary = parse_geomturbo(FIXTURES_DIR / "units.geomTurbo")
+
+        self.assertEqual(summary.units, "Millimeters")
+        self.assertEqual(summary.units_factor, 0.001)
+        self.assertEqual(summary.row_count, 1)
 
 
 if __name__ == "__main__":

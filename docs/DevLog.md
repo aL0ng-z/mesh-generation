@@ -1,5 +1,22 @@
 # 开发日志
 
+## 2026-09-11：CR-10 可分发测试基线与合成几何夹具
+
+### 夹具与忽略规则
+
+- 在 `geometries/fixtures/` 新增 6 个小型合成 `.geomTurbo` 夹具（single_row / multi_row / splitter / gap / fillet / units，305 B～1.4 KB），覆盖单排、多排、splitter、gap、fillet 侧别与 UNITS/UNITS-FACTOR 单位解析；内容为虚构合成数据，不包含真实工程几何。
+- `.gitignore` 由整体忽略 `geometries/` 改为 `geometries/*` 加放行 `!geometries/fixtures/`；`git check-ignore` 验证四个真实几何（Rotor37/ori1/WP100_comp/WP100_turb）仍被忽略，夹具可正常提交。
+
+### 测试改造
+
+- `tests/test_geomturbo.py` 普通单测全部改用合成夹具（流式解析、多排、splitter、gap、fillet、单位声明），不再直接依赖真实几何。
+- 真实工程几何测试移入 `tests/test_geomturbo_integration.py`，通过环境变量 `GEOMTURBO_TEST_GEOMETRIES_DIR` 指定几何目录（默认 `geometries/`），文件缺失时 `unittest.skipUnless` 明确跳过并说明放置路径。
+
+### 验证
+
+- 根测试 `python -m unittest discover -s tests` 共 23 项全部通过（含集成测试实际执行 3 项）。
+- 将 `GEOMTURBO_TEST_GEOMETRIES_DIR` 指向不存在目录复验：集成测试 3 项正确跳过（skipped=3），恢复后重新实际执行通过。
+
 ## 2026-09-09：清理临时产物并新增新机器部署指南
 
 ### 清理

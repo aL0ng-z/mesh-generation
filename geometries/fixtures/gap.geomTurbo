@@ -1,0 +1,25 @@
+GEOMETRY TURBO
+VERSION     5.9
+UNITS       Meters
+UNITS-FACTOR 1
+NI_BEGIN nirow
+  NAME          shrouded_turbine
+  PERIODICITY   15
+  NI_BEGIN NIBlade
+    NAME Turbine Blade
+    NI_BEGIN NITipGap
+      WIDTH_AT_LEADING_EDGE 0.0004
+    NI_END NITipGap
+    NI_BEGIN NIHubGap
+      WIDTH_AT_LEADING_EDGE 0.0003
+    NI_END NIHubGap
+    NI_BEGIN NITipPartialGap
+    NI_END NITipPartialGap
+    NI_BEGIN NIHubPartialGap
+    NI_END NIHubPartialGap
+    NI_BEGIN nibladegeometry
+      number_of_blades 15
+    NI_END nibladegeometry
+  NI_END NIBlade
+NI_END nirow
+NI_END GEOMTURBO
