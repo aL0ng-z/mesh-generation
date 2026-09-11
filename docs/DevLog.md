@@ -1,5 +1,28 @@
 # 开发日志
 
+## 2026-09-11：批次⑤ 依赖更新、文档同步与实机验收
+
+### 依赖更新
+
+- `@kitware/vtk.js` 36.6.0 → 36.12.0（其精确依赖 fflate 0.7.3 → 0.7.5），`vitest` 4.1.10 → 4.1.11；传递依赖 `js-yaml` 4.3.1 → 4.3.2、`nanoid` 3.3.17 → 3.3.19（均在声明范围内到达或超过目标版本）；react-router 保持 7.18.2（已覆盖 GHSA-qwww-vcr4-c8h2）。
+- `npm audit` 由 6 个漏洞（4 moderate、2 high）降至 0；前端测试 58 项、typecheck、lint、build 全部通过。
+
+### 文档同步
+
+- 五个文档按已落地实现更新 27 处：质量校验先行与 `quality_validation` 三态（QUALITY_CRITERIA）、启用谓词语义与 200/9 建议值（MESH_CONTROL_ITEMS）、事件协议/目录占用/Schema v4 与返回码（SOURCE_CODE_GUIDE）、迁移 0002 与新环境变量（SETUP_GUIDE、platform/README）、HTTPS Cookie 与"产物清单不能替代文件备份"（README）。
+- 更新过时的 react-router 告警说明；历史文档与 DevLog 旧条目中的 Schema 3 表述按保留历史原则不改。
+
+### 实机验收（本机 AutoGrid 17.1，Rotor37）
+
+- 迁移前备份真实数据库与产物（`runs/platform-dev/backup-*`）；执行迁移 0002 后 user_version=2，`db check` 通过。
+- 平台闭环：上传 Rotor37 建立会话，基线 + 4 个代表性组合（optimization.steps=100/300、b2b.default.type=streamwise + throat_points=7/11）全部 SUCCEEDED（真实网格生成约 26 秒/运行）。
+- 调用与回读：steps 回读 100/300 与 throat_points 回读 7/11 全部 `VERIFIED`（枚举按注册表归一化）；质量记录 steps 组合 PASS、throat 组合 FAIL（"Maximum expansion ratio above hard limit"）——符合"不要求每个组合质量 PASS"，且 FAIL 运行 `sample_eligibility.eligible=true`（有效失败经验）。
+- v4 证据完整：完成事件 run_id/stage 匹配、protocol_errors 空、sources（git commit、src 五模块签名、344 键注册表签名、质量规则版本 1、厂商版本 17.1）、manifest 8 项产物；`sample_eligibility` 合格且无原因。
+- 后处理独立子进程 COMPLETED（约 2 秒），预览 READY（9 个 block），切片 HTTP 200；事件流完整呈现 ENQUEUE_SOURCE → QUEUE → MESH → POSTPROCESS → PREVIEW → 完成。
+- 代表 CGNS（35.8 MB）预览转换测量：表面+线框 1.54 秒、切片 0.06 秒、OS 跟踪峰值工作集 78.7 MiB，远低于 512 MiB 工作内存预算。
+- 停机清理验证：端口释放、无残留 igg 进程；Windows Job Object 清理已在批次③实机验证。
+- 同草稿解锁实机验证：草稿内设置 b2b.default.type=streamwise 后 throat_points 的 effective_availability 变为 EDITABLE；steps=100/300、throat=7/11 草稿均 valid 且无 required_clears。
+
 ## 2026-09-11：批次④ 交互与领域（CR-05~06、CR-11、D-01）
 
 ### D-01：分离启用条件和实验取值
