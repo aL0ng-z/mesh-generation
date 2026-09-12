@@ -103,7 +103,7 @@ def test_explicit_migration_and_connection_pragmas(tmp_path: Path) -> None:
     with pytest.raises(DatabaseVersionError):
         database.require_current()
 
-    assert database.migrate() == 2
+    assert database.migrate() == 3
     database.require_current()
     with database.reading() as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
@@ -115,6 +115,39 @@ def test_explicit_migration_and_connection_pragmas(tmp_path: Path) -> None:
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
     assert {"sessions", "runs", "artifacts", "run_events", "workers"}.issubset(tables)
+
+
+def test_v3_migration_only_closes_failed_postprocess_pending_preview(tmp_path: Path) -> None:
+    database = Database(tmp_path / "mesh.sqlite3")
+    assert database.migrate(target_version=2) == 2
+    cases = [("FAILED", "PENDING"), ("FAILED", "READY"), ("FAILED", "UNAVAILABLE"), ("RUNNING", "PENDING")]
+    before = {}
+    for postprocess_status, preview_status in cases:
+        relative = f"geometries/{postprocess_status}-{preview_status}/source.geomTurbo"
+        detail = SessionService(database).create_session(
+            title="迁移测试", expert_name=None, source_filename="case.geomTurbo",
+            geometry_sha256="a" * 64, geometry_relative_path=relative,
+            geometry_summary=geometry_summary(relative),
+        )
+        run_id = detail["runs"][0]["id"]
+        transition(database, run_id, "RUNNING")
+        transition(database, run_id, "SUCCEEDED")
+        with database.transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE runs SET postprocess_status = ?, preview_status = ? WHERE id = ?",
+                (postprocess_status, preview_status, run_id),
+            )
+            before[run_id] = dict(connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone())
+    assert database.migrate() == 3
+    with database.reading() as connection:
+        for run_id, previous in before.items():
+            after = dict(connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone())
+            repaired = previous["postprocess_status"] == "FAILED" and previous["preview_status"] == "PENDING"
+            assert after["preview_status"] == ("FAILED" if repaired else previous["preview_status"])
+            for key in previous.keys() - {"preview_status", "updated_at"}:
+                assert after[key] == previous[key]
+            events = connection.execute("SELECT * FROM run_events WHERE run_id = ? AND stage = 'RECOVERY'", (run_id,)).fetchall()
+            assert len(events) == int(repaired)
 
 
 def test_wal_reader_is_not_blocked_by_uncommitted_writer(tmp_path: Path) -> None:

@@ -1,10 +1,10 @@
 import type { QualityMetric, RunDetail } from '../../api/types';
-import { normalizeQualityMetrics, qualityReportStatus } from '../compare/qualityDelta';
+import { formatQualityNumber, normalizeQualityMetrics, qualityReportStatus } from '../compare/qualityDelta';
 import styles from './Panels.module.css';
 
 function formatValue(metric: QualityMetric) {
   if (metric.value == null || metric.value === '') return '—';
-  if (typeof metric.value === 'number') return metric.value.toLocaleString('zh-CN', { maximumFractionDigits: 6 });
+  if (typeof metric.value === 'number') return formatQualityNumber(metric.value);
   return metric.value;
 }
 

@@ -484,7 +484,9 @@ def test_api_concurrent_same_slice_requests_generate_once(
     application = api_module.create_app(settings)
     cgns = _synthetic_cgns(tmp_path / "mesh.cgns", (4, 3, 2))
     service = PreviewService(cgns, tmp_path / "preview-cache")
-    monkeypatch.setattr(api_module, "_run_preview_status", lambda database, run_id: "READY")
+    monkeypatch.setattr(api_module, "_run_preview_state", lambda database, run_id: {
+        "preview_status": "READY", "postprocess_status": "COMPLETED", "postprocess_error": None,
+    })
     monkeypatch.setattr(api_module, "_preview_for_run", lambda *args, **kwargs: service)
 
     calls: list[tuple[str, str, int]] = []

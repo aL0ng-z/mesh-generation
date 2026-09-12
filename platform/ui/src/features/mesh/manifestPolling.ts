@@ -11,7 +11,7 @@ export function manifestPollingInterval(
   manifest?: MeshManifest,
 ): typeof PREVIEW_POLL_INTERVAL_MS | false {
   if (!run || run.status !== 'SUCCEEDED') return false;
-  if (manifest?.status === 'READY') return false;
+  if (manifest?.status === 'READY' || manifest?.status === 'FAILED') return false;
   if (run.preview_status === 'READY'
     || run.preview_status === 'UNAVAILABLE'
     || run.preview_status === 'FAILED') {

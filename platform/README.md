@@ -33,7 +33,7 @@ Copy-Item .env.example .env
 .\platform\deploy\run-local.ps1 -Migrate
 ```
 
-`-Migrate` 是显式迁移动作，迁移成功后会继续启动 API 和 Worker。日常启动不要添加该参数。API 和 Worker 只检查数据库版本，不会在请求或启动时悄悄执行 DDL。当前迁移含 `0002_postprocess_status.sql`（runs 表新增后处理状态与起止时间、错误字段，user_version=2）。升级代码后应先停止入队、排空在途任务，备份数据库与真实产物，再显式执行一次 `run-local.ps1 -Migrate`，并同步更新 API、Worker 和前端；生产环境仍使用 `python -m mesh_app.db migrate`。
+`-Migrate` 是显式迁移动作，迁移成功后会继续启动 API 和 Worker。日常启动不要添加该参数。API 和 Worker 只检查数据库版本，不会在请求或启动时悄悄执行 DDL。当前数据库版本为 3：迁移 0002 增加后处理字段，迁移 0003 修正后处理 FAILED 但预览仍 PENDING 的遗留记录并追加恢复事件。升级代码后应先停止入队、排空在途任务，使用修复后的工具备份数据库与真实产物，再显式执行一次 `run-local.ps1 -Migrate`，并同步更新 API、Worker 和前端；生产环境仍使用 `python -m mesh_app.db migrate`。回退旧代码前须停服并恢复升级前备份。
 
 后端锁文件固定直接与传递依赖版本；前端必须使用 `npm ci`，它严格使用已提交的 `package-lock.json`。
 
@@ -81,6 +81,7 @@ Windows 下 Worker 会把网格子进程加入带 `KILL_ON_JOB_CLOSE` 的 Job Ob
 
 ```powershell
 # 1. 生成密码哈希（两次输入确认，明文不落任何文件）
+$env:PYTHONPATH = (Resolve-Path platform).Path
 platform\.venv\Scripts\python.exe -m mesh_app.auth
 
 # 2. 将输出粘贴到根目录 .env（两个变量必须同时设置）

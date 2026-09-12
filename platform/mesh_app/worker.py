@@ -289,15 +289,16 @@ def recover_stale_runs(
     stale_after_seconds: float = 30.0,
     now: datetime | str | None = None,
     busy_timeout_ms: int = 5000,
-) -> int:
-    """把心跳过期的 RUNNING 运行修正为 FAILED 终态。"""
+    exclude_worker_id: str | None = None,
+) -> list[str]:
+    """把其他 Worker 心跳过期的运行修正为 FAILED，返回本次回收 ID。"""
 
     if stale_after_seconds < 0:
         raise ValueError("心跳过期秒数不能为负")
     current = _datetime_value(now)
     cutoff = current - timedelta(seconds=stale_after_seconds)
     timestamp = _format_datetime(current)
-    recovered = 0
+    recovered: list[str] = []
     with _connection(database, busy_timeout_ms=busy_timeout_ms) as connection:
         _begin_immediate(connection)
         try:
@@ -305,7 +306,9 @@ def recover_stale_runs(
                 """
                 SELECT id, heartbeat_at, started_at, updated_at, created_at
                 FROM runs WHERE status = 'RUNNING'
-                """
+                    AND (? IS NULL OR worker_id IS NULL OR worker_id <> ?)
+                """,
+                (exclude_worker_id, exclude_worker_id),
             ).fetchall()
             for row in rows:
                 last_seen_raw = row["heartbeat_at"] or row["started_at"] or row["updated_at"] or row["created_at"]
@@ -325,7 +328,7 @@ def recover_stale_runs(
                 )
                 if updated.rowcount != 1:
                     continue
-                recovered += 1
+                recovered.append(str(row["id"]))
                 _append_event_in_transaction(
                     connection,
                     row["id"],
@@ -457,6 +460,7 @@ class Worker:
         self._started = False
         self._stop_requested = False
         self._last_heartbeat = 0.0
+        self._last_recovery = 0.0
         self._heartbeat_interval = max(0.2, min(5.0, settings.worker_stale_seconds / 3.0))
         self._heartbeat_lock = threading.Lock()
         self.last_resource_snapshot: ResourceSnapshot | None = None
@@ -470,10 +474,24 @@ class Worker:
                 self.database,
                 stale_after_seconds=self.settings.worker_stale_seconds,
                 busy_timeout_ms=self.settings.busy_timeout_ms,
+                exclude_worker_id=self.worker_id,
             )
             if self._recover_pending_postprocess():
                 activity = True
             self._started = True
+            self._last_recovery = time.monotonic()
+
+        current = time.monotonic()
+        if current - self._last_recovery >= self._heartbeat_interval:
+            recovered = recover_stale_runs(
+                self.database,
+                stale_after_seconds=self.settings.worker_stale_seconds,
+                busy_timeout_ms=self.settings.busy_timeout_ms,
+                exclude_worker_id=self.worker_id,
+            )
+            self._postprocess_queue.extend(recovered)
+            activity = activity or bool(recovered)
+            self._last_recovery = current
 
         if self._poll_tasks():
             activity = True
@@ -623,6 +641,7 @@ class Worker:
         stderr_stream = (run_dir / "worker.stderr.log").open("wb")
         environment = dict(os.environ)
         environment["PYTHONUNBUFFERED"] = "1"
+        environment["PYTHONIOENCODING"] = "utf-8"
         try:
             process = spawn_managed_process(
                 command,
@@ -786,6 +805,7 @@ class Worker:
         command = [sys.executable, "-m", "mesh_app.postprocess", run_id]
         environment = dict(os.environ)
         environment["PYTHONUNBUFFERED"] = "1"
+        environment["PYTHONIOENCODING"] = "utf-8"
         environment["MESH_DATA_DIR"] = str(self.settings.data_dir)
         environment["MESH_DATABASE_PATH"] = str(self.settings.database_path)
         try:
@@ -1088,10 +1108,12 @@ def set_postprocess_terminal(
             updated = connection.execute(
                 """
                 UPDATE runs SET postprocess_status = ?, postprocess_finished_at = ?,
-                    postprocess_error = ?, updated_at = ?
+                    postprocess_error = ?, updated_at = ?,
+                    preview_status = CASE WHEN ? = 'FAILED' AND preview_status = 'PENDING'
+                        THEN 'FAILED' ELSE preview_status END
                 WHERE id = ? AND postprocess_status IN ('PENDING', 'RUNNING')
                 """,
-                (status, timestamp, safe_error, timestamp, run_id),
+                (status, timestamp, safe_error, timestamp, status, run_id),
             )
             if updated.rowcount != 1:
                 connection.rollback()

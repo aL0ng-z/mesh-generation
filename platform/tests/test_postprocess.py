@@ -18,6 +18,7 @@ from mesh_app.worker import (
     Worker,
     atomic_claim_run,
     mark_run_succeeded,
+    set_postprocess_terminal,
 )
 
 
@@ -351,8 +352,54 @@ def test_postprocess_timeout_terminates_tree_and_marks_failed(
     )
     assert row["status"] == "SUCCEEDED"
     assert row["postprocess_error"] and "超时" in row["postprocess_error"]
+    assert row["preview_status"] == "FAILED"
     assert row["postprocess_finished_at"] is not None
     assert fakes and fakes[0].terminated is True
+
+
+@pytest.mark.parametrize("failure", ["spawn", "exit"])
+def test_postprocess_failure_closes_preview_and_allows_freeze(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from mesh_app.sessions import SessionService
+
+    database = _database(tmp_path)
+    session_id, run_ids = _insert_session_and_runs(database, 1)
+    atomic_claim_run(database, "generation-worker")
+    mark_run_succeeded(database, run_ids[0], run_summary={}, quality={}, quality_status="UNKNOWN")
+    settings = _settings(tmp_path, database, tmp_path / "data", PROJECT_ROOT)
+
+    def spawn(command, **kwargs):
+        if failure == "spawn":
+            raise OSError("后处理启动失败复现")
+        return FakeProcess(returncode=1)
+
+    monkeypatch.setattr(worker_module, "spawn_managed_process", spawn)
+    worker = Worker(settings, database=database)
+    worker.run_once()
+    worker.run_once()
+    with database.reading() as connection:
+        row = connection.execute("SELECT * FROM runs WHERE id = ?", (run_ids[0],)).fetchone()
+        assert row["status"] == "SUCCEEDED"
+        assert row["postprocess_status"] == row["preview_status"] == "FAILED"
+        assert row["postprocess_error"]
+    completed = SessionService(database).complete_session(
+        session_id=session_id, run_id=run_ids[0], expected_version=1,
+    )
+    assert completed["status"] == "COMPLETED"
+
+
+@pytest.mark.parametrize("preview_status", ["READY", "UNAVAILABLE"])
+def test_postprocess_failure_preserves_completed_preview(tmp_path: Path, preview_status: str) -> None:
+    database = _database(tmp_path)
+    _, run_ids = _insert_session_and_runs(database, 1)
+    atomic_claim_run(database, "generation-worker")
+    mark_run_succeeded(database, run_ids[0], run_summary={}, quality={}, quality_status="UNKNOWN")
+    with database.transaction(immediate=True) as connection:
+        connection.execute("UPDATE runs SET preview_status = ? WHERE id = ?", (preview_status, run_ids[0]))
+    assert set_postprocess_terminal(database, run_ids[0], "FAILED", error="登记失败", message="后处理失败")
+    with database.reading() as connection:
+        assert connection.execute("SELECT preview_status FROM runs WHERE id = ?", (run_ids[0],)).fetchone()[0] == preview_status
 
 
 def test_recovery_requeues_pending_and_running_without_sync_execution(

@@ -5,12 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from controls import ControlValidationError, enumerate_control_targets
+from controls import CONTROL_REGISTRY, ControlValidationError, enumerate_control_targets
 from geomturbo import BladeInfo, GeomTurboSummary, RowInfo, parse_geomturbo
 from mesh_app.config import Settings
 from mesh_app.control_service import ControlService, target_to_selector
 from mesh_app.db import Database
-from mesh_app.sessions import SessionService, dump_json, utc_now
+from mesh_app.sessions import SessionService, ServiceError, dump_json, utc_now
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -170,7 +170,8 @@ def test_control_state_and_preview_enforce_prerequisites_and_clear_dependencies(
         if item["key"] == "row/target_points" and item["selector"] == "row:#1"
     )
     assert target_points["availability"] == "LOCKED"
-    assert "row/mesh_level=user" in target_points["reason"]
+    assert target_points["reason"] == CONTROL_REGISTRY["row/target_points"].unsupported_reason
+    assert target_points["can_clear"] is False
     skewness = next(
         item
         for item in state["controls"]
@@ -187,7 +188,7 @@ def test_control_state_and_preview_enforce_prerequisites_and_clear_dependencies(
         ],
     )
     assert target_only["valid"] is False
-    assert target_only["errors"][0]["code"] == "CONTROL_PREREQUISITE_NOT_MET"
+    assert target_only["errors"][0]["code"] == "INVALID_CONTROL_CHANGE"
 
     target_valid = controls.preview(
         session_id,
@@ -197,7 +198,7 @@ def test_control_state_and_preview_enforce_prerequisites_and_clear_dependencies(
             {"key": "row/target_points", "selector": "row:#1", "op": "set", "value": 500000},
         ],
     )
-    assert target_valid["valid"] is True
+    assert target_valid["valid"] is False
 
     # 启用规则只要求优化步数为正：100/300 不再被判缺依赖。
     for steps_value in (100, 300):
@@ -312,38 +313,38 @@ def test_effective_availability_unlocks_in_draft_and_relocks_on_revoke(tmp_path:
     # 空草稿：与父快照目录一致，子项保持锁定。
     empty = controls.preview(session_id, parent_run_id=baseline_id, changes=[])
     assert empty["valid"] is True
-    assert entry_of(empty, "row/mesh_level", "row:#1")["availability"] == "EDITABLE"
-    assert entry_of(empty, "row/target_points", "row:#1")["availability"] == "LOCKED"
+    assert entry_of(empty, "row/optimization.steps", "row:#1")["availability"] == "EDITABLE"
+    assert entry_of(empty, "row/optimization.skewness", "row:#1")["availability"] == "LOCKED"
 
     # 同一草稿内设置前置项即解锁子项。
     unlocked = controls.preview(
         session_id,
         parent_run_id=baseline_id,
-        changes=[{"key": "row/mesh_level", "selector": "row:#1", "op": "set", "value": "user"}],
+        changes=[{"key": "row/optimization.steps", "selector": "row:#1", "op": "set", "value": 100}],
     )
     assert unlocked["valid"] is True
-    assert entry_of(unlocked, "row/target_points", "row:#1")["availability"] == "EDITABLE"
-    assert entry_of(unlocked, "row/target_points", "row:#1")["reason"] is None
+    assert entry_of(unlocked, "row/optimization.skewness", "row:#1")["availability"] == "EDITABLE"
+    assert entry_of(unlocked, "row/optimization.skewness", "row:#1")["reason"] is None
 
     # 可定位的预检错误响应同样返回有效可编辑状态，便于修正草稿。
     invalid = controls.preview(
         session_id,
         parent_run_id=baseline_id,
-        changes=[{"key": "row/target_points", "selector": "row:#1", "op": "set", "value": 500000}],
+        changes=[{"key": "row/optimization.skewness", "selector": "row:#1", "op": "set", "value": "yes"}],
     )
     assert invalid["valid"] is False
     assert invalid["errors"][0]["code"] == "CONTROL_PREREQUISITE_NOT_MET"
-    target_invalid = entry_of(invalid, "row/target_points", "row:#1")
+    target_invalid = entry_of(invalid, "row/optimization.skewness", "row:#1")
     assert target_invalid["availability"] == "LOCKED"
-    assert "row/mesh_level=user" in target_invalid["reason"]
+    assert "row/optimization.steps>0" in target_invalid["reason"]
 
     # 把解锁后的组合落成一个父运行，再撤销前置项验证重新锁定与必要清除。
     seeded = controls.preview(
         session_id,
         parent_run_id=baseline_id,
         changes=[
-            {"key": "row/mesh_level", "selector": "row:#1", "op": "set", "value": "user"},
-            {"key": "row/target_points", "selector": "row:#1", "op": "set", "value": 500000},
+            {"key": "row/optimization.steps", "selector": "row:#1", "op": "set", "value": 100},
+            {"key": "row/optimization.skewness", "selector": "row:#1", "op": "set", "value": "yes"},
         ],
     )
     assert seeded["valid"] is True
@@ -361,16 +362,51 @@ def test_effective_availability_unlocks_in_draft_and_relocks_on_revoke(tmp_path:
     revoked = controls.preview(
         session_id,
         parent_run_id=child_id,
-        changes=[{"key": "row/mesh_level", "selector": "row:#1", "op": "clear"}],
+        changes=[{"key": "row/optimization.steps", "selector": "row:#1", "op": "clear"}],
     )
     assert revoked["valid"] is True
     assert revoked["required_clears"] == [
-        {"key": "row/target_points", "selector": "row:#1", "op": "clear"}
+        {"key": "row/optimization.skewness", "selector": "row:#1", "op": "clear"}
     ]
-    assert entry_of(revoked, "row/mesh_level", "row:#1")["availability"] == "EDITABLE"
-    target_revoked = entry_of(revoked, "row/target_points", "row:#1")
+    assert entry_of(revoked, "row/optimization.steps", "row:#1")["availability"] == "EDITABLE"
+    target_revoked = entry_of(revoked, "row/optimization.skewness", "row:#1")
     assert target_revoked["availability"] == "LOCKED"
-    assert "row/mesh_level=user" in target_revoked["reason"]
+    assert "row/optimization.steps>0" in target_revoked["reason"]
+
+
+def test_historical_target_points_can_be_cleared_but_cannot_be_inherited_or_retried(tmp_path: Path) -> None:
+    settings, database, sessions, controls = make_services(tmp_path)
+    detail, baseline_id = create_ready_baseline(settings, database, sessions)
+    snapshot = {"schema_version": 1, "items": [
+        {"key": "row/mesh_level", "selector": "row:#1", "value": "user"},
+        {"key": "row/target_points", "selector": "row:#1", "value": 500000},
+    ]}
+    historical = sessions.create_child_run(
+        session_id=detail["id"], parent_run_id=baseline_id, request_id="historical-target",
+        expected_version=1, control_snapshot=snapshot, control_delta={"schema_version": 1, "items": []},
+    )
+    _promote_to_succeeded(database, historical["id"])
+    state = controls.get_control_state(detail["id"], parent_run_id=historical["id"])
+    target = next(item for item in state["controls"] if item["key"] == "row/target_points" and item["selector"] == "row:#1")
+    assert target["availability"] == "LOCKED" and target["can_clear"] is True
+    unchanged = controls.preview(detail["id"], parent_run_id=historical["id"], changes=[])
+    assert unchanged["valid"] is False
+    assert "row/target_points" in unchanged["errors"][0]["message"]
+    cleared = controls.preview(detail["id"], parent_run_id=historical["id"], changes=[
+        {"key": "row/target_points", "selector": "row:#1", "op": "clear"},
+    ])
+    assert cleared["valid"] is True
+    assert all(item["key"] != "row/target_points" for item in cleared["snapshot"]["items"])
+    failed = sessions.create_child_run(
+        session_id=detail["id"], parent_run_id=historical["id"], request_id="historical-failed-target",
+        expected_version=2, control_snapshot=snapshot, control_delta={"schema_version": 1, "items": []},
+    )
+    with database.transaction(immediate=True) as connection:
+        connection.execute("UPDATE runs SET status = 'RUNNING' WHERE id = ?", (failed["id"],))
+        connection.execute("UPDATE runs SET status = 'FAILED' WHERE id = ?", (failed["id"],))
+    with pytest.raises(ServiceError) as error:
+        sessions.retry_run(run_id=failed["id"], request_id="retry-target", expected_version=3)
+    assert error.value.code == "CONTROL_VALIDATION_FAILED"
 
 
 def test_throat_points_predicate_preserves_children(tmp_path: Path) -> None:

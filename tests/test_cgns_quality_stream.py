@@ -27,6 +27,7 @@ from quality import (  # noqa: E402
     _first_float,
     _last_count,
     _quality_blocks,
+    _stream_quality_fragments,
     parse_embedded_cgns_quality,
 )
 
@@ -201,6 +202,24 @@ class CgnsStreamingParseTests(unittest.TestCase):
         # 两个外层片段都保留，最后一个块的统计生效。
         self.assertEqual(parsed["avg_skewness_angle"], 33.0)
         self.assertEqual(parsed["min_skewness_angle"], 22.0)
+
+    def test_first_section_part_before_chunk_boundary_keeps_nested_depth(self) -> None:
+        chunk = 1 << 20
+        for remaining in (150, 300, 600):
+            with self.subTest(remaining=remaining):
+                path = _temp_file(
+                    self, b"X" * (chunk - remaining) + VALID_CGNS.encode("latin1"), "mesh.cgns"
+                )
+                self.assertEqual(parse_embedded_cgns_quality(path), _reference_parse(path))
+
+    def test_closed_section_does_not_retain_following_mesh_body(self) -> None:
+        path = _temp_file(
+            self, VALID_CGNS.encode("latin1") + b"X" * (3 << 20), "mesh.cgns"
+        )
+        seen, fragments, counts = _stream_quality_fragments(Path(path))
+        self.assertTrue(seen)
+        self.assertEqual(fragments, VALID_CGNS.rstrip())
+        self.assertEqual(counts, (0, 12345, 3))
 
     def test_stray_counts_outside_sections_still_take_last(self) -> None:
         # 旧实现整文件扫描，片段外的计数也参与“最后一次匹配”语义。

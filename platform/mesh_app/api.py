@@ -489,8 +489,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.get("/api/v1/runs/{run_id}/mesh/manifest")
     async def mesh_manifest(run_id: str) -> dict[str, Any]:
-        preview_status = await run_in_threadpool(_run_preview_status, database, run_id)
-        if preview_status == "PENDING":
+        preview = await run_in_threadpool(_run_preview_state, database, run_id)
+        if preview["preview_status"] == "FAILED" and preview["postprocess_status"] == "FAILED":
+            return {
+                "status": "FAILED",
+                "reason": preview["postprocess_error"] or "后处理失败，无法生成网格预览",
+                "reason_code": "POSTPROCESS_FAILED",
+                "blocks": [],
+            }
+        if preview["preview_status"] == "PENDING":
             return {
                 "status": "PENDING",
                 "reason": "网格任务已成功，产物登记与预览后处理仍在进行",
@@ -613,9 +620,13 @@ def _preview_for_run(
     settings: Settings,
     run_id: str,
 ) -> Any | None:
-    preview_status = _run_preview_status(database, run_id)
-    if preview_status == "PENDING":
+    preview = _run_preview_state(database, run_id)
+    if preview["preview_status"] == "PENDING":
         raise ServiceError("PREVIEW_PENDING", "网格预览仍在生成，请稍后重试", status_code=409)
+    if preview["preview_status"] == "FAILED" and preview["postprocess_status"] == "FAILED":
+        raise ServiceError(
+            "POSTPROCESS_FAILED", preview["postprocess_error"] or "后处理失败，无法生成网格预览", status_code=409
+        )
     with database.reading() as connection:
         artifact = connection.execute(
             """
@@ -639,14 +650,14 @@ def _preview_for_run(
     return PreviewService(cgns_path, settings.preview_dir / run_id)
 
 
-def _run_preview_status(database: Database, run_id: str) -> str:
+def _run_preview_state(database: Database, run_id: str) -> dict[str, Any]:
     with database.reading() as connection:
         run = connection.execute(
-            "SELECT preview_status FROM runs WHERE id = ?", (run_id,)
+            "SELECT preview_status, postprocess_status, postprocess_error FROM runs WHERE id = ?", (run_id,)
         ).fetchone()
     if run is None:
         raise ServiceError("RUN_NOT_FOUND", "找不到指定运行", status_code=404)
-    return str(run["preview_status"])
+    return dict(run)
 
 
 def _public_manifest(raw: dict[str, Any]) -> dict[str, Any]:

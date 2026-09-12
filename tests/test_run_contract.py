@@ -70,6 +70,59 @@ class RunContractTests(unittest.TestCase):
     def _behavior_env(self, behavior):
         return {fake_igg.BEHAVIOR_ENV: behavior}
 
+    def test_target_points_is_rejected_before_creating_run_directory(self):
+        for index, arguments in enumerate((
+            ["--target-points", "500000"],
+            ["--set", "row:#1/target_points=500000"],
+        )):
+            with self.subTest(arguments=arguments):
+                out = self.tmp / f"unsupported_{index}"
+                completed = run_cli([str(GEOMETRY), "--dry-run", "--out", str(out), *arguments])
+                self.assertEqual(completed.returncode, 2)
+                self.assertIn("目标点数控制暂时停用", completed.stderr.decode("utf-8"))
+                self.assertFalse(out.exists())
+
+    def test_relative_igg_path_survives_run_directory_change(self):
+        out = self.tmp / "relative_igg"
+        launcher = "./" + Path(self.igg).name
+        completed = run_cli([str(GEOMETRY), "--out", str(out), "--igg", launcher], cwd=self.tmp)
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode(errors="replace"))
+        self.assertTrue(Path(load_summary(out)["autogrid"]["command"][0]).is_absolute())
+
+    def test_input_source_comes_from_executed_copy_after_original_changes(self):
+        original_data = GEOMETRY.read_bytes()
+        for behavior in ("modify_source_input", "move_source_input"):
+            with self.subTest(behavior=behavior):
+                source = self.tmp / f"{behavior}.geomTurbo"
+                source.write_bytes(original_data)
+                out = self.tmp / behavior
+                completed = run_cli(
+                    [str(source), "--out", str(out), "--igg", self.igg],
+                    env_extra={**self._behavior_env(behavior), "FAKE_IGG_SOURCE_INPUT": str(source)},
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr.decode(errors="replace"))
+                recorded = load_summary(out)["sources"]["input_summary"]
+                self.assertEqual(recorded["sha256"], hashlib.sha256(original_data).hexdigest())
+                self.assertEqual(recorded["size_bytes"], len(original_data))
+                self.assertEqual((out / "input.geomTurbo").read_bytes(), original_data)
+                self.assertTrue((out / "report.md").is_file())
+
+    def test_final_verification_uses_post_generation_instead_of_matching_setter(self):
+        for behavior, expected in (("post_readback_mismatch", "MISMATCH"), ("post_readback_error", "READBACK_ERROR")):
+            with self.subTest(behavior=behavior):
+                out = self.tmp / behavior
+                completed = run_cli(
+                    [str(GEOMETRY), "--out", str(out), "--igg", self.igg, "--set", GRID_LEVELS_SET],
+                    env_extra=self._behavior_env(behavior),
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr.decode(errors="replace"))
+                summary = load_summary(out)
+                self.assertEqual(summary["controls"]["applied"][0]["readback"], 4)
+                verification = summary["controls"]["verification"]
+                self.assertEqual(verification["basis"], "post_generation")
+                self.assertEqual(verification["results"][0]["verification"], expected)
+                self.assertIn(expected, (out / "report.md").read_text(encoding="utf-8"))
+
     def test_default_run_dir_contains_uuid(self):
         completed = run_cli([str(GEOMETRY), "--dry-run"], cwd=self.tmp)
         self.assertEqual(completed.returncode, 0, completed.stderr.decode(errors="replace"))
@@ -296,6 +349,7 @@ class RunContractTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 1)
         summary = load_summary(out)
         self.assertIn("fake setter failure", summary["autogrid"]["error"])
+        self.assertNotIn("generation", summary["manifest"]["stages_completed"])
         verification = summary["controls"]["verification"]["results"][0]
         self.assertEqual(verification["verification"], "UNVERIFIABLE")
 
@@ -440,7 +494,7 @@ class RunContractTests(unittest.TestCase):
         )
         self.assertEqual(sources["control_registry"]["key_count"], 344)
         self.assertRegex(sources["control_registry"]["signature"], r"^[0-9a-f]{64}$")
-        self.assertEqual(sources["quality_rules_version"], "1")
+        self.assertEqual(sources["quality_rules_version"], "2")
         self.assertEqual(sources["vendor_version"], "17.1-1")
 
         manifest = summary["manifest"]

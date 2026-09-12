@@ -93,6 +93,8 @@ export function SessionWorkspacePage() {
     ? selectedParam
     : session?.satisfied_run_id ?? latestRunId(session?.runs ?? []);
   const selectedSummary = session?.runs.find((run) => run.id === selectedRunId);
+  const selectedSummaryStatus = selectedSummary?.status;
+  const selectedSummaryActive = selectedSummary ? isActiveRun(selectedSummary) : undefined;
   const activeTab = parseWorkspaceTab(params.get('tab'));
   const successfulRuns = useMemo(() => session?.runs.filter((run) => run.status === 'SUCCEEDED') ?? [], [session?.runs]);
   const successfulIds = useMemo(() => new Set(successfulRuns.map((run) => run.id)), [successfulRuns]);
@@ -103,8 +105,14 @@ export function SessionWorkspacePage() {
     queryKey: ['run', selectedRunId],
     queryFn: () => api.getRun(selectedRunId!),
     enabled: Boolean(selectedRunId),
-    refetchInterval: selectedSummary && isActiveRun(selectedSummary) ? 3_000 : false,
+    refetchInterval: (query) => query.state.data && isActiveRun(query.state.data) ? 3_000 : false,
   });
+
+  useEffect(() => {
+    if (selectedRunId && (selectedSummaryStatus === 'SUCCEEDED' || selectedSummaryStatus === 'FAILED')) {
+      void queryClient.invalidateQueries({ queryKey: ['run', selectedRunId] });
+    }
+  }, [queryClient, selectedRunId, selectedSummaryStatus, selectedSummaryActive]);
 
   useEffect(() => {
     if (!selectedRunId || params.get('run')) return;
@@ -160,6 +168,18 @@ export function SessionWorkspacePage() {
     });
   }
 
+  async function refreshWorkspace() {
+    const runIds = new Set([selectedRunId, ...(compareIds ?? [])]);
+    await queryClient.invalidateQueries({
+      predicate: (query) => {
+        const [kind, id] = query.queryKey;
+        return (kind === 'session' && id === sessionId)
+          || (['run', 'run-events', 'mesh-manifest'].includes(String(kind)) && runIds.has(id as string))
+          || (['control-state', 'control-preview'].includes(String(kind)) && id === sessionId);
+      },
+    });
+  }
+
   function freeze() {
     if (!selectedSummary || selectedSummary.status !== 'SUCCEEDED' || frozen) return;
     const accepted = window.confirm(
@@ -172,7 +192,7 @@ export function SessionWorkspacePage() {
   const onNoteDirty = useCallback((value: boolean) => setNoteDirty(value), []);
 
   if (sessionQuery.isPending) return <main className={styles.statePage}>正在加载专家工作台…</main>;
-  if (sessionQuery.isError || !session) {
+  if (!session) {
     return (
       <main className={styles.statePage}>
         <strong>无法打开会话</strong>
@@ -212,7 +232,7 @@ export function SessionWorkspacePage() {
           onCompare={(ids) => updateParams((next) => next.set('compare', ids.join(',')))}
           onExit={() => updateParams((next) => next.delete('compare'))}
         />
-        <button className={styles.refresh} type="button" disabled={sessionQuery.isFetching} onClick={() => void sessionQuery.refetch()}>
+        <button className={styles.refresh} type="button" disabled={sessionQuery.isFetching} onClick={() => void refreshWorkspace()}>
           {sessionQuery.isFetching ? '刷新中…' : '刷新'}
         </button>
         <button

@@ -51,6 +51,7 @@ class ControlSpec:
     topologies: tuple[str, ...] = ()
     not_applicable_when: str | None = None
     setter_mode: str = "value"
+    unsupported_reason: str | None = None
 
     @property
     def supports_readback(self) -> bool:
@@ -247,6 +248,7 @@ def _add(
     topologies: tuple[str, ...] = (),
     not_applicable_when: str | None = None,
     setter_mode: str = "value",
+    unsupported_reason: str | None = None,
 ) -> None:
     """向内部注册表添加一条完整控制规格。"""
 
@@ -272,6 +274,7 @@ def _add(
             topologies=topologies,
             not_applicable_when=not_applicable_when,
             setter_mode=setter_mode,
+            unsupported_reason=unsupported_reason,
         )
     )
 
@@ -490,6 +493,7 @@ _add(
     minimum=100,
     maximum=2_000_000_000,
     setter_mode="row_accuracy_target",
+    unsupported_reason="目标点数控制暂时停用：当前 AutoGrid 17.1 生成路径不能兑现目标点数，请使用网格级别、展向或 B2B 点数控制。",
 )
 _add(
     "row/streamwise_weight",
@@ -2452,6 +2456,8 @@ def resolve_control_requests(
     # Step 1: wildcard 展开。
     candidates_by_identity: dict[tuple[str, tuple[TargetEntity, ...]], list[ControlRequest]] = {}
     for request in requests:
+        if request.spec.unsupported_reason:
+            raise ControlValidationError(f"{request.key}：{request.spec.unsupported_reason}")
         targets = _candidate_targets(request.spec, geometry)
         matches = [target for target in targets if _target_matches(request.selectors, target)]
         if not matches:

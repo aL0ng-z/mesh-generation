@@ -1,4 +1,5 @@
-import { useQuery } from '@tanstack/react-query';
+import { useEffect } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../../api/client';
 import type { RunDetail } from '../../api/types';
 import { isActiveRun } from '../runs/runTreeModel';
@@ -6,12 +7,20 @@ import { progressPercent } from '../runs/progress';
 import styles from './Panels.module.css';
 
 export function EventsPanel({ run }: { run?: RunDetail }) {
+  const queryClient = useQueryClient();
+  const runId = run?.id;
+  const active = run ? isActiveRun(run) : undefined;
   const eventQuery = useQuery({
     queryKey: ['run-events', run?.id],
     queryFn: () => api.getEvents(run!.id),
     enabled: Boolean(run?.id),
-    refetchInterval: run && isActiveRun(run) ? 3_000 : false,
+    refetchInterval: active ? 3_000 : false,
   });
+  useEffect(() => {
+    if (runId && active === false) {
+      void queryClient.invalidateQueries({ queryKey: ['run-events', runId] });
+    }
+  }, [queryClient, runId, active]);
   const events = eventQuery.data?.items ?? run?.events ?? [];
   if (!run) return <div className={styles.empty}>请选择运行节点。</div>;
   return (

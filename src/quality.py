@@ -62,6 +62,11 @@ REQUIRED_FIELDS = (
 )
 
 COUNT_FIELDS = ("negative_cells", "number_of_points", "grid_levels")
+STATISTIC_FIELDS = {
+    f"{statistic}_{criterion}"
+    for criterion in CRITERIA
+    for statistic in ("min", "max", "avg")
+} | {"wall_distance_uniformity"}
 
 METRIC_PATH_PREFIX = "quality.metrics"
 
@@ -118,9 +123,8 @@ def summarize_quality(
             "raw": None,
         }
 
-    metrics = model["metrics"]
-    result = evaluate_quality(metrics)
-    validation = _quality_validation(metrics, result.status)
+    result = evaluate_quality(model)
+    validation = _quality_validation(model, result.status)
     for key in ("metadata", "project", "entities", "metrics"):
         model[key] = _sanitize_non_finite(model[key])
     return {
@@ -208,7 +212,7 @@ def parse_quality_report(
                     "b2b_topology": None,
                 }
                 continue
-            value_match = re.match(rf"NUMBER\s+OF\s+POINTS\s+({NUMBER_TEXT})", stripped, flags=re.IGNORECASE)
+            value_match = re.match(r"NUMBER\s+OF\s+POINTS\s*(.*?)\s*$", stripped, flags=re.IGNORECASE)
             if value_match:
                 value = _strict_count(value_match.group(1))
                 if current_project_row is None:
@@ -216,15 +220,15 @@ def parse_quality_report(
                 else:
                     current_project_row["number_of_points"] = value
                 continue
-            rows_match = re.match(rf"NUMBER\s+OF\s+ROWS\s+({NUMBER_TEXT})", stripped, flags=re.IGNORECASE)
+            rows_match = re.match(r"NUMBER\s+OF\s+ROWS\s*(.*?)\s*$", stripped, flags=re.IGNORECASE)
             if rows_match and current_project_row is None:
                 project["number_of_rows"] = _strict_count(rows_match.group(1))
                 continue
             if current_project_row is not None:
                 project_field_patterns = (
-                    ("main_blades", rf"NUMBER\s+OF\s+MAIN\s+BLADES\s+({NUMBER_TEXT})", int),
-                    ("splitter_blades", rf"NUMBER\s+OF\s+SPLITTER\s+BLADES\s+({NUMBER_TEXT})", int),
-                    ("layers", rf"NUMBER\s+OF\s+LAYERS\s+({NUMBER_TEXT})", int),
+                    ("main_blades", r"NUMBER\s+OF\s+MAIN\s+BLADES\s*(.*?)\s*$", int),
+                    ("splitter_blades", r"NUMBER\s+OF\s+SPLITTER\s+BLADES\s*(.*?)\s*$", int),
+                    ("layers", r"NUMBER\s+OF\s+LAYERS\s*(.*?)\s*$", int),
                     ("b2b_topology", r"BLADE\s+TO\s+BLADE\s+TOPOLOGY\s+(.+?)\s*$", str),
                 )
                 matched_project_field = False
@@ -279,15 +283,15 @@ def parse_quality_report(
         if re.search(r"\bNo\s+Negative\s+Cell\b", stripped, flags=re.IGNORECASE):
             current_entity["negative_cells"] = 0
             continue
-        negative_match = re.search(rf"\bNegative\s+Cells?\s*:?\s*({NUMBER_TEXT})", stripped, flags=re.IGNORECASE)
+        negative_match = re.search(r"\bNegative\s+Cells?\s*:?\s*(.*?)\s*$", stripped, flags=re.IGNORECASE)
         if negative_match:
             current_entity["negative_cells"] = _strict_count(negative_match.group(1))
             continue
-        points_match = re.match(rf"Number\s+of\s+Points\s*:?\s*({NUMBER_TEXT})", stripped, flags=re.IGNORECASE)
+        points_match = re.match(r"Number\s+of\s+Points\s*:?\s*(.*?)\s*$", stripped, flags=re.IGNORECASE)
         if points_match:
             current_entity["number_of_points"] = _strict_count(points_match.group(1))
             continue
-        levels_match = re.match(rf"Number\s+of\s+grid\s+levels\s*:?\s*({NUMBER_TEXT})", stripped, flags=re.IGNORECASE)
+        levels_match = re.match(r"Number\s+of\s+grid\s+levels\s*:?\s*(.*?)\s*$", stripped, flags=re.IGNORECASE)
         if levels_match:
             current_entity["grid_levels"] = _strict_count(levels_match.group(1))
             continue
@@ -379,9 +383,9 @@ def parse_embedded_cgns_quality(
             continue
         criterion_name, min_field, max_field, avg_field = fields
         block = blocks[-1]
-        metrics[avg_field] = _first_float(block, r"\baverage\s+" + NUMBER)
-        metrics[min_field] = _first_float(block, r"\bmin\s+" + NUMBER)
-        metrics[max_field] = _first_float(block, r"\bmax\s+" + NUMBER)
+        metrics[avg_field] = _first_float(block, r"\baverage\b\s*([^\s\x00]*)")
+        metrics[min_field] = _first_float(block, r"\bmin\b\s*([^\s\x00]*)")
+        metrics[max_field] = _first_float(block, r"\bmax\b\s*([^\s\x00]*)")
         extreme = CRITICAL_EXTREME[criterion_name]
         location = _embedded_location(blocks, extreme=extreme)
         if location is not None:
@@ -395,19 +399,13 @@ def parse_embedded_cgns_quality(
 def evaluate_quality(metrics: dict[str, Any]) -> QualityEvaluation:
     """先校验质量指标数据合法性，再依据预设硬性阈值评估网格质量。"""
 
-    if "metrics" in metrics and "negative_cells" not in metrics and isinstance(metrics["metrics"], dict):
-        metrics = metrics["metrics"]
-    missing = sorted(field for field in REQUIRED_FIELDS if field not in metrics or metrics[field] is None)
-    if missing:
-        return QualityEvaluation(
-            "UNKNOWN", False, [f"{METRIC_PATH_PREFIX}.{field}: 缺失" for field in missing]
-        )
-
-    problems = _validation_problems(metrics)
+    problems = _quality_problems(metrics)
     if problems:
         return QualityEvaluation(
             "UNKNOWN", False, [f"{field}: {problem}" for field, problem in problems]
         )
+    if isinstance(metrics.get("metrics"), dict):
+        metrics = metrics["metrics"]
 
     reasons: list[str] = []
     if metrics["negative_cells"] != HARD_LIMITS["negative_cells"]:
@@ -434,32 +432,92 @@ def _validation_problems(metrics: dict[str, Any]) -> list[tuple[str, str]]:
     for field in COUNT_FIELDS:
         if field not in metrics or metrics[field] is None:
             continue
-        value = metrics[field]
-        path = f"{METRIC_PATH_PREFIX}.{field}"
-        if isinstance(value, bool):
-            problems.append((path, "布尔值不是合法计数"))
-        elif not isinstance(value, int):
-            problems.append((path, "计数必须为整数"))
-        elif value < 0 or (field != "negative_cells" and value == 0):
-            label = "非负整数" if field == "negative_cells" else "正整数"
-            problems.append((path, f"计数必须为{label}"))
+        problem = _count_problem(field, metrics[field])
+        if problem:
+            problems.append((f"{METRIC_PATH_PREFIX}.{field}", problem))
     for field, value in metrics.items():
-        if field in COUNT_FIELDS:
+        if field not in STATISTIC_FIELDS or value is None:
             continue
-        if isinstance(value, bool):
-            problems.append((f"{METRIC_PATH_PREFIX}.{field}", "非实数"))
-            continue
-        if not isinstance(value, (int, float)):
-            continue
-        path = f"{METRIC_PATH_PREFIX}.{field}"
-        if not math.isfinite(value):
-            problems.append((path, "非有限数值"))
-        elif "skewness_angle" in field and not 0.0 <= value <= 180.0:
-            problems.append((path, "角度必须在 [0, 180] 内"))
-        elif ("expansion_ratio" in field or "aspect_ratio" in field) and value <= 0.0:
-            problems.append((path, "比例必须为正"))
-        elif "wall_distance" in field and value < 0.0:
-            problems.append((path, "壁面距离必须非负"))
+        problem = _statistic_problem(field, value)
+        if problem:
+            problems.append((f"{METRIC_PATH_PREFIX}.{field}", problem))
+    return problems
+
+
+def _count_problem(field: str, value: Any) -> str | None:
+    """计数必须保持整数类型及对应的正值域。"""
+
+    if isinstance(value, bool):
+        return "布尔值不是合法计数"
+    if isinstance(value, str):
+        return f"无法解析数值: {value!r}"
+    if isinstance(value, float) and not math.isfinite(value):
+        return "非有限数值"
+    if not isinstance(value, int):
+        return "计数必须为整数"
+    allow_zero = field in {"negative_cells", "splitter_blades"}
+    if value < 0 or (not allow_zero and value == 0):
+        return "计数必须为非负整数" if allow_zero else "计数必须为正整数"
+    return None
+
+
+def _statistic_problem(field: str, value: Any) -> str | None:
+    """六类质量统计共用数值类型与物理域校验。"""
+
+    if isinstance(value, str):
+        return f"无法解析数值: {value!r}"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "非实数"
+    if not math.isfinite(value):
+        return "非有限数值"
+    if "skewness_angle" in field and not 0.0 <= value <= 180.0:
+        return "角度必须在 [0, 180] 内"
+    if ("expansion_ratio" in field or "aspect_ratio" in field) and value <= 0.0:
+        return "比例必须为正"
+    if "wall_distance" in field and value < 0.0:
+        return "壁面距离必须非负"
+    return None
+
+
+def _quality_problems(data: dict[str, Any]) -> list[tuple[str, str]]:
+    """同时检查全网格必填字段、已提供统计及逐叶排数据。"""
+
+    metrics = data["metrics"] if isinstance(data.get("metrics"), dict) else data
+    problems = [
+        (f"{METRIC_PATH_PREFIX}.{field}", "缺失")
+        for field in sorted(REQUIRED_FIELDS)
+        if field not in metrics or metrics[field] is None
+    ]
+    problems.extend(_validation_problems(metrics))
+    for index, entity in enumerate(data.get("entities", [])):
+        if entity.get("scope") == "entire_mesh":
+            continue  # 全网格已由兼容的 metrics 路径完整校验。
+        prefix = f"quality.entities[{index}]"
+        for field in COUNT_FIELDS:
+            if entity.get(field) is not None:
+                problem = _count_problem(field, entity[field])
+                if problem:
+                    problems.append((f"{prefix}.{field}", problem))
+        for name in CRITERIA:
+            criterion = entity.get("criteria", {}).get(name, {})
+            for statistic in ("minimum", "maximum", "average"):
+                if criterion.get(statistic) is not None:
+                    problem = _statistic_problem(name, criterion[statistic])
+                    if problem:
+                        problems.append((f"{prefix}.criteria.{name}.{statistic}", problem))
+    project = data.get("project", {})
+    count_groups = [("quality.project", project, ("number_of_points", "number_of_rows"))]
+    count_groups.extend(
+        (f"quality.project.rows[{index}]", row,
+         ("number_of_points", "main_blades", "splitter_blades", "layers"))
+        for index, row in enumerate(project.get("rows", []))
+    )
+    for prefix, group, fields in count_groups:
+        for field in fields:
+            if group.get(field) is not None:
+                problem = _count_problem(field, group[field])
+                if problem:
+                    problems.append((f"{prefix}.{field}", problem))
     return problems
 
 
@@ -468,12 +526,7 @@ def _quality_validation(metrics: dict[str, Any], result_status: str) -> dict[str
 
     if result_status != "UNKNOWN":
         return {"status": "VALID", "reasons": []}
-    missing = sorted(field for field in REQUIRED_FIELDS if field not in metrics or metrics[field] is None)
-    problems: list[tuple[str, str]] = [
-        (f"{METRIC_PATH_PREFIX}.{field}", "缺失") for field in missing
-    ]
-    if not missing:
-        problems = _validation_problems(metrics)
+    problems = _quality_problems(metrics)
     return {
         "status": "INVALID",
         "reasons": [{"field": field, "problem": problem} for field, problem in problems],
@@ -486,7 +539,15 @@ def _sanitize_non_finite(value: Any) -> Any:
     if isinstance(value, float):
         return None if not math.isfinite(value) else value
     if isinstance(value, dict):
-        return {key: _sanitize_non_finite(item) for key, item in value.items()}
+        numeric_fields = STATISTIC_FIELDS | set(COUNT_FIELDS) | {
+            "minimum", "maximum", "average", "number_of_rows",
+            "main_blades", "splitter_blades", "layers",
+        }
+        return {
+            key: None if key in numeric_fields and isinstance(item, str)
+            else _sanitize_non_finite(item)
+            for key, item in value.items()
+        }
     if isinstance(value, list):
         return [_sanitize_non_finite(item) for item in value]
     return value
@@ -539,11 +600,11 @@ def _empty_project(*, units: str | None, units_factor: float | None) -> dict[str
     }
 
 
-def _parse_statistic_line(line: str) -> tuple[str, str, float] | None:
+def _parse_statistic_line(line: str) -> tuple[str, str, float | str] | None:
     """解析质量报告中的单行统计值。"""
 
     match = re.match(
-        rf"(Minimal|Maximum|Maximal|Average|Minimum)\s+(.+?)\s*:\s*({NUMBER_TEXT})\s*$",
+        r"(Minimal|Maximum|Maximal|Average|Minimum)\s+(.+?)\s*:\s*(.*?)\s*$",
         line,
         flags=re.IGNORECASE,
     )
@@ -554,7 +615,7 @@ def _parse_statistic_line(line: str) -> tuple[str, str, float] | None:
     criterion = _criterion_name(match.group(2))
     if criterion is None:
         return None
-    return criterion, statistic, float(match.group(3))
+    return criterion, statistic, _parse_number(match.group(3))
 
 
 def _parse_location_line(line: str) -> tuple[str, dict[str, Any]] | None:
@@ -613,7 +674,7 @@ def _finalize_entity_criteria(
             criterion["unit"] = units or "project"
             criterion["si"] = {
                 statistic: criterion.get(statistic) * units_factor
-                if criterion.get(statistic) is not None and units_factor is not None
+                if isinstance(criterion.get(statistic), (int, float)) and units_factor is not None
                 else None
                 for statistic in ("minimum", "maximum", "average")
             }
@@ -635,13 +696,13 @@ def _derive_entire_mesh_locations(entities: list[dict[str, Any]]) -> None:
             continue
         statistic = CRITICAL_EXTREME[criterion_name]
         global_value = criterion.get(statistic)
-        if global_value is None:
+        if not isinstance(global_value, (int, float)) or not math.isfinite(global_value):
             continue
         for row_entity in rows:
             row_criterion = row_entity["criteria"].get(criterion_name, {})
             row_value = row_criterion.get(statistic)
             location = row_criterion.get("critical_location")
-            if row_value is None or location is None:
+            if not isinstance(row_value, (int, float)) or not math.isfinite(row_value) or location is None:
                 continue
             if abs(row_value - global_value) <= max(1.0, abs(global_value)) * 1.0e-10:
                 derived = deepcopy(location)
@@ -738,7 +799,7 @@ def _stream_quality_fragments(
     path: Path,
     *,
     chunk_bytes: int = _QUALITY_SCAN_CHUNK_BYTES,
-) -> tuple[bool, str, tuple[int | float | None, int | float | None, int | float | None]]:
+) -> tuple[bool, str, tuple[int | float | str | None, ...]]:
     """按块流式扫描 CGNS 文本，仅保留外层 NIGridQuality 片段与所需计数。
 
     返回 ``(是否出现 NIGridQuality 标记, 拼接后的质量片段文本, 三项计数)``，
@@ -749,13 +810,12 @@ def _stream_quality_fragments(
     未闭合片段在文件结束时按原文保留。
     """
 
-    outer_begin = re.compile(r"NI_BEGIN\s+NIGridQuality(?![A-Za-z0-9_])", re.IGNORECASE)
-    begin_marker = re.compile(r"NI_BEGIN\s+NIGridQuality", re.IGNORECASE)
-    end_marker = re.compile(r"NI_END\s+NIGridQuality", re.IGNORECASE)
-    count_patterns = (
-        re.compile(rf"NEGATIVE_CELLS\s+{NUMBER}", re.IGNORECASE),
-        re.compile(rf"NUMBER_OF_POINTS\s+{NUMBER}", re.IGNORECASE),
-        re.compile(rf"MULTIGRID_LEVEL\s+{NUMBER}", re.IGNORECASE),
+    marker_pattern = re.compile(
+        r"NI_(BEGIN|END)\s+NIGridQuality([A-Za-z0-9_]*)", re.IGNORECASE
+    )
+    count_patterns = tuple(
+        re.compile(rf"{name}\b\s*([^\s\x00]*)", re.IGNORECASE)
+        for name in ("NEGATIVE_CELLS", "NUMBER_OF_POINTS", "MULTIGRID_LEVEL")
     )
 
     fragments: list[str] = []
@@ -763,93 +823,52 @@ def _stream_quality_fragments(
     last_counts: list[tuple[int, str] | None] = [None, None, None]
     depth = 0
     carry = ""
-    handled = 0
     count_carry = ""
     marker_seen = False
     absolute = 0
 
-    def hold(part: str) -> None:
-        """把文本并入当前片段；始终扣留尾部字符等待下一块判定跨块标记。"""
-
-        nonlocal carry
-        combined = carry + part
-        if len(combined) > _QUALITY_MARKER_TAIL:
-            pending.append(combined[:-_QUALITY_MARKER_TAIL])
-            carry = combined[-_QUALITY_MARKER_TAIL:]
-        else:
-            carry = combined
-
     with path.open("rb") as stream:
         while True:
             raw = stream.read(chunk_bytes)
-            if not raw:
-                break
             decoded = raw.decode("latin1", errors="ignore")
             count_text = count_carry + decoded
             count_base = absolute - len(count_carry)
-            count_carry = count_text[-64:]
+            count_carry = count_text[-_QUALITY_MARKER_TAIL:]
             for pattern_index, pattern in enumerate(count_patterns):
-                matches = list(pattern.finditer(count_text))
-                if not matches:
-                    continue
-                last = matches[-1]
-                current = last_counts[pattern_index]
-                if current is None or count_base + last.start() >= current[0]:
-                    last_counts[pattern_index] = (count_base + last.start(), last.group(1))
+                for match in pattern.finditer(count_text):
+                    current = last_counts[pattern_index]
+                    position = count_base + match.start()
+                    if current is None or position >= current[0]:
+                        last_counts[pattern_index] = (position, match.group(1))
+
             text = carry + decoded
-            base = absolute - len(carry)
-            carry = ""
             if not marker_seen and "NIGridQuality" in text:
                 marker_seen = True
+            # 尾部留到下一块，避免把尚未读完的内层名称误判为外层开始。
+            limit = max(0, len(text) - _QUALITY_MARKER_TAIL) if raw else len(text)
             cursor = 0
-            limit = len(text)
-            while cursor < limit:
-                if depth == 0:
-                    match = outer_begin.search(text, cursor)
-                    if match is None:
-                        break
-                    if base + match.end() <= handled:
-                        # 扣留尾部中已被处理过的标记，跳过。
-                        cursor = match.end()
-                        continue
-                    hold(text[match.start():])
-                    depth = 1
-                    handled = base + limit
-                    cursor = limit
-                    continue
-                begin_match = begin_marker.search(text, cursor)
-                end_match = end_marker.search(text, cursor)
-                while begin_match is not None and base + begin_match.end() <= handled:
-                    begin_match = begin_marker.search(text, begin_match.end())
-                while end_match is not None and base + end_match.end() <= handled:
-                    end_match = end_marker.search(text, end_match.end())
-                if begin_match is None and end_match is None:
-                    hold(text[cursor:])
-                    handled = base + limit
-                    cursor = limit
-                    continue
-                if end_match is not None and (
-                    begin_match is None or end_match.start() < begin_match.start()
-                ):
-                    hold(text[cursor:end_match.end()])
-                    depth -= 1
-                    handled = base + end_match.end()
-                    cursor = end_match.end()
+            for match in marker_pattern.finditer(text):
+                if match.start() >= limit:
+                    break
+                if depth:
+                    pending.append(text[cursor:match.end()])
+                    depth += 1 if match.group(1).upper() == "BEGIN" else -1
                     if depth == 0:
-                        fragments.append("".join(pending) + carry)
+                        fragments.append("".join(pending))
                         pending = []
-                        carry = ""
-                    continue
-                hold(text[cursor:begin_match.end()])
-                depth += 1
-                handled = base + begin_match.end()
-                cursor = begin_match.end()
-            if depth == 0 and cursor < limit:
-                # 尚未进入片段：保留可能含跨块标记的尾部。
-                carry = text[cursor:][-_QUALITY_MARKER_TAIL:]
+                elif match.group(1).upper() == "BEGIN" and not match.group(2):
+                    pending.append(match.group(0))
+                    depth = 1
+                cursor = match.end()
+            consumed = max(cursor, limit)
+            if depth and consumed > cursor:
+                pending.append(text[cursor:consumed])
+            carry = text[consumed:]
             absolute += len(raw)
+            if not raw:
+                break
         if depth > 0:
-            fragments.append("".join(pending) + carry)
+            fragments.append("".join(pending))
     counts = tuple(
         _strict_count(value[1]) if value is not None else None for value in last_counts
     )
@@ -891,22 +910,33 @@ def _embedded_location(blocks: list[str], *, extreme: str) -> dict[str, Any] | N
     return None
 
 
-def _first_float(text: str, pattern: str) -> float | None:
-    """返回正则表达式首次匹配到的浮点数。"""
+def _first_float(text: str, pattern: str) -> float | str | None:
+    """返回首个统计值；非法文本保留到质量校验阶段。"""
 
     match = re.search(pattern, text, flags=re.IGNORECASE)
-    return float(match.group(1)) if match else None
+    return _parse_number(match.group(1)) if match else None
 
 
-def _strict_count(token: str) -> int | float:
+def _parse_number(token: str) -> float | str:
+    """先识别字段再解析数值，失败时保留原文供字段级错误说明使用。"""
+
+    token = token.strip()
+    try:
+        return float(token)
+    except ValueError:
+        return token
+
+
+def _strict_count(token: str) -> int | float | str:
     """将计数字段文本转为严格整数；非整数字面量保留为浮点而不截断。"""
 
+    token = token.strip()
     if re.fullmatch(r"[+-]?\d+", token):
         return int(token)
-    return float(token)
+    return _parse_number(token)
 
 
-def _last_count(text: str, pattern: str) -> int | float | None:
+def _last_count(text: str, pattern: str) -> int | float | str | None:
     """返回正则表达式最后一次匹配到的计数值，不做小数截断。"""
 
     matches = list(re.finditer(pattern, text, flags=re.IGNORECASE))
@@ -925,7 +955,10 @@ def _add_wall_uniformity(metrics: dict[str, Any]) -> None:
 
     min_wall = metrics.get("min_wall_distance")
     max_wall = metrics.get("max_wall_distance")
-    if min_wall is not None and max_wall is not None and min_wall != 0:
+    if (
+        isinstance(min_wall, (int, float)) and isinstance(max_wall, (int, float))
+        and math.isfinite(min_wall) and math.isfinite(max_wall) and min_wall != 0
+    ):
         metrics["wall_distance_uniformity"] = max_wall / min_wall
 
 

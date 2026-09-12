@@ -24,7 +24,9 @@ export function buildRunForest(runs: readonly RunSummary[]): RunTreeNode[] {
 export function isActiveRun(run: RunSummary): boolean {
   return run.status === 'QUEUED'
     || run.status === 'RUNNING'
-    || (run.status === 'SUCCEEDED' && run.preview_status === 'PENDING');
+    || run.postprocess_status === 'PENDING'
+    || run.postprocess_status === 'RUNNING'
+    || (run.postprocess_status === undefined && run.status === 'SUCCEEDED' && run.preview_status === 'PENDING');
 }
 
 export function latestRunId(runs: readonly RunSummary[]): string | undefined {

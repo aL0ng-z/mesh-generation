@@ -78,7 +78,7 @@ export function MeshViewer({ run, cameraGroup, compact = false }: Props) {
   }
   if (manifestQuery.isPending) return <div className={styles.unavailable}>正在读取预览 manifest…</div>;
   if (manifestQuery.isError) return <div className={styles.unavailable}>Viewer manifest 加载失败：{(manifestQuery.error as Error).message}</div>;
-  if (manifest?.status === 'PENDING' || (run.preview_status === 'PENDING' && manifest?.status !== 'READY')) {
+  if (manifest?.status === 'PENDING' || (run.preview_status === 'PENDING' && manifest?.status !== 'READY' && manifest?.status !== 'FAILED')) {
     return <div className={styles.unavailable}>网格运行已成功，正在生成三维预览资产；页面每 3 秒自动刷新…</div>;
   }
   if (!manifest || manifest.available === false || manifest.status !== 'READY' || !manifest.blocks.length) {

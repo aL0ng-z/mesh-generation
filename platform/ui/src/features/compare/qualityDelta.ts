@@ -57,6 +57,7 @@ export function qualityReportStatus(
 export function numericQualityMetrics(report?: QualityReport | null): Map<string, QualityMetric & { value: number }> {
   const result = new Map<string, QualityMetric & { value: number }>();
   for (const metric of normalizeQualityMetrics(report)) {
+    if (metric.value == null || (typeof metric.value === 'string' && !metric.value.trim())) continue;
     const numeric = typeof metric.value === 'number' ? metric.value : Number(metric.value);
     if (Number.isFinite(numeric)) result.set(metric.key, { ...metric, value: numeric });
   }

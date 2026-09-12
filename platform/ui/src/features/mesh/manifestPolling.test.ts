@@ -29,6 +29,7 @@ describe('预览后处理轮询', () => {
 
   it('READY 或终态 UNAVAILABLE 后停止轮询', () => {
     expect(manifestPollingInterval(run('PENDING'), manifest('READY'))).toBe(false);
+    expect(manifestPollingInterval(run('PENDING'), manifest('FAILED'))).toBe(false);
     expect(manifestPollingInterval(run('UNAVAILABLE'), manifest('UNAVAILABLE'))).toBe(false);
     expect(manifestPollingInterval(run('READY'), manifest('UNAVAILABLE'))).toBe(false);
     expect(manifestPollingInterval(run('UNAVAILABLE'), manifest('PENDING'))).toBe(false);

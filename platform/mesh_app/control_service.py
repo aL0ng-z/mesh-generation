@@ -62,7 +62,10 @@ class ControlService:
                 identity = (spec.key, selector)
                 value = values.get(identity)
                 availability, reason = _availability(session, parent, spec, selector, values)
-                controls.append(_control_item(spec, selector, value, availability, reason))
+                controls.append(_control_item(
+                    spec, selector, value, availability, reason,
+                    can_clear=session["status"] == "ACTIVE" and parent["status"] == "SUCCEEDED" and identity in values,
+                ))
                 entities.add(selector)
                 stages.add(spec.stage)
                 topologies.update(spec.topologies)
@@ -249,6 +252,8 @@ class ControlService:
             if "value" in raw and raw["value"] is not None:
                 raise ControlValidationError("clear 操作不能携带 value")
             return [{"key": key, "selector": item, "op": "clear"} for item in selectors]
+        if spec.unsupported_reason:
+            raise ControlValidationError(spec.unsupported_reason)
         if "value" not in raw:
             raise ControlValidationError("set 操作必须携带 value")
         normalized: list[dict[str, Any]] = []
@@ -342,6 +347,8 @@ def _control_item(
     value: Any,
     availability: str,
     reason: str | None,
+    *,
+    can_clear: bool = False,
 ) -> dict[str, Any]:
     value_type = {
         "bool": "boolean",
@@ -363,6 +370,7 @@ def _control_item(
         "topology": ",".join(spec.topologies) if spec.topologies else None,
         "availability": availability,
         "reason": reason,
+        "can_clear": can_clear,
         "value_type": value_type,
         "value": value,
         "inherited_value": None if value is not None else "由 AutoGrid 默认决定",
@@ -384,6 +392,8 @@ def _availability(
         return "LOCKED", "会话已完成，控制已冻结"
     if parent["status"] != "SUCCEEDED":
         return "LOCKED", "只能从成功运行创建控制分支"
+    if spec.unsupported_reason:
+        return "LOCKED", spec.unsupported_reason
     missing_prerequisites = _missing_prerequisites(spec.key, selector, values)
     if missing_prerequisites:
         requirements = "、".join(
@@ -455,6 +465,7 @@ def _effective_availability(
                     "selector": selector,
                     "availability": availability,
                     "reason": reason,
+                    "can_clear": session["status"] == "ACTIVE" and parent["status"] == "SUCCEEDED" and (spec.key, selector) in values,
                 }
             )
     return items

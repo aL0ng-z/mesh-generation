@@ -173,7 +173,7 @@ def test_recover_stale_run_writes_failed_terminal_and_event(tmp_path: Path) -> N
         stale_after_seconds=30,
         now=old + timedelta(seconds=31),
     )
-    assert recovered == 1
+    assert recovered == [run_ids[0]]
     with database.reading() as connection:
         stale = connection.execute("SELECT * FROM runs WHERE id = ?", (run_ids[0],)).fetchone()
         live = connection.execute("SELECT * FROM runs WHERE id = ?", (run_ids[1],)).fetchone()
@@ -187,6 +187,36 @@ def test_recover_stale_run_writes_failed_terminal_and_event(tmp_path: Path) -> N
         ).fetchone()
         assert event["stage"] == "RECOVERY"
         assert event["level"] == "ERROR"
+
+
+def test_worker_periodically_recovers_newly_stale_runs_without_resetting_postprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = _database(tmp_path)
+    _, run_ids = _insert_session_and_runs(database, 3)
+    old = datetime.now(timezone.utc)
+    for owner in ("previous-worker", "current-worker", "previous-worker"):
+        assert atomic_claim_run(database, owner, now=old)
+    mark_run_succeeded(database, run_ids[2], run_summary={}, quality={}, quality_status="UNKNOWN")
+    settings = _worker_settings(tmp_path, database, tmp_path / "data", PROJECT_ROOT)
+    worker = Worker(settings, database=database, worker_id="current-worker")
+    worker._stop_requested = True
+    worker.run_once()
+    assert worker._postprocess_queue == [run_ids[2]]
+    with database.transaction(immediate=True) as connection:
+        connection.execute("UPDATE runs SET postprocess_status = 'RUNNING' WHERE id = ?", (run_ids[2],))
+    monkeypatch.setattr(worker_module, "_datetime_value", lambda now: old + timedelta(seconds=31))
+    worker._last_recovery -= worker._heartbeat_interval
+    worker.run_once()
+    assert worker._postprocess_queue == [run_ids[2], run_ids[0]]
+    with database.reading() as connection:
+        rows = {row["id"]: row for row in connection.execute("SELECT * FROM runs")}
+        assert rows[run_ids[0]]["error_code"] == "WORKER_HEARTBEAT_LOST"
+        assert rows[run_ids[1]]["status"] == "RUNNING"
+        assert rows[run_ids[2]]["postprocess_status"] == "RUNNING"
+    worker._last_recovery -= worker._heartbeat_interval
+    worker.run_once()
+    assert worker._postprocess_queue == [run_ids[2], run_ids[0]]
 
 
 def test_control_snapshot_builds_stable_mesh_cli(tmp_path: Path) -> None:
@@ -513,8 +543,9 @@ def test_worker_startup_recovers_succeeded_pending_postprocess(tmp_path: Path) -
     assert "POSTPROCESS" in stages
 
 
-def test_online_backup_contains_consistent_database_and_artifact_manifest(tmp_path: Path) -> None:
-    data_dir = tmp_path / "data"
+@pytest.mark.parametrize("data_name,backup_name", [("data", "backups"), ("data#100%", "backups"), ("data", "backups#100%")])
+def test_online_backup_contains_consistent_database_and_artifact_manifest(tmp_path: Path, data_name: str, backup_name: str) -> None:
+    data_dir = tmp_path / data_name
     database = Database(data_dir / "mesh.sqlite3", MIGRATIONS_DIR, 10_000)
     database.migrate()
     session_id, run_ids = _insert_session_and_runs(database, 1)
@@ -541,12 +572,13 @@ def test_online_backup_contains_consistent_database_and_artifact_manifest(tmp_pa
                 "2026-08-06T00:00:00.000Z",
             ),
         )
-    result = create_backup(database.path, data_dir, data_dir / "backups")
+    result = create_backup(database.path, data_dir, data_dir / backup_name)
     backup_path = Path(result["database"])
     manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
     with sqlite3.connect(backup_path) as connection:
         assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
         assert connection.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0] == 1
+        assert connection.execute("SELECT id FROM sessions").fetchone()[0] == session_id
     assert manifest["counts"]["registered_artifacts"] == 1
     assert manifest["counts"]["missing_registered"] == 0
     assert manifest["counts"]["filesystem_files"] == 1
@@ -554,7 +586,7 @@ def test_online_backup_contains_consistent_database_and_artifact_manifest(tmp_pa
     listed = next(item for item in manifest["files"] if item["relative_path"] == relative)
     assert listed["verification"] == "MATCH"
 
-    second = create_backup(database.path, data_dir, data_dir / "backups")
+    second = create_backup(database.path, data_dir, data_dir / backup_name)
     assert second["database"] != result["database"]
     assert second["manifest"] != result["manifest"]
 
@@ -628,6 +660,36 @@ def _run_worker_until_terminal(
         time.sleep(0.05)
     worker.shutdown()
     pytest.fail("Worker 未在期限内将运行推进到终态")
+
+
+def test_worker_rejects_preexisting_queued_target_points_with_real_cli(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    session_id, run_ids = _insert_session_and_runs(database, 1)
+    data_dir = tmp_path / "data"
+    geometry_path = _write_geometry(data_dir, session_id)
+    geometry_path.write_text(
+        "GEOMETRY TURBO\nVERSION 5.6\nUNITS METER\nUNITS-FACTOR 1.0\n"
+        "NI_BEGIN nirow\nNAME Rotor\nPERIODICITY 36\n"
+        "NI_BEGIN niblade\nNAME MainBlade\nNUMBER_OF_BLADES 36\nNI_END niblade\nNI_END nirow\n",
+        encoding="utf-8",
+    )
+    with database.transaction(immediate=True) as connection:
+        connection.execute("UPDATE runs SET control_snapshot_json = ? WHERE id = ?", (
+            json.dumps({"schema_version": 1, "items": [
+                {"key": "row/mesh_level", "selector": "row:#1", "value": "user"},
+                {"key": "row/target_points", "selector": "row:#1", "value": 500000},
+            ]}), run_ids[0],
+        ))
+    worker = Worker(
+        _worker_settings(tmp_path, database, data_dir, PROJECT_ROOT), database=database,
+        resource_probe=_always_allowed_probe,
+    )
+    try:
+        row = _run_worker_until_terminal(worker, database, run_ids[0])
+        assert row["status"] == "FAILED"
+        assert "目标点数控制暂时停用" in row["error_message"]
+    finally:
+        worker.shutdown()
 
 
 def test_worker_refuses_existing_run_directory_and_marks_failed(tmp_path: Path) -> None:

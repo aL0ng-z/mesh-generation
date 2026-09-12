@@ -572,15 +572,6 @@ def build_dependency_controls(key: str, value: Any) -> list[tuple[str, Any]]:
             variable_key=key,
         )
 
-    # 值相关的可设置前置条件。
-    if key == "wizard/grid_level" and value == "user":
-        _add_dependency(
-            dependencies,
-            "row/target_points",
-            750000,
-            variable_key=key,
-        )
-
     ordered = sorted(
         dependencies.items(),
         key=lambda item: (
@@ -765,6 +756,17 @@ def build_control_cases(
     cases: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     for key in sorted(GENERAL_CONTROL_KEYS):
+        spec = CONTROL_REGISTRY[key]
+        if spec.unsupported_reason:
+            blocked.append({
+                "case_id": f"cases/blocked/{_safe_name(key)}",
+                "phase": "cases", "category": "UNSUPPORTED_CONTROL",
+                "variable_key": key, "variable_value": None,
+                "topology": None, "dependency_controls": [], "set_args": [],
+                "context_id": "unsupported", "out_dir": "", "signature": "",
+                "status": "blocked", "error": spec.unsupported_reason, "run_summary": None,
+            })
+            continue
         if key in GENERAL_HOH_KEYS and hoh_anchor is None:
             blocked.append(
                 {
@@ -962,8 +964,10 @@ def execute_case(
     igg_executable: str | None,
 ) -> dict[str, Any]:
     started = time.time()
-    out_dir = Path(case["out_dir"])
-    out_dir.mkdir(parents=True, exist_ok=True)
+    case_root = Path(case["out_dir"])
+    case_root.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(tempfile.mkdtemp(prefix="attempt_", dir=str(case_root)))
+    case = {**case, "out_dir": str(out_dir)}
     command = _mesh_command(
         case,
         timeout_seconds=timeout_seconds,
@@ -1125,11 +1129,9 @@ def execute_batch(
     ]
     for case in retry_cases:
         print(f"串行重试基础设施失败：{case['case_id']}")
-        # 运行目录一经占用不可复用；串行重试使用全新同级目录。
-        retry_case = dict(case)
-        retry_case["out_dir"] = f"{case['out_dir']}_retry"
+        # execute_case 为每次尝试分配新目录，恢复与串行重试使用相同规则。
         retry_result = execute_case(
-            retry_case,
+            case,
             timeout_seconds=timeout_seconds,
             igg_executable=igg_executable,
         )
@@ -1694,12 +1696,16 @@ def main(argv: list[str] | None = None) -> int:
 class CampaignRunnerUnitTests(unittest.TestCase):
     def test_full_matrix_covers_156_controls_with_comparable_variants(self) -> None:
         cases, blocked = build_control_cases(Path("<unit>"), hoh_anchor=[])
-        self.assertFalse(blocked)
+        unsupported = {key for key in GENERAL_CONTROL_KEYS if CONTROL_REGISTRY[key].unsupported_reason}
+        self.assertEqual({item["variable_key"] for item in blocked}, unsupported)
+        self.assertTrue(all(item["error"] for item in blocked))
         by_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for case in cases:
             if case.get("variable_key") in GENERAL_CONTROL_KEYS:
                 by_key[case["variable_key"]].append(case)
-        self.assertEqual(set(by_key), set(GENERAL_CONTROL_KEYS))
+        self.assertEqual(set(by_key), set(GENERAL_CONTROL_KEYS) - unsupported)
+        for case in cases:
+            self.assertFalse(any("/target_points=" in arg for arg in case["set_args"]))
         for key, key_cases in by_key.items():
             contexts: dict[str, set[str]] = defaultdict(set)
             for case in key_cases:
@@ -1789,6 +1795,37 @@ class CampaignRunnerUnitTests(unittest.TestCase):
                 )
         execute_mock.assert_not_called()
         self.assertEqual(results, previous)
+
+    def test_failed_case_resume_preserves_previous_attempt_and_uses_new_directory(self) -> None:
+        import fake_igg
+
+        original_command = _mesh_command
+
+        def command_without_fingerprint(*args: Any, **kwargs: Any) -> list[str]:
+            # 此用例验证真实 CLI 目录占用；假 IGG 不提供完整 CGNS 坐标。
+            return [part for part in original_command(*args, **kwargs) if part != "--mesh-fingerprint"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher = fake_igg.write_launcher(root / "launcher")
+            case = {"case_id": "resume", "signature": "same", "out_dir": str(root / "case"), "set_args": []}
+            results_file = root / "results.json"
+            with patch(__name__ + "._mesh_command", side_effect=command_without_fingerprint), patch(
+                __name__ + ".GEOMETRY_PATH", PROJECT_ROOT / "geometries/fixtures/single_row.geomTurbo"
+            ):
+                with patch.dict(os.environ, {fake_igg.BEHAVIOR_ENV: "script_traceback"}):
+                    first = execute_batch([case], results_file=results_file, max_workers=1,
+                        timeout_seconds=10, igg_executable=str(launcher), resume=True, dry_run=False)[0]
+                first_summary = (Path(first["out_dir"]) / "run_summary.json").read_bytes()
+                with patch.dict(os.environ, {fake_igg.BEHAVIOR_ENV: "normal"}):
+                    second = execute_batch([case], results_file=results_file, max_workers=1,
+                        timeout_seconds=10, igg_executable=str(launcher), resume=True, dry_run=False)[0]
+            self.assertEqual(first["returncode"], 1)
+            self.assertEqual(second["returncode"], 0, second["error"])
+            self.assertIsNone(second["error"])
+            self.assertNotEqual(first["out_dir"], second["out_dir"])
+            self.assertEqual(first_summary, (Path(first["out_dir"]) / "run_summary.json").read_bytes())
+            self.assertEqual(first["signature"], second["signature"])
 
     def test_pilot_rejects_unstable_aa_fingerprint(self) -> None:
         results = []

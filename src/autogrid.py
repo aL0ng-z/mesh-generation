@@ -181,6 +181,7 @@ def run_autogrid_init(
             protocol_errors=[],
             controls_verification={
                 "status": "INCOMPLETE" if controls else "NOT_REQUESTED",
+                "basis": "post_generation",
                 "results": [],
             },
             manifest_outputs=[],
@@ -239,13 +240,14 @@ def run_autogrid_init(
         controls, parsed_post_events, protocol_errors=protocol_errors
     )
     controls_verification = {
+        "basis": "post_generation",
         "status": (
             "PROTOCOL_ERROR"
             if protocol_errors
             else ("COMPLETE" if controls else "NOT_REQUESTED")
         ),
         "results": verify_control_readbacks(
-            controls, control_results, units_factor=units_factor
+            controls, control_results, post_control_results, units_factor=units_factor
         ),
     }
     fingerprint_data = None
@@ -1092,7 +1094,7 @@ def compare_control_readback(
     units_factor: float | None,
     readback: Any,
 ) -> bool | None:
-    """按注册表规则比较 setter 后回读与请求值。
+    """按注册表规则比较生成后回读与请求值。
 
     返回 True/False 表示匹配或不匹配；None 表示无法按已确认规则解释，
     不认定为 VERIFIED。整数、布尔和枚举归一化后精确比较；浮点使用
@@ -1160,33 +1162,39 @@ def compare_control_readback(
 def verify_control_readbacks(
     controls: Sequence[ResolvedControl],
     merged: Sequence[dict[str, Any]],
+    post_generation: Sequence[dict[str, Any]],
     *,
     units_factor: float | None = None,
 ) -> list[dict[str, Any]]:
-    """为每项计划控制生成 VERIFIED/MISMATCH/READBACK_ERROR/UNVERIFIABLE 验证结果。"""
+    """依据生成后回读核验参数，应用失败或未观察到结果不认定为已验证。"""
 
     merged_by_id = {str(item.get("id")): item for item in merged}
+    post_by_id = {str(item.get("id")): item for item in post_generation}
     results: list[dict[str, Any]] = []
     for control in controls:
         spec = CONTROL_REGISTRY.get(control.key)
-        event = merged_by_id.get(control.control_id, {})
+        applied = merged_by_id.get(control.control_id, {})
+        event = post_by_id.get(control.control_id, {})
         status = event.get("status")
         readback = event.get("readback")
         error = event.get("error")
         verification: str
         detail: str | None
-        if status == "failed":
+        if applied.get("status") != "applied":
             verification = "UNVERIFIABLE"
-            detail = error or "setter 执行失败"
-        elif status == "not_applied":
+            detail = applied.get("error") or "setter 未成功执行"
+        elif status in (None, "not_observed"):
             verification = "UNVERIFIABLE"
-            detail = error or "未收到应用事件"
+            detail = error or "未收到生成后观察事件"
         elif not control.getter:
             verification = "UNVERIFIABLE"
             detail = "该控制未注册 getter，无法回读验证"
-        elif error:
+        elif error or status == "failed":
             verification = "READBACK_ERROR"
-            detail = error
+            detail = error or "生成后 getter 执行失败"
+        elif status != "readback":
+            verification = "UNVERIFIABLE"
+            detail = "生成后事件没有可验证的回读"
         elif spec is None:
             verification = "UNVERIFIABLE"
             detail = f"控制 {control.key} 不在注册表中"
@@ -1685,22 +1693,22 @@ def resolve_igg(executable: str = "igg") -> str | None:
 
     if os.path.sep in executable or (os.path.altsep and os.path.altsep in executable):
         path = Path(executable)
-        return str(path) if path.exists() else None
+        return str(path.resolve()) if path.exists() else None
     resolved = shutil.which(executable)
     if resolved:
-        return resolved
+        return str(Path(resolved).resolve())
     if executable.lower() not in {"igg", "igg.exe", "iggx86_64", "iggx86_64.exe"}:
         return None
     for root in _candidate_roots():
         candidate = root / "bin64" / "iggx86_64.exe"
         if candidate.exists():
-            return str(candidate)
+            return str(candidate.resolve())
         candidate = root / "bin64" / "igg.exe"
         if candidate.exists():
-            return str(candidate)
+            return str(candidate.resolve())
         candidate = root / "bin" / "igg"
         if candidate.exists():
-            return str(candidate)
+            return str(candidate.resolve())
     return None
 
 

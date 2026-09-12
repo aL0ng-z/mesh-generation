@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../../api/client';
 import { AUTH_SESSION_QUERY_KEY } from '../../app/queryClient';
@@ -8,6 +9,7 @@ interface AuthGateProps {
 }
 
 export function AuthGate({ children }: AuthGateProps) {
+  const [opened, setOpened] = useState(false);
   const sessionQuery = useQuery({
     queryKey: AUTH_SESSION_QUERY_KEY,
     queryFn: () => api.getAuthSession(),
@@ -15,26 +17,18 @@ export function AuthGate({ children }: AuthGateProps) {
     retry: false,
   });
 
-  if (sessionQuery.isPending) {
-    return (
-      <main className="auth-loading" role="status">
-        正在确认登录状态…
-      </main>
-    );
-  }
-
   const session = sessionQuery.data;
-  if (sessionQuery.isError || !session || !session.enabled || session.authenticated) {
-    // 鉴权未配置、已认证，或会话查询本身失败（如网络不可达）时放行，
-    // 让应用自身的数据请求与错误提示接管。
-    return <>{children}</>;
-  }
+  const accessible = !sessionQuery.isPending
+    && (sessionQuery.isError || !session || !session.enabled || session.authenticated);
+  if (accessible && !opened) setOpened(true);
 
   return (
-    <LoginPage
-      onSuccess={() => {
-        void sessionQuery.refetch();
-      }}
-    />
+    <>
+      {(opened || accessible) ? <div hidden={!accessible} inert={!accessible}>{children}</div> : null}
+      {sessionQuery.isPending ? <main className="auth-loading" role="status">正在确认登录状态…</main> : null}
+      {!sessionQuery.isPending && !accessible ? (
+        <LoginPage onSuccess={() => { void sessionQuery.refetch(); }} />
+      ) : null}
+    </>
   );
 }

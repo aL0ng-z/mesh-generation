@@ -9,6 +9,7 @@ accepted=False；涉及非有限值的对外结构断言转换为 null。
 from __future__ import annotations
 
 import math
+import json
 import shutil
 import sys
 import tempfile
@@ -340,6 +341,74 @@ class QualityReportParseTests(unittest.TestCase):
         )
         self.assertIn("Maximal Expansion Ratio : 1e309", summary["raw"])
 
+    def test_optional_statistic_invalid_tokens_are_not_discarded(self) -> None:
+        for token in ("NaN", "Inf", "-Inf", "1e999", "invalid", ""):
+            with self.subTest(token=token):
+                path = _temp_text_file(
+                    self, VALID_REPORT + f"Average Wall Distance : {token}\n", "mesh.qualityReport"
+                )
+                summary = summarize_quality({"quality_report": path}, units_factor=0.001)
+                self.assertEqual(summary["result"]["status"], "UNKNOWN")
+                self.assertFalse(summary["result"]["accepted"])
+                self.assertIsNone(summary["metrics"]["avg_wall_distance"])
+                self.assertTrue(any(
+                    reason["field"] == "quality.metrics.avg_wall_distance"
+                    for reason in summary["quality_validation"]["reasons"]
+                ))
+                json.dumps(summary, allow_nan=False)
+
+    def test_all_row_criteria_and_counts_are_validated(self) -> None:
+        cases = (
+            ("Average Skewness Angle : 181", "criteria.skewness_angle.average"),
+            ("Minimal Spanwise Skewness Angle : -1", "criteria.spanwise_skewness_angle.minimum"),
+            ("Maximal Spanwise Expansion Ratio : 0", "criteria.spanwise_expansion_ratio.maximum"),
+            ("Average Aspect Ratio : -1", "criteria.aspect_ratio.average"),
+            ("Average Expansion Ratio : NaN", "criteria.expansion_ratio.average"),
+            ("Average Wall Distance : 1e999", "criteria.wall_distance.average"),
+            ("Minimal Wall Distance : invalid", "criteria.wall_distance.minimum"),
+            ("Number of Negative Cells : -1", "negative_cells"),
+            ("Number of Points : Inf", "number_of_points"),
+            ("Number of grid levels : 3.5", "grid_levels"),
+        )
+        for line, field in cases:
+            with self.subTest(line=line):
+                path = _temp_text_file(
+                    self, VALID_REPORT + f"row 1 Quality\n{line}\n", "mesh.qualityReport"
+                )
+                model = parse_quality_report(path)
+                self.assertEqual(evaluate_quality(model).status, "UNKNOWN")
+                summary = summarize_quality({"quality_report": path})
+                self.assertEqual(summary["result"]["status"], "UNKNOWN")
+                self.assertFalse(summary["result"]["accepted"])
+                self.assertIn(
+                    f"quality.entities[1].{field}",
+                    [reason["field"] for reason in summary["quality_validation"]["reasons"]],
+                )
+                json.dumps(summary, allow_nan=False)
+
+    def test_missing_and_invalid_fields_are_both_reported(self) -> None:
+        path = _temp_text_file(
+            self, VALID_REPORT.replace("Number of Points : 1000\n", "")
+            + "Average Wall Distance : invalid\n", "mesh.qualityReport"
+        )
+        reasons = summarize_quality({"quality_report": path})["quality_validation"]["reasons"]
+        self.assertIn({"field": "quality.metrics.number_of_points", "problem": "缺失"}, reasons)
+        self.assertIn({
+            "field": "quality.metrics.avg_wall_distance", "problem": "无法解析数值: 'invalid'"
+        }, reasons)
+
+    def test_project_row_invalid_count_is_not_discarded(self) -> None:
+        path = _temp_text_file(
+            self, VALID_REPORT.replace("NUMBER OF MAIN BLADES 17", "NUMBER OF MAIN BLADES bad"),
+            "mesh.qualityReport",
+        )
+        summary = summarize_quality({"quality_report": path})
+        self.assertFalse(summary["result"]["accepted"])
+        self.assertIn({
+            "field": "quality.project.rows[0].main_blades", "problem": "无法解析数值: 'bad'"
+        }, summary["quality_validation"]["reasons"])
+        self.assertIsNone(summary["project"]["rows"][0]["main_blades"])
+
 
 class CgnsQualityParseTests(unittest.TestCase):
     """parse_embedded_cgns_quality() 的 CGNS 降级解析入口。"""
@@ -385,6 +454,24 @@ class CgnsQualityParseTests(unittest.TestCase):
             {"field": "quality.metrics.max_expansion_ratio", "problem": "非有限数值"},
             summary["quality_validation"]["reasons"],
         )
+
+    def test_optional_cgns_statistic_and_count_invalid_tokens_are_retained(self) -> None:
+        for token in ("NaN", "Inf", "1e999", "bad", ""):
+            for original, replacement, field in (
+                ("average 0.01", f"average {token}", "avg_wall_distance"),
+                ("NUMBER_OF_POINTS 12345", f"NUMBER_OF_POINTS {token}", "number_of_points"),
+            ):
+                with self.subTest(token=token, field=field):
+                    path = _temp_text_file(self, VALID_CGNS.replace(original, replacement), "mesh.cgns")
+                    summary = summarize_quality({"cgns": path})
+                    self.assertEqual(summary["result"]["status"], "UNKNOWN")
+                    self.assertFalse(summary["result"]["accepted"])
+                    self.assertIsNone(summary["metrics"][field])
+                    self.assertTrue(any(
+                        reason["field"] == f"quality.metrics.{field}"
+                        for reason in summary["quality_validation"]["reasons"]
+                    ))
+                    json.dumps(summary, allow_nan=False)
 
 
 class QualitySourceSelectionTests(unittest.TestCase):

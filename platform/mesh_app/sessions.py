@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
+from controls import CONTROL_REGISTRY
+
 from .db import Database
 
 
@@ -493,6 +495,14 @@ class SessionService:
                 _assert_active_and_version(session, expected_version)
                 if source["status"] != "FAILED":
                     raise ServiceError("RUN_NOT_FAILED", "只有失败运行可以重试", status_code=409)
+                snapshot = load_json(source["control_snapshot_json"], EMPTY_CONTROL_SNAPSHOT)
+                for item in snapshot["items"]:
+                    spec = CONTROL_REGISTRY.get(item["key"])
+                    if spec is not None and spec.unsupported_reason:
+                        raise ServiceError(
+                            "CONTROL_VALIDATION_FAILED", spec.unsupported_reason, status_code=422,
+                            details={"key": spec.key, "selector": item["selector"]},
+                        )
                 retry_id = str(uuid.uuid4())
                 sequence = _next_sequence(connection, session_id)
                 timestamp = utc_now()

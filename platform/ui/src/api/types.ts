@@ -122,6 +122,7 @@ export interface ControlItem {
   stage?: string | null;
   topology?: string | null;
   availability: ControlAvailability;
+  can_clear?: boolean;
   reason?: string | null;
   value_type?: 'boolean' | 'integer' | 'number' | 'string' | 'enum';
   value?: unknown;
@@ -156,6 +157,7 @@ export interface EffectiveAvailabilityEntry {
   key: string;
   selector: string;
   availability: ControlAvailability;
+  can_clear?: boolean;
   reason?: string | null;
 }
 

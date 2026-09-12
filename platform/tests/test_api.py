@@ -5,7 +5,9 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import mesh_app.api as api_module
 from fastapi.testclient import TestClient
+from controls import CONTROL_REGISTRY
 from geomturbo import MAX_PHYSICAL_LINE_CHARS
 
 from mesh_app.api import create_app
@@ -13,6 +15,7 @@ from mesh_app.artifacts import ArtifactStore, parse_range_header
 from mesh_app.config import Settings
 from mesh_app.db import Database, DatabaseVersionError
 from mesh_app.sessions import utc_now
+from mesh_app.worker import set_postprocess_terminal
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -143,7 +146,7 @@ def test_upload_list_detail_artifact_range_and_uniform_errors(tmp_path: Path) ->
 
         health = client.get("/api/health")
         assert health.status_code == 200
-        assert health.json()["database"] == {"status": "ok", "version": 2}
+        assert health.json()["database"] == {"status": "ok", "version": 3}
         assert health.json()["queue"]["queued"] == 1
 
 
@@ -368,6 +371,26 @@ def test_branch_idempotency_retry_note_version_conflict_and_freeze(tmp_path: Pat
         assert frozen_preview.json()["error"]["code"] == "SESSION_FROZEN"
 
 
+def test_failed_postprocess_manifest_returns_failure_without_converting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _settings, database, application = make_app(tmp_path)
+    with TestClient(application) as client:
+        detail = upload_session(client)
+        run_id = detail["runs"][0]["id"]
+        transition(database, run_id, "RUNNING")
+        transition(database, run_id, "SUCCEEDED")
+        set_postprocess_terminal(database, run_id, "FAILED", error="后处理超时", message="后处理失败")
+
+        def unexpected_conversion(*args, **kwargs):
+            raise AssertionError("失败 manifest 不应重新转换")
+
+        monkeypatch.setattr(api_module, "_preview_for_run", unexpected_conversion)
+        response = client.get(f"/api/v1/runs/{run_id}/mesh/manifest")
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "FAILED", "reason": "后处理超时", "reason_code": "POSTPROCESS_FAILED", "blocks": [],
+        }
+
+
 def test_control_preview_events_preview_degradation_and_path_safety(tmp_path: Path) -> None:
     settings, database, application = make_app(tmp_path)
     with TestClient(application) as client:
@@ -393,7 +416,7 @@ def test_control_preview_events_preview_degradation_and_path_safety(tmp_path: Pa
         )
         assert invalid_preview.status_code == 200
         assert invalid_preview.json()["valid"] is False
-        assert invalid_preview.json()["errors"][0]["code"] == "CONTROL_PREREQUISITE_NOT_MET"
+        assert invalid_preview.json()["errors"][0]["code"] == "INVALID_CONTROL_CHANGE"
         effective_items = invalid_preview.json()["effective_availability"]
         target_effective = next(
             item
@@ -404,7 +427,8 @@ def test_control_preview_events_preview_degradation_and_path_safety(tmp_path: Pa
             "key": "row/target_points",
             "selector": "row:#1",
             "availability": "LOCKED",
-            "reason": "需先显式设置 row/mesh_level=user",
+            "reason": CONTROL_REGISTRY["row/target_points"].unsupported_reason,
+            "can_clear": False,
         }
 
         with database.transaction(immediate=True) as connection:

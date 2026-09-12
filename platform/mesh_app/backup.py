@@ -38,7 +38,7 @@ def backup_database(
     temporary_path = Path(temporary_name)
     try:
         source = sqlite3.connect(
-            f"file:{source_path.as_posix()}?mode=ro",
+            source_path.resolve().as_uri() + "?mode=ro",
             uri=True,
             timeout=busy_timeout_ms / 1000.0,
             isolation_level=None,
@@ -184,7 +184,7 @@ def create_backup(
 
 def _registered_artifacts(database_path: Path) -> list[dict[str, Any]]:
     connection = sqlite3.connect(
-        f"file:{database_path.as_posix()}?mode=ro", uri=True, isolation_level=None
+        database_path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None
     )
     connection.row_factory = sqlite3.Row
     try:

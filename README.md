@@ -1,6 +1,6 @@
 # geomTurbo → AutoGrid 17.1 网格生成工具
 
-本项目从 `.geomTurbo` 文件直接建立 NUMECA AutoGrid 17.1 项目，应用经过类型校验的纯网格控制，生成 B2B/3D 网格，并把原生 `.qualityReport` 标准化为 Schema v3 运行摘要。
+本项目从 `.geomTurbo` 文件直接建立 NUMECA AutoGrid 17.1 项目，应用经过类型校验的纯网格控制，生成 B2B/3D 网格，并把原生 `.qualityReport` 标准化为 Schema v4 运行摘要。
 
 当前网格内核在 `src/` 内保持扁平：不依赖 `.trb` 模板，不读取 JSON/YAML 配置，不对 `.trb` 做字符串修改。`platform/` 额外提供独立的内网 Web 服务，且不改变 CLI 的标准库依赖边界。所有仓库内运行产物写入 `runs/`。
 
@@ -14,7 +14,7 @@
 - 长度控制始终按米输入，并按 `.geomTurbo` 的 `UNITS-FACTOR` 换算为项目单位。
 - 按固定阶段调用正式 AutoGrid 17.1 Python API，并通过 getter 回读可回读参数。
 - 完整解析项目、逐叶排质量统计以及最差 block/I/J/K 位置。
-- 输出 Schema v3 `run_summary.json` 和中文 `report.md`，同时保留旧版字段。
+- 输出 Schema v4 `run_summary.json` 和中文 `report.md`，同时保留旧版字段；控制最终核验使用生成后回读。
 - 可选 `--mesh-fingerprint`，记录完整 CGNS block 坐标 SHA-256、I/J/K 尺寸、固定坐标探针和聚合网格指纹。
 - 在缺少 `.qualityReport` 时降级读取 CGNS 内嵌 `NIGridQuality` 数据。
 - 通过 `enumerate_control_targets()` 向内网平台公开与 CLI 一致的几何目标枚举逻辑。
@@ -26,7 +26,7 @@
 
 ```text
 src/                    扁平的网格内核源码目录
-  mesh.py               命令行入口、Schema v3 摘要、网格指纹和中文报告
+  mesh.py               命令行入口、Schema v4 摘要、网格指纹和中文报告
   controls.py           类型化控制注册表、选择器、校验、SI 换算和 17.1 API 审计
   geomturbo.py          .geomTurbo 元数据与实体选择信息解析
   autogrid.py           AutoGrid 17.1 脚本渲染、执行、回读和结果标记解析
@@ -123,7 +123,7 @@ python src/mesh.py geometries/Rotor37.geomTurbo `
 | 参数 | 含义 |
 |---|---|
 | `--mesh-level coarse\|medium\|fine\|user` | 所有叶排网格级别 |
-| `--target-points N` | 所有叶排 user 级别目标点数 |
+| `--target-points N` | 暂时停用：当前生成路径不能兑现目标点数，静态返回 2 |
 | `--first-cell-width M` | 所有叶排首层宽度；固定以米输入 |
 | `--spanwise-paths N` | 所有叶排 RowWizard 展向 flow paths 数 |
 | `--gap-points N` | 所有已存在 gap 的展向点数 |
@@ -190,7 +190,9 @@ project_value = requested_si / units_factor
 
 `.trb` 仅由 AutoGrid API 保存，用于复现和人工核对，程序不会读取后再修改其文本。
 
-## 运行产物与 Schema v3
+`row/target_points` 的通用 `--set` 和 Web 设置同样停用。控制目录及历史记录保留，Web 可清除旧节点继承的该值后创建新分支；使用 `--mesh-level`、展向和 B2B 点数控制调整网格。批量验证矩阵记录停用原因，不再执行该项。
+
+## 运行产物与 Schema v4
 
 典型运行目录：
 
@@ -213,13 +215,16 @@ runs/<case>_<timestamp>/
 `run_summary.json` 的稳定顶层结构为：
 
 ```text
-schema_version: 3
+schema_version: 4
+run_id
+created_at
 geometry
 controls
   requested
   resolved
   applied
   post_generation
+  verification              basis: post_generation；逐项核验结果
 autogrid
 mesh_fingerprint
 quality
@@ -229,6 +234,10 @@ quality
   entities
   metrics
   result
+quality_validation
+execution_evidence
+sources
+manifest
 ```
 
 - `controls.resolved` 记录静态解析结果；dry-run 中状态为 `planned`。
@@ -272,7 +281,9 @@ quality
 只运行当前实现的根测试：
 
 ```powershell
-python -m pytest tests -q
+python -m unittest discover -s tests -q
 ```
 
 测试不会读取或执行 `archive/` 中的历史实现。
+
+也可使用 `python -m pytest tests -q`，该方式需要额外安装 pytest；CLI 本身仍仅依赖标准库。

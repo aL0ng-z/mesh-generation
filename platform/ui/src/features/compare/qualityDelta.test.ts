@@ -36,3 +36,13 @@ it('格式化质量数值时保留极小差值并消除负零', () => {
   expect(formatQualityNumber(1_464_289)).toBe('1,464,289');
   expect(formatQualityNumber(14.8742)).toBe('14.874');
 });
+
+it('null、undefined、空白及非有限值不参与比较，真实零仍参与', () => {
+  const values = [null, undefined, '', '  ', Infinity, NaN, 'Infinity', 0];
+  const left = { metrics: values.map((value, index) => ({ key: String(index), value })) };
+  const right = { metrics: values.map((_value, index) => ({ key: String(index), value: 1 })) };
+  expect(calculateQualityDeltas(left, right)).toEqual([
+    { key: '7', label: '7', left: 0, right: 1, delta: 1, unit: undefined },
+  ]);
+  expect(calculateQualityDeltas(right, left)).toHaveLength(1);
+});

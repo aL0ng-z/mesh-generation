@@ -1,18 +1,19 @@
-import { QueryCache, QueryClient } from '@tanstack/react-query';
+import { MutationCache, QueryCache, QueryClient } from '@tanstack/react-query';
 import { ApiError } from '../api/client';
 
 export const AUTH_SESSION_QUERY_KEY = ['auth-session'] as const;
 
+function handleAuthenticationError(error: Error) {
+  if (error instanceof ApiError && error.status === 401) {
+    void queryClient.invalidateQueries({ queryKey: AUTH_SESSION_QUERY_KEY });
+  }
+}
+
 export const queryClient = new QueryClient({
   queryCache: new QueryCache({
-    onError(error) {
-      // 会话过期或 Cookie 被清除后，任何数据请求 401 都触发会话查询重取，
-      // AuthGate 全局回落到登录页。
-      if (error instanceof ApiError && error.status === 401) {
-        void queryClient.invalidateQueries({ queryKey: AUTH_SESSION_QUERY_KEY });
-      }
-    },
+    onError: handleAuthenticationError,
   }),
+  mutationCache: new MutationCache({ onError: handleAuthenticationError }),
   defaultOptions: {
     queries: {
       staleTime: 5_000,

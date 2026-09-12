@@ -57,6 +57,10 @@ DEFAULT_BEHAVIORS = frozenset(
         "script_traceback",
         "readback_error",
         "readback_mismatch",
+        "post_readback_mismatch",
+        "post_readback_error",
+        "modify_source_input",
+        "move_source_input",
         "slow",
     }
 )
@@ -311,7 +315,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if behavior != "no_events":
         for control in plan:
-            if behavior == "readback_error":
+            if behavior in {"readback_error", "post_readback_error"}:
                 _post_event(
                     control,
                     event_run_id,
@@ -319,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
                     readback=None,
                     error="RuntimeError: fake post getter failure",
                 )
-            elif behavior == "readback_mismatch":
+            elif behavior in {"readback_mismatch", "post_readback_mismatch"}:
                 _post_event(
                     control,
                     event_run_id,
@@ -353,6 +357,12 @@ def main(argv: list[str] | None = None) -> int:
         (cwd / "mesh.qualityReport").write_text(
             QUALITY_REPORT_TEMPLATE, encoding="utf-8"
         )
+    if behavior in {"modify_source_input", "move_source_input"}:
+        source = Path(os.environ["FAKE_IGG_SOURCE_INPUT"])
+        if behavior == "modify_source_input":
+            source.write_bytes(source.read_bytes() + b"\n# changed after input copy\n")
+        else:
+            source.rename(source.with_suffix(".moved"))
     return 0
 
 

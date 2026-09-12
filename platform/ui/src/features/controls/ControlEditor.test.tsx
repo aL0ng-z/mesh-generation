@@ -111,7 +111,7 @@ function previewFor(changes: readonly ControlChange[]): ControlPreview {
   };
 }
 
-function renderEditor() {
+function renderEditor(onDirtyChange: (dirty: boolean) => void = () => {}, frozen = false) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
@@ -119,8 +119,8 @@ function renderEditor() {
         sessionId="session-1"
         sessionVersion={1}
         parentRun={parentRun}
-        frozen={false}
-        onDirtyChange={() => {}}
+        frozen={frozen}
+        onDirtyChange={onDirtyChange}
         onRunCreated={() => {}}
       />
     </QueryClientProvider>,
@@ -335,4 +335,68 @@ it('number 类型允许小数与科学计数法，不套用整数限制', async 
   act(() => debounce.flush());
   await waitFor(() => expect(hasSet(lastPreviewChanges(previewSpy), 'row/expansion_ratio', 1.9)).toBe(true));
   expect(screen.queryByText('必须是整数，不接受小数')).not.toBeInTheDocument();
+});
+
+it('仅有非法原始输入也保护草稿，行撤销与放弃均清除原始文本', async () => {
+  setupApi();
+  const onDirtyChange = vi.fn();
+  renderEditor(onDirtyChange);
+  await screen.findByRole('textbox', { name: 'row/expansion_ratio · row:#1' });
+  fireEvent.change(ratioInput(), { target: { value: '1e' } });
+  expect(onDirtyChange).toHaveBeenLastCalledWith(true);
+  expect(screen.getByRole('button', { name: '放弃草稿' })).toBeEnabled();
+  expect(submitButton()).toBeDisabled();
+  fireEvent.click(within(screen.getAllByRole('article')[2]).getByRole('button', { name: '撤销' }));
+  expect(ratioInput()).toHaveValue('');
+  expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+  fireEvent.change(ratioInput(), { target: { value: '+' } });
+  fireEvent.click(screen.getByRole('button', { name: '放弃草稿' }));
+  expect(ratioInput()).toHaveValue('');
+  expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+});
+
+it('停用控制允许清除显式继承值，清除后依然禁止设置', async () => {
+  const state = { ...controlState, controls: [{ ...controlState.controls[1], explicit: true, value: 500000, can_clear: true, reason: '目标点数暂不支持' }] };
+  vi.spyOn(api, 'getControlState').mockResolvedValue(state);
+  vi.spyOn(api, 'previewControls').mockImplementation(async (_session, _parent, changes) => ({
+    valid: true, normalized_changes: changes,
+    effective_availability: [{ key: 'row/target_points', selector: 'row:#1', availability: 'LOCKED', can_clear: false, reason: '目标点数暂不支持' }],
+  }));
+  renderEditor();
+  expect(await screen.findByRole('textbox', { name: 'row/target_points · row:#1' })).toBeDisabled();
+  fireEvent.click(screen.getByRole('button', { name: '清除' }));
+  expect(targetInput()).toBeDisabled();
+  act(() => debounce.flush());
+  await waitFor(() => expect(submitButton()).toBeEnabled());
+  expect(targetInput()).toBeDisabled();
+  expect(api.previewControls).toHaveBeenCalledWith('session-1', 'parent-1', [{ key: 'row/target_points', selector: 'row:#1', op: 'clear' }]);
+});
+
+it('冻结会话即使目录提供 can_clear 也不能清除', async () => {
+  vi.spyOn(api, 'getControlState').mockResolvedValue({ ...controlState, controls: [{ ...controlState.controls[1], explicit: true, value: 500000, can_clear: true }] });
+  renderEditor(undefined, true);
+  expect(await screen.findByRole('textbox', { name: 'row/target_points · row:#1' })).toBeDisabled();
+  expect(screen.queryByRole('button', { name: '清除' })).not.toBeInTheDocument();
+});
+
+it('同一父运行从 QUEUED 进入 SUCCEEDED 时重取控制目录并解锁可编辑项', async () => {
+  const getControlState = vi.spyOn(api, 'getControlState')
+    .mockResolvedValueOnce({
+      ...controlState,
+      controls: controlState.controls.map((item) => ({ ...item, availability: 'LOCKED', reason: '只能从成功运行创建控制分支' })),
+    })
+    .mockResolvedValue(controlState);
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+  const node = (run: RunSummary) => (
+    <QueryClientProvider client={client}>
+      <ControlEditor sessionId="session-1" sessionVersion={1} parentRun={run} frozen={false} onDirtyChange={() => {}} onRunCreated={() => {}} />
+    </QueryClientProvider>
+  );
+  const view = render(node({ ...parentRun, status: 'QUEUED' }));
+  expect(await screen.findByRole('textbox', { name: 'row/expansion_ratio · row:#1' })).toBeDisabled();
+  expect(getControlState).toHaveBeenCalledTimes(1);
+  view.rerender(node(parentRun));
+  await waitFor(() => expect(ratioInput()).toBeEnabled());
+  expect(getControlState).toHaveBeenCalledTimes(2);
+  expect(screen.queryByText('只能从成功运行创建控制分支')).not.toBeInTheDocument();
 });

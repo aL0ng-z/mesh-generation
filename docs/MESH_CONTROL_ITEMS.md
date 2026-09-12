@@ -227,8 +227,8 @@ dry-run 只在 `controls.resolved` 中记录 `planned`，不会把控制写成 `
 
 | CLI 参数 | 对应控制键 | 值类型 | 说明 |
 |---|---|---|---|
-| `--mesh-level` | `row/mesh_level` | enum | `coarse`/`medium`/`fine`/`user`，作用于所有行 |
-| `--target-points` | `row/target_points` | int | user 级别的目标点数，作用于所有行 |
+| `--mesh-level` | `wizard/grid_level` | enum | `coarse`/`medium`/`fine`/`user`，作用于所有行 |
+| `--target-points` | `row/target_points` | int | 暂时停用；CLI 静态返回 2，Web 只允许清除旧继承值 |
 | `--first-cell-width` | `wizard/first_cell_width` | float（米） | 所有行首层单元宽度 |
 | `--spanwise-paths` | `wizard/spanwise_paths` | int | 所有行 RowWizard 展向 flow paths 数 |
 | `--gap-points` | `gap/spanwise_points` | int | 所有已有 gap 的展向点数 |
@@ -380,8 +380,8 @@ abs_tol=1e-10 比较，长度换算到 SI 后比较），完整可审计。需�
 | 控制键 | CLI 快捷参数 | 值类型 | 范围/枚举 |
 |---|---|---|---|
 | `configuration/grid_levels` | 仅 `--set` | int | 1–9 |
-| `row/mesh_level` | `--mesh-level` | enum | coarse / medium / fine / user |
-| `row/target_points` | `--target-points` | int | 100–2,000,000,000 |
+| `wizard/grid_level` | `--mesh-level` | enum | coarse / medium / fine / user |
+| `row/target_points` | `--target-points` | int | 暂时停用，保留注册信息和历史记录 |
 | `row/flow_path.number` | 仅 `--set` | int | 3–10001 |
 | `row/optimization.steps` | `--optimization-steps` | int | 0–100000 |
 | `row/optimization.gap_steps` | `--gap-optimization-steps` | int | 0–100000 |

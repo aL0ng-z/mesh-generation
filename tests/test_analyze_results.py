@@ -28,6 +28,7 @@ CLASSIFICATIONS = (
     "FAIL_READBACK",
     "FAIL_GENERATION",
     "BLOCKED_TOPOLOGY_BASELINE",
+    "BLOCKED_UNSUPPORTED_CONTROL",
 )
 
 QUALITY_FIELDS = (
@@ -500,8 +501,12 @@ def classify_control(
     ]
     stable_readback_mapping: list[dict[str, Any]] = []
     if relevant and all(record.get("status") == "blocked" for record in relevant):
-        classification = "BLOCKED_TOPOLOGY_BASELINE"
-        reason = "HOH 在 Rotor37 上未获得结构有效的通用锚点"
+        if all(record.get("category") == "UNSUPPORTED_CONTROL" for record in relevant):
+            classification = "BLOCKED_UNSUPPORTED_CONTROL"
+            reason = relevant[0].get("error") or "该控制当前停用"
+        else:
+            classification = "BLOCKED_TOPOLOGY_BASELINE"
+            reason = "HOH 在 Rotor37 上未获得结构有效的通用锚点"
         pairs: list[dict[str, Any]] = []
     else:
         successful = [

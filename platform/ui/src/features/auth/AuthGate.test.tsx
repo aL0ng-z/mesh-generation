@@ -4,6 +4,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { ApiError, api } from '../../api/client';
 import type { AuthSession } from '../../api/types';
 import { queryClient } from '../../app/queryClient';
+import { ExperienceNote } from '../runs/ExperienceNote';
 import { AuthGate } from './AuthGate';
 
 const authorized: AuthSession = { enabled: true, authenticated: true, username: 'shared' };
@@ -113,7 +114,7 @@ it('401 响应使会话查询失效并回落到登录页', async () => {
       </AuthGate>
     </QueryClientProvider>,
   );
-  expect(await screen.findByRole('alert')).toHaveTextContent('数据加载失败');
+  expect(await screen.findByText('数据加载失败')).toBeInTheDocument();
 
   // 数据查询的 401 已触发 QueryCache.onError → 会话查询失效并重取，
   // 重取得到未认证 → AuthGate 回落到登录页。
@@ -121,4 +122,42 @@ it('401 响应使会话查询失效并回落到登录页', async () => {
     expect(screen.getByRole('heading', { name: '叶轮机械网格经验平台' })).toBeInTheDocument();
   });
   expect(listSessions).toHaveBeenCalledTimes(1);
+});
+
+it('首次过期请求为保存时重新登录，保留同一草稿组件并且不重放写请求', async () => {
+  let session = authorized;
+  vi.spyOn(api, 'getAuthSession').mockImplementation(async () => session);
+  const run = {
+    id: 'run-1', session_id: 'session-1', sequence: 1, status: 'SUCCEEDED' as const,
+    quality_status: 'PASS' as const, created_at: '', experience_note: '原始经验', note_version: 1,
+  };
+  const getRun = vi.spyOn(api, 'getRun').mockResolvedValue(run);
+  const save = vi.spyOn(api, 'updateExperienceNote').mockImplementation(async () => {
+    session = unauthenticated;
+    throw new ApiError(401, { error: { message: '登录已过期' } });
+  });
+  vi.spyOn(api, 'login').mockImplementation(async () => {
+    session = authorized;
+    return session;
+  });
+  function Workspace() {
+    const query = useQuery({ queryKey: ['run', run.id], queryFn: () => api.getRun(run.id) });
+    return query.data ? <ExperienceNote run={query.data} frozen={false} onDirtyChange={() => {}} /> : null;
+  }
+  render(<QueryClientProvider client={queryClient}><AuthGate><Workspace /></AuthGate></QueryClientProvider>);
+  const textarea = await screen.findByRole('textbox');
+  fireEvent.change(textarea, { target: { value: '不能丢失的本地草稿' } });
+  fireEvent.click(screen.getByRole('button', { name: '保存经验' }));
+  await screen.findByRole('heading', { name: '叶轮机械网格经验平台' });
+  expect(textarea).toBeInTheDocument();
+  expect(textarea).not.toBeVisible();
+  expect(textarea.closest('[inert]')).toHaveAttribute('hidden');
+  fireEvent.change(screen.getByLabelText('用户名'), { target: { value: 'shared' } });
+  fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'secret' } });
+  fireEvent.click(screen.getByRole('button', { name: '登录' }));
+  await waitFor(() => expect(textarea).toBeVisible());
+  expect(screen.getByRole('textbox')).toBe(textarea);
+  expect(textarea).toHaveValue('不能丢失的本地草稿');
+  expect(getRun).toHaveBeenCalledTimes(2);
+  expect(save).toHaveBeenCalledTimes(1);
 });

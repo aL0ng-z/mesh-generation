@@ -30,6 +30,7 @@ const availabilityText = {
 
 interface EffectiveAvailability {
   availability: ControlAvailability;
+  can_clear?: boolean;
   reason?: string | null;
 }
 
@@ -134,7 +135,8 @@ function ControlRow({
   const reason = effective ? effective.reason : item.reason;
   const disabled = frozen || (effective
     ? effective.availability !== 'EDITABLE'
-    : change ? false : item.availability !== 'EDITABLE');
+    : change?.op === 'set' ? false : item.availability !== 'EDITABLE');
+  const canClear = !frozen && (effective?.can_clear ?? item.can_clear ?? (!disabled && item.explicit));
   return (
     <article className={styles.control} data-availability={availability}>
       <div className={styles.controlHead}>
@@ -155,7 +157,7 @@ function ControlRow({
           numeric={numeric}
           onNumericText={onNumericText}
         />
-        {!disabled && item.explicit ? (
+        {canClear ? (
           <button
             type="button"
             title="清除显式设置，恢复继承或默认值"
@@ -167,7 +169,7 @@ function ControlRow({
             清除
           </button>
         ) : null}
-        {change ? (
+        {change || numeric ? (
           <button
             type="button"
             title="撤销这项草稿"
@@ -204,11 +206,12 @@ export function ControlEditor({
   // 草稿只存解析后的数值，原始文本保留在输入框中直到撤销、清除或提交。
   const [numericInputs, setNumericInputs] = useState<Record<string, Record<string, NumericInputState>>>({});
   const debouncedDraft = useDebouncedValue(draft, 400);
+  const dirty = draft.length > 0 || Object.keys(numericInputs).length > 0;
 
-  useEffect(() => onDirtyChange(draft.length > 0), [draft.length, onDirtyChange]);
+  useEffect(() => onDirtyChange(dirty), [dirty, onDirtyChange]);
 
   const controlQuery = useQuery({
-    queryKey: ['control-state', sessionId, parentRun?.id],
+    queryKey: ['control-state', sessionId, parentRun?.id, parentRun?.status],
     queryFn: () => api.getControlState(sessionId, parentRun!.id),
     enabled: Boolean(parentRun?.id),
   });
@@ -406,7 +409,7 @@ export function ControlEditor({
           {createMutation.isError ? `创建分支失败：${(createMutation.error as Error).message}` : null}
         </div>
         <div className={styles.actions}>
-          <button type="button" disabled={!draft.length || createMutation.isPending} onClick={() => { setDraft([]); setNumericInputs({}); }}>放弃草稿</button>
+          <button type="button" disabled={!dirty || createMutation.isPending} onClick={() => { setDraft([]); setNumericInputs({}); }}>放弃草稿</button>
           <button
             className={styles.submit}
             type="button"

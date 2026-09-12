@@ -1,5 +1,7 @@
 # 源码指南：从零理解 geomTurbo → AutoGrid 网格生成工具
 
+当前修复契约（2026-09-12）：控制最终核验取生成后回读，`basis=post_generation`；质量规则版本为 2；`row/target_points` 暂时停用。源码/Git 来源在启动 IGG 前采集，输入哈希使用本轮副本。平台数据库当前为 v3，修复记录见 `docs/FIXES_20260912.md`。
+
 > **目标读者**：有 Python 基础但不了解 CFD 的开发者。本文会先解释必要的领域概念，再深入每一行源码。
 >
 > **阅读建议**：如果只想快速了解项目，读第 0、1 章即可。如果要修改代码，请按模块顺序读第 2～6 章。
@@ -1411,7 +1413,7 @@ main()
 | `--dry-run` | flag | False | 仅生成脚本不执行 IGG |
 | `--timeout` | int | None | AutoGrid 超时秒数 |
 | `--mesh-level` | enum | None | 所有行的网格级别 |
-| `--target-points` | int | None | 所有行 user 级别的目标点数 |
+| `--target-points` | int | None | 暂时停用，静态报错；通用 row/target_points 同样拒绝 |
 | `--first-cell-width` | float | None | 所有行首层宽度（米） |
 | `--spanwise-paths` | int | None | 所有行展向 flow paths 数 |
 | `--gap-points` | int | None | 所有已有 gap 的展向点数 |
@@ -1428,7 +1430,7 @@ main()
 将快捷参数（`--mesh-level`、`--first-cell-width` 等）转换为等价的 `--set` 表达式：
 
 ```python
-(args.mesh_level,  f"row:*/mesh_level={args.mesh_level}"),
+(args.mesh_level,  f"row:*/wizard/grid_level={args.mesh_level}"),
 (args.first_cell_width, f"row:*/wizard/first_cell_width={args.first_cell_width}"),
 # ...
 ```
@@ -1477,7 +1479,11 @@ def _load_env_file(path):
         "resolved":   [ /* ResolvedControl.to_dict() */ ],
         "applied":    [ /* setter 前后回读 */ ],
         "post_generation": [ /* 3D 网格生成后回读 */ ],
-        "verification": [ /* 每项控制 VERIFIED/MISMATCH/READBACK_ERROR/UNVERIFIABLE */ ]
+        "verification": {
+            "basis": "post_generation",
+            "status": "COMPLETE",
+            "results": [ /* 每项控制 VERIFIED/MISMATCH/READBACK_ERROR/UNVERIFIABLE */ ]
+        }
     },
     "autogrid": { /* AutoGridRun.to_dict() */ },
     "mesh_fingerprint": { /* 可选：block 尺寸、完整坐标 SHA 和探针 */ },

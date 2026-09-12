@@ -31,7 +31,7 @@ from quality import summarize_quality
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_MODULE_FILES = ("mesh.py", "controls.py", "autogrid.py", "geomturbo.py", "quality.py")
-QUALITY_RULES_VERSION = "1"
+QUALITY_RULES_VERSION = "2"
 
 
 def main() -> int:
@@ -57,7 +57,7 @@ def main() -> int:
         choices=("coarse", "medium", "fine", "user"),
         help="所有行的网格级别。",
     )
-    parser.add_argument("--target-points", type=int, help="所有行 user 级别的目标点数。")
+    parser.add_argument("--target-points", type=int, help="暂时停用：当前生成路径不能兑现目标点数。")
     parser.add_argument("--first-cell-width", type=float, help="所有行首层单元宽度，固定以米输入。")
     parser.add_argument("--spanwise-paths", type=int, help="所有行 RowWizard 展向 flow paths 数。")
     parser.add_argument("--gap-points", type=int, help="所有已有 gap 的展向点数。")
@@ -118,6 +118,7 @@ def main() -> int:
 
     run_id = args.run_id or uuid.uuid4().hex
     run_dir = Path(args.out) if args.out else _default_run_dir(geomturbo_path)
+    source_snapshot, source_issues = _capture_source_snapshot()
 
     try:
         autogrid_run = run_autogrid_init(
@@ -137,6 +138,7 @@ def main() -> int:
         return 2
 
     quality_summary: dict[str, Any] | None = None
+    quality_evaluated = False
     missing_mesh_outputs = (
         []
         if args.dry_run
@@ -169,6 +171,7 @@ def main() -> int:
                 units_factor=geometry.units_factor,
                 units=geometry.units,
             )
+            quality_evaluated = quality_summary.get("metrics_source") is not None
         except Exception as exc:
             quality_summary = {
                 "metrics_source": None,
@@ -193,8 +196,8 @@ def main() -> int:
     )
     autogrid_data = autogrid_run.to_dict()
     autogrid_data["mesh_fingerprint"] = mesh_fingerprint
-    sources, source_issues = _build_sources(
-        geomturbo_path, geometry, run_dir, quality_summary
+    sources = _build_sources(
+        geomturbo_path, geometry, run_dir, quality_summary, source_snapshot
     )
     quality_validation = (
         quality_summary.get("quality_validation")
@@ -204,8 +207,12 @@ def main() -> int:
             "reasons": [{"field": "quality", "problem": "无质量数据源"}],
         }
     )
-    stages_completed = ["planning"] if args.dry_run else ["generation"]
-    if quality_summary is not None:
+    stages_completed = ["planning"] if args.dry_run else []
+    if (not args.dry_run and autogrid_run.completion_event is not None
+            and not autogrid_run.protocol_errors and "igg" in autogrid_run.outputs
+            and not any(item.get("status") == "failed" for item in autogrid_run.control_results)):
+        stages_completed.append("generation")
+    if quality_evaluated:
         stages_completed.append("quality")
     if mesh_fingerprint is not None:
         stages_completed.append("fingerprint")
@@ -289,14 +296,11 @@ def _finalize_mesh_fingerprint(
 def _build_control_requests(args: argparse.Namespace) -> list[ControlRequest]:
     """将快捷参数和通用设置合并为网格控制请求。"""
 
+    if args.target_points is not None:
+        raise ControlValidationError(CONTROL_REGISTRY["row/target_points"].unsupported_reason)
     assignments = list(args.set_values)
     explicit = (
         (args.mesh_level, f"row:*/wizard/grid_level={args.mesh_level}" if args.mesh_level else None),
-        (args.target_points, f"row:*/target_points={args.target_points}" if args.target_points is not None else None),
-        (
-            args.target_points if args.target_points is not None and args.mesh_level != "user" else None,
-            "row:*/wizard/grid_level=user",
-        ),
         (
             args.first_cell_width,
             f"row:*/wizard/first_cell_width={args.first_cell_width}"
@@ -432,17 +436,11 @@ def _git_sources(root: Path) -> tuple[str | None, bool, list[str]]:
     return commit, dirty, issues
 
 
-def _build_sources(
-    geomturbo_path: Path,
-    geometry: Any,
-    run_dir: Path,
-    quality_summary: dict[str, Any] | None,
-) -> tuple[dict[str, Any], list[str]]:
-    """按共享契约 A.7 汇总本次执行的来源信息。"""
+def _capture_source_snapshot() -> tuple[dict[str, Any], list[str]]:
+    """在启动 IGG 前采集本轮源码、Git 与控制规则的来源。"""
 
     git_commit, git_dirty, issues = _git_sources(PROJECT_ROOT)
     registry_signature, key_count = _control_registry_signature()
-    metadata = (quality_summary or {}).get("metadata") or {}
     src_root = Path(__file__).resolve().parent
     source_files = []
     for name in SOURCE_MODULE_FILES:
@@ -451,33 +449,47 @@ def _build_sources(
             continue
         relative = str(path.relative_to(PROJECT_ROOT)).replace(os.sep, "/")
         source_files.append({"path": relative, "sha256": _sha256_file(path)})
-    script_path = run_dir / "autogrid_init.py"
-    sources = {
-        "input_summary": {
-            "path": str(geomturbo_path),
-            "sha256": _sha256_file(geomturbo_path),
-            "size_bytes": geomturbo_path.stat().st_size,
-            "version": geometry.version,
-            "units": geometry.units,
-            "units_factor": geometry.units_factor,
-        },
+    return {
         "source_signature": {
             "algorithm": "sha256",
             "files": source_files,
         },
         "git": {"commit": git_commit, "dirty": git_dirty},
-        "generated_script": {
-            "path": "autogrid_init.py",
-            "sha256": _sha256_file(script_path),
-        },
         "control_registry": {
             "signature": registry_signature,
             "key_count": key_count,
         },
         "quality_rules_version": QUALITY_RULES_VERSION,
+    }, issues
+
+
+def _build_sources(
+    geomturbo_path: Path,
+    geometry: Any,
+    run_dir: Path,
+    quality_summary: dict[str, Any] | None,
+    source_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    """合并启动来源与本轮实际输入副本，原路径仅作来源标签。"""
+
+    input_copy = run_dir / "input.geomTurbo"
+    metadata = (quality_summary or {}).get("metadata") or {}
+    return {
+        **source_snapshot,
+        "input_summary": {
+            "path": str(geomturbo_path),
+            "sha256": _sha256_file(input_copy),
+            "size_bytes": input_copy.stat().st_size,
+            "version": geometry.version,
+            "units": geometry.units,
+            "units_factor": geometry.units_factor,
+        },
+        "generated_script": {
+            "path": "autogrid_init.py",
+            "sha256": _sha256_file(run_dir / "autogrid_init.py"),
+        },
         "vendor_version": metadata.get("autogrid_version"),
     }
-    return sources, issues
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
@@ -541,21 +553,29 @@ def _render_report(
     )
     resolved = controls.get("resolved", [])
     if resolved:
+        verification = controls.get("verification") or {}
+        basis_label = "生成后核验" if verification.get("basis") == "post_generation" else "旧版应用后核验"
+        if not dry_run:
+            lines.append(f"- 核验依据：{basis_label}")
+            lines.append("")
         lines.extend(
             [
-                "| 控制键 | 目标 | 请求值 | 项目单位值 | 阶段 | 状态 | 回读 | 错误 |",
-                "|---|---|---:|---:|---|---|---:|---|",
+                "| 控制键 | 目标 | 请求值 | 项目单位值 | 阶段 | 应用状态 | 核验 | 核验回读 | 错误 |",
+                "|---|---|---:|---:|---|---|---|---:|---|",
             ]
         )
         applied_by_id = {item.get("id"): item for item in controls.get("applied", [])}
+        verified_by_id = {item.get("control_id"): item for item in verification.get("results", [])}
         for item in resolved:
             applied = applied_by_id.get(item.get("id"), {})
+            verified = verified_by_id.get(item.get("id"), {})
             status = "planned" if dry_run else applied.get("status", "not_applied")
             lines.append(
                 f"| `{item.get('key')}` | `{item.get('target_path')}` | "
                 f"{_display_value(item.get('requested'))} | {_display_value(item.get('project_value'))} | "
-                f"{item.get('stage')} | {status} | {_display_value(applied.get('readback'))} | "
-                f"{_display_value(applied.get('error'))} |"
+                f"{item.get('stage')} | {status} | {_display_value(verified.get('verification'))} | "
+                f"{_display_value(verified.get('readback'))} | "
+                f"{_display_value(verified.get('error') or applied.get('error'))} |"
             )
     else:
         lines.append("- 未设置额外控制，使用 AutoGrid 默认值。")
@@ -687,6 +707,7 @@ def _print_control_catalog(priority: str | None) -> None:
         print(
             f"{spec.key} | {spec.priority} | {spec.scope} | {spec.value_type} | "
             f"{spec.stage} | {spec.description}"
+            + (f"（暂时停用：{spec.unsupported_reason}）" if spec.unsupported_reason else "")
         )
 
 
@@ -709,6 +730,8 @@ def _print_control_description(key: str) -> None:
     print(f"getter：{spec.getter or '无；以 setter 无异常作为 applied'}")
     print(f"拓扑限制：{', '.join(spec.topologies) if spec.topologies else '无'}")
     print(f"不适用条件：{spec.not_applicable_when or '无额外条件'}")
+    if spec.unsupported_reason:
+        print(f"当前不可用：{spec.unsupported_reason}")
 
 
 if __name__ == "__main__":

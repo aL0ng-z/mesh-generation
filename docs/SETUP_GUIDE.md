@@ -61,6 +61,7 @@ MESH_DATA_DIR=runs\platform-dev
 
 ```powershell
 # 交互式输入两次明文密码（不回显、不落盘），输出 scrypt 哈希串
+$env:PYTHONPATH = (Resolve-Path platform).Path
 platform\.venv\Scripts\python.exe -m mesh_app.auth
 ```
 
@@ -138,7 +139,7 @@ npm run typecheck
 Set-Location ..\..
 
 # 网格内核测试（只用系统 Python，无依赖）
-python -m pytest tests -q
+python -m unittest discover -s tests -q
 ```
 
 在浏览器完成一次真实闭环：上传 `.geomTurbo` → baseline → 分支 → 经验文本 → 对比 → 冻结 → 刷新恢复。
@@ -171,7 +172,7 @@ platform\.venv\Scripts\python.exe -m mesh_app.backup --output-dir <备份目录>
 .\platform\deploy\run-local.ps1 -Migrate
 ```
 
-迁移包含 `0002_postprocess_status.sql`（后处理状态与起止时间、错误字段，user_version=2），只在显式 `-Migrate` 时应用。
+当前数据库版本为 3。迁移 0002 增加后处理字段，迁移 0003 只修正后处理已失败但预览仍等待的遗留记录并追加恢复事件；只在显式 `-Migrate` 时应用。回退到旧版代码前需停服并恢复升级前的数据库及产物备份。
 
 ## 10. 生产部署提示
 

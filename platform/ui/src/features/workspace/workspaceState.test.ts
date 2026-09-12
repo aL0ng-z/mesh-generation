@@ -32,6 +32,19 @@ describe('工作台状态', () => {
     expect(isSessionFrozen(session('ACTIVE', 'FAILED'))).toBe(false);
   });
 
+  it('显式后处理状态优先：失败任务仍轮询至后处理终结', () => {
+    const value = session('ACTIVE', 'FAILED', 'UNAVAILABLE');
+    value.runs[0].postprocess_status = 'PENDING';
+    expect(pollingIntervalForSession(value)).toBe(3000);
+    value.runs[0].postprocess_status = 'RUNNING';
+    expect(pollingIntervalForSession(value)).toBe(3000);
+    value.runs[0].postprocess_status = 'FAILED';
+    value.runs[0].preview_status = 'PENDING';
+    expect(pollingIntervalForSession(value)).toBe(false);
+    value.runs[0].postprocess_status = 'COMPLETED';
+    expect(pollingIntervalForSession(value)).toBe(false);
+  });
+
   it('只恢复有效页签和两个不同的成功运行', () => {
     expect(parseWorkspaceTab('bad')).toBe('viewer');
     expect(parseWorkspaceTab('events')).toBe('events');
